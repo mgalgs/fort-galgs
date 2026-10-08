@@ -7,7 +7,7 @@ a busy Kubernetes worker, or a test sweep in tmux cannot starve Rocket League.
 | File | Installed to | Does |
 |------|--------------|------|
 | `game-mode` | `/usr/local/bin` | GTK front end: live per-thread CPU map, who is using the CPUs, one toggle |
-| `game-mode-cpus` | `/usr/local/bin` | Backend: `status [--json]`, `on`, `off`; root half via `--system on\|off` |
+| `game-mode-cpus` | `/usr/local/bin` | Backend: `status [--json]`, `on`, `off`, `adopt <pid>`; root half via `--system on\|off` |
 | `game-mode.desktop`, `game-mode.svg` | `/usr/local/share/...` | Dash entry and icon |
 | — | `/etc/sudoers.d/game-mode` | Lets the user run exactly `game-mode-cpus --system on` and `… off` |
 | — | `/etc/systemd/system/user@.service.d/game-mode-cpuset.conf` | Delegates the cpuset controller to user sessions |

@@ -820,6 +820,10 @@ class GameModeApp(Adw.Application):
     def do_startup(self):
         Adw.Application.do_startup(self)
         load_css()
+        # Out of the fenced app.slice, or the animation stutters under
+        # exactly the load Game Mode exists for. Failing only costs that.
+        run_backend(["adopt", str(os.getpid())],
+                    lambda ok, text: ok or print(text, file=sys.stderr))
 
     def do_activate(self):
         if not self.window:

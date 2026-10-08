@@ -4,6 +4,8 @@
     game-mode-cpus status [--json]   anyone
     game-mode-cpus on | off          the desktop user; uses sudo -n for the
                                      system half
+    game-mode-cpus adopt <pid>       move one of your processes into
+                                     game.slice
     game-mode-cpus --system on|off   root only; this is what sudoers allows
 
 "On" reserves the machine's fastest cores (and their SMT siblings) for the
@@ -202,34 +204,61 @@ def steam_state(game_cg):
     return "game", next(iter(groups))
 
 
+def move_into_game(unit, pids, what):
+    """Put running processes into a new scope in game.slice.
+
+    StartTransientUnit with PIDs is how gnome-shell itself puts
+    already-running processes into a scope.
+    """
+    # A process can exit between listing and moving, which fails the whole
+    # call with ESRCH; drop the dead and retry once.
+    for _attempt in range(2):
+        pids = [p for p in pids if os.path.exists(f"/proc/{p}")]
+        if not pids:
+            return
+        try:
+            run(["busctl", "--user", "call", "org.freedesktop.systemd1",
+                 "/org/freedesktop/systemd1",
+                 "org.freedesktop.systemd1.Manager", "StartTransientUnit",
+                 "ssa(sv)a(sa(sv))", unit, "fail", "2",
+                 "Slice", "s", GAME_SLICE,
+                 "PIDs", "au", str(len(pids)), *map(str, pids), "0"])
+            print(f"moved {what} ({len(pids)} processes) into {GAME_SLICE}")
+            return
+        except Fail as exc:
+            if "No such process" not in str(exc):
+                raise
+    raise Fail(f"could not move {what} into {GAME_SLICE}: its processes "
+               "kept exiting")
+
+
 def pull_game_in(game_cg):
-    """Move every game cgroup that is not already in game.slice into a new
-    scope there. StartTransientUnit with PIDs is how gnome-shell itself puts
-    already-running processes into a scope."""
+    """Move every game cgroup not already in game.slice into it."""
     for cg, pids in game_cgroups().items():
         if cg.startswith(game_cg + "/") or not pids:
             continue
-        unit = f"game-{os.path.basename(cg).removesuffix('.scope')}.scope"
-        # A process can exit between listing and moving, which fails the
-        # whole call with ESRCH; drop the dead and retry once.
-        for _attempt in range(2):
-            pids = [p for p in pids if os.path.exists(f"/proc/{p}")]
-            try:
-                run(["busctl", "--user", "call", "org.freedesktop.systemd1",
-                     "/org/freedesktop/systemd1",
-                     "org.freedesktop.systemd1.Manager", "StartTransientUnit",
-                     "ssa(sv)a(sa(sv))", unit, "fail", "2",
-                     "Slice", "s", GAME_SLICE,
-                     "PIDs", "au", str(len(pids)), *map(str, pids), "0"])
-                print(f"moved {os.path.basename(cg)} ({len(pids)} processes) "
-                      f"into {GAME_SLICE}")
-                break
-            except Fail as exc:
-                if "No such process" not in str(exc):
-                    raise
-        else:
-            raise Fail(f"could not move {cg} into {GAME_SLICE}: its "
-                       "processes kept exiting")
+        name = os.path.basename(cg)
+        move_into_game(f"game-{name.removesuffix('.scope')}.scope", pids,
+                       name)
+
+
+def adopt(pid):
+    """Move one process of this user's into game.slice, unless it is there.
+
+    The launcher adopts itself, so its animation keeps running while the
+    fenced CPUs are pegged.
+    """
+    try:
+        owner = os.stat(f"/proc/{pid}").st_uid
+    except OSError:
+        raise Fail(f"no such process: {pid}") from None
+    if owner != os.getuid():
+        raise Fail(f"pid {pid} is not yours")
+    game_cg = user_cgroup(GAME_SLICE)
+    if (CGROUP_ROOT + read(f"/proc/{pid}/cgroup")[3:]).startswith(
+            game_cg + "/"):
+        return
+    move_into_game(f"game-adopted-{pid}.scope", [pid], f"pid {pid}")
 
 
 def user_apply(on, fenced):
@@ -324,6 +353,10 @@ def main(argv):
                 print(json.dumps(st))
             else:
                 print_status(st)
+            return 0
+
+        if len(argv) == 2 and argv[0] == "adopt" and argv[1].isdigit():
+            adopt(int(argv[1]))
             return 0
 
         if argv in (["on"], ["off"]):
