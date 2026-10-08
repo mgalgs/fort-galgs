@@ -30,10 +30,9 @@ BACKEND = os.path.join(os.path.dirname(os.path.realpath(__file__)),
 SAMPLE_MS = 500
 STATUS_EVERY_S = 5
 
-# While the game has focus this window is not being looked at. Redrawing it
-# at the display's refresh rate would spend CPU on the very thing it exists
-# to protect, so an unfocused window repaints only when a new sample lands.
-IDLE_REDRAW_S = SAMPLE_MS / 1000
+# An unfocused window is capped at 30 fps: smooth to watch from beside the
+# game, at half the cost of a 60 Hz repaint.
+IDLE_REDRAW_S = 1 / 30
 
 # Rocket League's two sides: orange is the game, blue is everything else.
 GAME_RGB = (1.00, 0.55, 0.12)
