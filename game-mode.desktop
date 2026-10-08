@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Game Mode
+GenericName=CPU reservation for games
+Comment=Keep the fastest cores free for the game
+Exec=/usr/local/bin/game-mode
+Icon=game-mode
+Terminal=false
+Categories=Game;
+Keywords=game;cpu;cores;steam;rocket;league;
+StartupNotify=true
+# Ties the window to this entry, so the dash highlights this icon while it runs.
+StartupWMClass=io.mgalgs.GameMode

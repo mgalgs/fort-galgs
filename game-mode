@@ -1,0 +1,933 @@
+#!/usr/bin/env python3
+"""Game Mode: a one-click front end for this machine's CPU reservation.
+
+Deployed to /usr/local/bin/game-mode. See README.md.
+
+This is a front end. Every change to the machine belongs to game-mode-cpus,
+which this program shells out to; if a toggle fails, its own words are what
+the user sees. The live picture reads /proc/stat and cgroup cpu.stat
+directly, because those are read-only and cheap.
+
+Run with --self-test to build every page and draw every state once.
+"""
+
+import json
+import math
+import os
+import sys
+
+import cairo
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
+
+BACKEND = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                       "game-mode-cpus")
+
+SAMPLE_MS = 500
+STATUS_EVERY_S = 5
+
+# While the game has focus this window is not being looked at. Redrawing it
+# at the display's refresh rate would spend CPU on the very thing it exists
+# to protect, so an unfocused window repaints only when a new sample lands.
+IDLE_REDRAW_S = SAMPLE_MS / 1000
+
+# Rocket League's two sides: orange is the game, blue is everything else.
+GAME_RGB = (1.00, 0.55, 0.12)
+GAME_HOT_RGB = (1.00, 0.33, 0.38)
+REST_RGB = (0.24, 0.62, 1.00)
+DIM_RGB = (0.62, 0.66, 0.85)
+
+
+CSS = b"""
+.gm-root {
+  background-image:
+    radial-gradient(ellipse at 15% 0%, rgba(255,140,30,0.16), transparent 55%),
+    radial-gradient(ellipse at 90% 100%, rgba(60,150,255,0.18), transparent 60%),
+    linear-gradient(165deg, #0a0f22 0%, #141235 50%, #0b1a33 100%);
+}
+
+.gm-hero {
+  font-size: 21pt;
+  font-weight: 800;
+  letter-spacing: -0.5px;
+  color: #f6f4ff;
+}
+
+.gm-sub {
+  font-size: 11.5pt;
+  color: #c3c8ec;
+}
+
+.gm-big {
+  font-size: 15pt;
+  font-weight: 700;
+  padding: 16px 12px;
+  border-radius: 18px;
+}
+
+.gm-on {
+  background-image: linear-gradient(120deg, #ff9a1f, #ff4f6d);
+  color: #ffffff;
+  border: none;
+  box-shadow: 0 6px 22px rgba(255,110,40,0.38);
+}
+
+.gm-on:hover {
+  background-image: linear-gradient(120deg, #ffb04a, #ff6a84);
+}
+
+.gm-off {
+  background-image: linear-gradient(120deg, rgba(60,150,255,0.85), rgba(80,90,230,0.85));
+  color: #ffffff;
+  border: none;
+}
+
+.gm-off:hover {
+  background-image: linear-gradient(120deg, rgba(90,170,255,0.95), rgba(105,115,245,0.95));
+}
+
+.gm-card {
+  background-color: rgba(255,255,255,0.05);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 16px;
+  padding: 12px 16px;
+}
+
+.gm-row-title {
+  font-weight: 600;
+  color: #e9eaff;
+}
+
+.gm-row-value {
+  font-family: monospace;
+  font-size: 10.5pt;
+  color: #e9eaff;
+}
+
+.gm-row-note {
+  font-size: 9pt;
+  color: #9ea5d4;
+}
+
+.gm-log {
+  font-family: monospace;
+  font-size: 9pt;
+  color: #e9eaff;
+}
+
+levelbar.gm-game block.filled { background-color: #ff8c1f; }
+levelbar.gm-rest block.filled { background-color: #3d9eff; }
+levelbar block.empty { background-color: rgba(255,255,255,0.07); }
+"""
+
+
+# --------------------------------------------------------------------------
+# Measuring
+# --------------------------------------------------------------------------
+
+class CpuSampler:
+    """Per-CPU busy fraction from /proc/stat, as deltas between calls."""
+
+    def __init__(self):
+        self.prev = {}
+
+    def sample(self):
+        loads = {}
+        with open("/proc/stat") as fh:
+            for line in fh:
+                if not line.startswith("cpu") or line.startswith("cpu "):
+                    continue
+                parts = line.split()
+                cpu = int(parts[0][3:])
+                vals = [int(v) for v in parts[1:]]
+                idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+                total = sum(vals[:8])  # guest time is already in user
+                prev = self.prev.get(cpu)
+                self.prev[cpu] = (total, idle)
+                if prev and total > prev[0]:
+                    busy = 1.0 - (idle - prev[1]) / (total - prev[0])
+                    loads[cpu] = min(1.0, max(0.0, busy))
+        return loads
+
+
+class GroupSampler:
+    """CPUs' worth of time used per cgroup, from cpu.stat usage_usec."""
+
+    def __init__(self):
+        self.prev = {}
+
+    @staticmethod
+    def _usage(path):
+        try:
+            with open(os.path.join(path, "cpu.stat")) as fh:
+                for line in fh:
+                    if line.startswith("usage_usec "):
+                        return int(line.split()[1])
+        except (OSError, TypeError):
+            pass
+        return None
+
+    def sample(self, paths):
+        """paths: {name: cgroup dir or None}. Returns {name: cpus used}."""
+        now = GLib.get_monotonic_time()
+        out = {}
+        for name, path in paths.items():
+            usage = self._usage(path)
+            prev = self.prev.get(name)
+            self.prev[name] = (path, now, usage)
+            if usage is None or not prev or prev[0] != path or prev[2] is None:
+                out[name] = 0.0
+                continue
+            dt = now - prev[1]
+            out[name] = max(0.0, (usage - prev[2]) / dt) if dt > 0 else 0.0
+        return out
+
+
+# --------------------------------------------------------------------------
+# The picture: the chip, with the game's cores fenced off
+# --------------------------------------------------------------------------
+
+class CpuView(Gtk.DrawingArea):
+    """Every physical core as a tile, each of its threads a live load bar.
+
+    The reserved cores carry a controller glyph and a frame in every state,
+    so which ones they are never depends on telling orange from blue. When
+    Game Mode is on, the frame becomes a marching shield and sparks rise in
+    the reserved tiles; when it is off, the frame is a quiet dashed outline
+    -- the same cores, waiting.
+    """
+
+    COLS = 5
+
+    def __init__(self):
+        super().__init__(content_height=230, hexpand=True, vexpand=True)
+        self.cores = []
+        self.reserved = set()
+        self.on = False
+        self.loads = {}       # cpu -> target load
+        self.shown = {}       # cpu -> displayed load, eased toward target
+        self.phase = 0.0
+        self.last_draw = -1.0
+        self._t0 = None
+        self.set_draw_func(self._draw)
+        self.add_tick_callback(self._on_tick)
+
+    def set_state(self, cores, reserved, on):
+        self.cores = cores
+        self.reserved = set(reserved)
+        self.on = on
+        self.queue_draw()
+
+    def set_loads(self, loads):
+        self.loads = loads
+
+    def _on_tick(self, widget, clock):
+        now = clock.get_frame_time()
+        if self._t0 is None:
+            self._t0 = now
+        prev = self.phase
+        self.phase = (now - self._t0) / 1_000_000.0
+        dt = max(0.0, self.phase - prev)
+        # Frame-rate independent easing: the same glide at 30 Hz or 144 Hz.
+        k = 1.0 - math.exp(-dt * 7.0)
+        for cpu, target in self.loads.items():
+            cur = self.shown.get(cpu, target)
+            self.shown[cpu] = cur + (target - cur) * k
+
+        root = widget.get_root()
+        focused = root is not None and root.is_active()
+        if focused or self.phase - self.last_draw >= IDLE_REDRAW_S:
+            self.last_draw = self.phase
+            self.queue_draw()
+        return GLib.SOURCE_CONTINUE
+
+    # -- helpers ----------------------------------------------------------
+
+    @staticmethod
+    def _glow(cr, x, y, radius, rgb, alpha):
+        if radius <= 0 or alpha <= 0:
+            return
+        grad = cairo.RadialGradient(x, y, 0, x, y, radius)
+        grad.add_color_stop_rgba(0.0, *rgb, alpha)
+        grad.add_color_stop_rgba(0.5, *rgb, alpha * 0.3)
+        grad.add_color_stop_rgba(1.0, *rgb, 0.0)
+        cr.set_source(grad)
+        cr.arc(x, y, radius, 0, 2 * math.pi)
+        cr.fill()
+
+    @staticmethod
+    def _rounded(cr, x, y, w, h, r):
+        r = min(r, w / 2, h / 2)
+        cr.new_sub_path()
+        cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+        cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+        cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+        cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+        cr.close_path()
+
+    @staticmethod
+    def _text(cr, x, y, text, size, alpha, bold=False):
+        cr.select_font_face("Cantarell", cairo.FONT_SLANT_NORMAL,
+                            cairo.FONT_WEIGHT_BOLD if bold
+                            else cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(size)
+        ext = cr.text_extents(text)
+        cr.move_to(x - ext.width / 2 - ext.x_bearing, y)
+        cr.set_source_rgba(1, 1, 1, alpha)
+        cr.show_text(text)
+
+    @staticmethod
+    def _glyph_pad(cr, x, y, s, alpha):
+        """A game controller: body, two grips, a d-pad and two buttons."""
+        cr.set_source_rgba(1, 1, 1, alpha)
+        w, h = s, s * 0.56
+        cr.new_sub_path()
+        cr.arc(x - w / 2 + h / 2, y, h / 2, math.pi / 2, 3 * math.pi / 2)
+        cr.arc(x + w / 2 - h / 2, y, h / 2, -math.pi / 2, math.pi / 2)
+        cr.close_path()
+        cr.fill()
+        cr.set_source_rgba(0.08, 0.08, 0.18, alpha)
+        d = h * 0.17
+        cx = x - w * 0.24
+        cr.rectangle(cx - d * 1.6, y - d / 2, d * 3.2, d)
+        cr.rectangle(cx - d / 2, y - d * 1.6, d, d * 3.2)
+        cr.fill()
+        bx = x + w * 0.24
+        cr.arc(bx - d * 0.9, y + d * 0.4, d * 0.62, 0, 2 * math.pi)
+        cr.fill()
+        cr.arc(bx + d * 0.9, y - d * 0.4, d * 0.62, 0, 2 * math.pi)
+        cr.fill()
+
+    # -- the picture ------------------------------------------------------
+
+    def _draw(self, _area, cr, width, height):
+        if not self.cores:
+            return
+        n = len(self.cores)
+        cols = min(self.COLS, n)
+        rows = math.ceil(n / cols)
+        gap = max(10.0, width * 0.025)
+        label_h = max(16.0, height * 0.07)
+        # Square-ish tiles, as large as the area allows.
+        tile_w = min((width - gap * (cols + 1)) / cols,
+                     (height - gap * (rows + 1) - label_h * rows) / rows / 1.05)
+        tile_w = max(24.0, tile_w)
+        tile_h = tile_w * 1.05
+        grid_w = cols * tile_w + (cols - 1) * gap
+        grid_h = rows * (tile_h + label_h) + (rows - 1) * gap
+        x0 = (width - grid_w) / 2
+        y0 = (height - grid_h) / 2
+
+        self._draw_die(cr, x0, y0, grid_w, grid_h, gap)
+
+        for i, core in enumerate(self.cores):
+            col, row = i % cols, i // cols
+            x = x0 + col * (tile_w + gap)
+            y = y0 + row * (tile_h + label_h + gap)
+            mine = any(c in self.reserved for c in core["cpus"])
+            self._draw_tile(cr, x, y, tile_w, tile_h, core, mine)
+            label = " · ".join(str(c) for c in core["cpus"])
+            self._text(cr, x + tile_w / 2, y + tile_h + label_h * 0.78,
+                       label, max(9.0, label_h * 0.6),
+                       0.85 if mine else 0.45, bold=mine)
+
+    def _draw_die(self, cr, x, y, w, h, gap):
+        """The package outline with pins, so the tiles read as one chip."""
+        pad = gap * 0.8
+        X, Y, W, H = x - pad, y - pad, w + 2 * pad, h + 2 * pad
+        cr.set_line_width(2.0)
+        cr.set_source_rgba(*DIM_RGB, 0.18)
+        pin = pad * 0.55
+        step = max(14.0, W / 24)
+        px = X + step / 2
+        while px < X + W:
+            cr.move_to(px, Y)
+            cr.line_to(px, Y - pin)
+            cr.move_to(px, Y + H)
+            cr.line_to(px, Y + H + pin)
+            px += step
+        cr.stroke()
+        self._rounded(cr, X, Y, W, H, pad)
+        grad = cairo.LinearGradient(X, Y, X + W, Y + H)
+        grad.add_color_stop_rgba(0.0, 0.16, 0.17, 0.32, 0.55)
+        grad.add_color_stop_rgba(1.0, 0.07, 0.09, 0.20, 0.55)
+        cr.set_source(grad)
+        cr.fill_preserve()
+        cr.set_source_rgba(*DIM_RGB, 0.25)
+        cr.set_line_width(1.4)
+        cr.stroke()
+
+    def _draw_tile(self, cr, x, y, w, h, core, mine):
+        pulse = 0.5 + 0.5 * math.sin(self.phase * 2.2)
+        live = mine and self.on
+        rgb = GAME_RGB if mine else REST_RGB
+        r = w * 0.16
+
+        if live:
+            self._glow(cr, x + w / 2, y + h / 2, w * (0.95 + 0.12 * pulse),
+                       GAME_RGB, 0.30 + 0.12 * pulse)
+
+        self._rounded(cr, x, y, w, h, r)
+        cr.set_source_rgba(0.05, 0.06, 0.14, 0.92)
+        cr.fill()
+
+        # One bar per thread, filled from the bottom by its live load.
+        cpus = core["cpus"]
+        inner = w * 0.14
+        glyph_h = w * 0.30 if mine else 0.0
+        bar_top = y + inner + glyph_h
+        bar_h = y + h - inner - bar_top
+        bar_gap = w * 0.08
+        bar_w = (w - 2 * inner - bar_gap * (len(cpus) - 1)) / len(cpus)
+        for j, cpu in enumerate(cpus):
+            bx = x + inner + j * (bar_w + bar_gap)
+            self._rounded(cr, bx, bar_top, bar_w, bar_h, bar_w * 0.25)
+            cr.set_source_rgba(1, 1, 1, 0.06)
+            cr.fill()
+            load = self.shown.get(cpu, 0.0)
+            fill = bar_h * load
+            if fill < 1.0:
+                continue
+            self._rounded(cr, bx, bar_top + bar_h - fill, bar_w, fill,
+                          min(bar_w * 0.25, fill / 2))
+            grad = cairo.LinearGradient(0, bar_top + bar_h, 0, bar_top)
+            if mine:
+                grad.add_color_stop_rgba(0.0, *GAME_RGB, 0.95)
+                grad.add_color_stop_rgba(1.0, *GAME_HOT_RGB, 0.95)
+            else:
+                grad.add_color_stop_rgba(0.0, *REST_RGB, 0.85)
+                grad.add_color_stop_rgba(1.0, 0.55, 0.45, 1.0, 0.85)
+            cr.set_source(grad)
+            cr.fill()
+
+        if live:
+            self._sparks(cr, x, bar_top, w, bar_h, core["core"])
+
+        if mine:
+            self._glyph_pad(cr, x + w / 2, y + inner + glyph_h * 0.42,
+                            w * 0.42, 0.95 if live else 0.55)
+
+        # The frame. Its dash pattern, not its colour, is what says "game".
+        self._rounded(cr, x, y, w, h, r)
+        if mine:
+            cr.set_line_width(2.4 if live else 1.6)
+            cr.set_dash([7.0, 5.0], -self.phase * 18.0 if live else 0.0)
+            cr.set_source_rgba(*rgb, 0.95 if live else 0.55)
+        else:
+            cr.set_line_width(1.2)
+            cr.set_dash([])
+            cr.set_source_rgba(*DIM_RGB, 0.22)
+        cr.stroke()
+        cr.set_dash([])
+
+    def _sparks(self, cr, x, top, w, h, seed):
+        """Boost: a few embers rising through the reserved tile."""
+        for k in range(4):
+            t = (self.phase * 0.55 + k / 4 + seed * 0.37) % 1.0
+            sx = x + w * (0.25 + 0.5 * ((k * 0.618 + seed * 0.29) % 1.0))
+            sx += math.sin(t * 6.0 + k) * w * 0.04
+            sy = top + h * (1.0 - t)
+            edge = math.sin(t * math.pi)
+            self._glow(cr, sx, sy, w * 0.07, GAME_HOT_RGB, 0.6 * edge)
+            cr.set_source_rgba(1, 0.95, 0.85, 0.9 * edge)
+            cr.arc(sx, sy, max(1.2, w * 0.012), 0, 2 * math.pi)
+            cr.fill()
+
+
+# --------------------------------------------------------------------------
+# Who is using the CPUs
+# --------------------------------------------------------------------------
+
+class UsageRow(Gtk.Box):
+    def __init__(self, icon, title, game):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self.append(Gtk.Image(icon_name=icon, pixel_size=20,
+                              valign=Gtk.Align.CENTER))
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1,
+                       hexpand=True)
+        head = Gtk.Box(spacing=8)
+        head.append(Gtk.Label(label=title, xalign=0.0, hexpand=True,
+                              css_classes=["gm-row-title"]))
+        self.value = Gtk.Label(label="–", xalign=1.0,
+                               css_classes=["gm-row-value"])
+        head.append(self.value)
+        text.append(head)
+        self.bar = Gtk.LevelBar(min_value=0.0, max_value=1.0,
+                                css_classes=["gm-game" if game else "gm-rest"])
+        # Without this GTK paints high fills with its own warning colours.
+        for name in ("low", "high", "full"):
+            self.bar.remove_offset_value(name)
+        text.append(self.bar)
+        self.note = Gtk.Label(label="", xalign=0.0, css_classes=["gm-row-note"])
+        text.append(self.note)
+        self.append(text)
+
+    def update(self, cpus, total, note):
+        self.value.set_label(f"{cpus:4.1f} CPUs")
+        self.bar.set_value(min(1.0, cpus / total) if total else 0.0)
+        self.note.set_label(note)
+
+
+# --------------------------------------------------------------------------
+# Talking to game-mode-cpus
+# --------------------------------------------------------------------------
+
+def run_backend(args, callback):
+    """callback(ok, stdout_and_stderr). Never blocks the main loop."""
+    try:
+        proc = Gio.Subprocess.new(
+            [BACKEND] + args,
+            Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE)
+    except GLib.Error as exc:
+        callback(False, f"Could not run {BACKEND}: {exc.message}")
+        return
+
+    def done(source, result):
+        try:
+            _, out, _ = source.communicate_utf8_finish(result)
+        except GLib.Error as exc:
+            callback(False, exc.message)
+            return
+        callback(source.get_successful(), (out or "").strip())
+
+    proc.communicate_utf8_async(None, None, done)
+
+
+def ranges(cpus):
+    """[3, 4, 13, 14] -> "3, 4, 13 and 14": these get read aloud, roughly."""
+    words = [str(c) for c in cpus]
+    if len(words) < 2:
+        return "".join(words)
+    return ", ".join(words[:-1]) + " and " + words[-1]
+
+
+# --------------------------------------------------------------------------
+# The window
+# --------------------------------------------------------------------------
+
+class GameModeWindow(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(title="Game Mode")
+        if app is not None:
+            self.set_application(app)
+        self.set_default_size(560, 820)
+        self.state = None
+        self.busy = False
+        self.cpus = CpuSampler()
+        self.groups = GroupSampler()
+
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE,
+                               transition_duration=220)
+        self.stack.add_named(self._build_loading(), "loading")
+        self.stack.add_named(self._build_home(), "home")
+        self.stack.add_named(self._build_error(), "error")
+
+        header = Adw.HeaderBar(css_classes=["flat"])
+        header.set_title_widget(Adw.WindowTitle(title="Game Mode",
+                                                subtitle=os.uname().nodename))
+        toolbar = Adw.ToolbarView()
+        toolbar.add_top_bar(header)
+        toolbar.set_content(self.stack)
+        toolbar.add_css_class("gm-root")
+        self.set_content(toolbar)
+
+        self.sample_id = GLib.timeout_add(SAMPLE_MS, self._sample)
+        self.status_id = GLib.timeout_add_seconds(STATUS_EVERY_S,
+                                                  self._poll_status)
+        self.connect("close-request", self._on_close)
+
+    def _on_close(self, _win):
+        for source in (self.sample_id, self.status_id):
+            if source:
+                GLib.source_remove(source)
+        self.sample_id = self.status_id = 0
+        return False
+
+    # -- pages ------------------------------------------------------------
+
+    def _build_loading(self):
+        page = Adw.StatusPage(title="Reading the CPUs…")
+        page.set_child(Adw.Spinner(width_request=48, height_request=48))
+        return page
+
+    def _build_home(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                      margin_top=2, margin_bottom=18,
+                      margin_start=24, margin_end=24)
+
+        self.view = CpuView()
+        box.append(self.view)
+
+        self.hero = Gtk.Label(css_classes=["gm-hero"], wrap=True,
+                              justify=Gtk.Justification.CENTER)
+        self.sub = Gtk.Label(css_classes=["gm-sub"], wrap=True,
+                             justify=Gtk.Justification.CENTER)
+        box.append(self.hero)
+        box.append(self.sub)
+
+        # At most one banner shows at a time; see _show_banner.
+        self.banner = Adw.Banner(revealed=False)
+        self.banner.connect("button-clicked", lambda _b: self._banner_action())
+        self.banner_action = None
+        box.append(self.banner)
+
+        self.toggle = Gtk.Button(css_classes=["gm-big"], margin_top=4)
+        face = Gtk.Box(spacing=16, halign=Gtk.Align.CENTER)
+        self.toggle_icon = Gtk.Image(pixel_size=30)
+        face.append(self.toggle_icon)
+        words = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2,
+                        valign=Gtk.Align.CENTER)
+        self.toggle_title = Gtk.Label(xalign=0.0, css_classes=["gm-big"])
+        self.toggle_sub = Gtk.Label(xalign=0.0, css_classes=["gm-sub"])
+        words.append(self.toggle_title)
+        words.append(self.toggle_sub)
+        face.append(words)
+        self.toggle_spinner = Adw.Spinner(visible=False)
+        face.append(self.toggle_spinner)
+        self.toggle.set_child(face)
+        self.toggle.connect("clicked", lambda _b: self._on_toggle())
+        box.append(self.toggle)
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
+                       css_classes=["gm-card"], margin_top=4)
+        card.append(Gtk.Label(label="Who is using the CPUs", xalign=0.0,
+                              css_classes=["gm-row-note"]))
+        self.rows = {
+            "game": UsageRow("applications-games-symbolic",
+                             "Steam and the game", True),
+            "apps": UsageRow("utilities-terminal-symbolic",
+                             "Your apps, tests and sandboxes", False),
+            "vms": UsageRow("computer-symbolic",
+                            "Virtual machines", False),
+            "services": UsageRow("system-run-symbolic",
+                                 "Services and containers", False),
+        }
+        for row in self.rows.values():
+            card.append(row)
+        box.append(card)
+        return box
+
+    def _build_error(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16,
+                      margin_top=12, margin_bottom=24,
+                      margin_start=24, margin_end=24)
+        box.append(Gtk.Image(icon_name="dialog-warning-symbolic",
+                             pixel_size=56, margin_top=12))
+        self.error_title = Gtk.Label(css_classes=["gm-hero"], wrap=True,
+                                     justify=Gtk.Justification.CENTER)
+        box.append(self.error_title)
+        self.error_body = Gtk.Label(css_classes=["gm-log"], xalign=0.0,
+                                    wrap=True, selectable=True,
+                                    valign=Gtk.Align.START)
+        scroller = Gtk.ScrolledWindow(vexpand=True, css_classes=["gm-card"],
+                                      hscrollbar_policy=Gtk.PolicyType.NEVER)
+        scroller.set_child(self.error_body)
+        box.append(scroller)
+        self.error_back = Gtk.Button(label="Back", css_classes=["pill"],
+                                     halign=Gtk.Align.CENTER)
+        self.error_back.connect("clicked", lambda _b: self.refresh_status())
+        box.append(self.error_back)
+        return box
+
+    # -- state ------------------------------------------------------------
+
+    def refresh_status(self, quiet=False):
+        if not quiet:
+            self.stack.set_visible_child_name("loading")
+        run_backend(["status", "--json"], self._got_status)
+
+    def _poll_status(self):
+        if not self.busy and self.stack.get_visible_child_name() == "home":
+            self.refresh_status(quiet=True)
+        return GLib.SOURCE_CONTINUE
+
+    def _got_status(self, ok, text):
+        if not ok:
+            self.show_error("Could not read Game Mode's state", text)
+            return
+        try:
+            state = json.loads(text)
+        except ValueError as exc:
+            self.show_error("game-mode-cpus said something unreadable",
+                            f"{exc}\n\n{text}")
+            return
+        self.apply_state(state)
+        self.stack.set_visible_child_name("home")
+
+    def apply_state(self, state):
+        self.state = state
+        mode = state.get("mode", "unknown")
+        on = mode == "on"
+        reserved = state.get("reserved", [])
+        cores = [c["core"] for c in state.get("cores", [])
+                 if any(cpu in reserved for cpu in c["cpus"])]
+        core_words = ranges(cores)
+        total = sum(len(c["cpus"]) for c in state.get("cores", []))
+        self.view.set_state(state.get("cores", []), reserved, on)
+
+        if on:
+            self.hero.set_label(f"Cores {core_words} are the game's")
+            self.sub.set_label(
+                f"Everything else is kept off CPUs {ranges(reserved)}. "
+                f"The game can still use all {total}.")
+        elif mode == "off":
+            self.hero.set_label("Game Mode is off")
+            self.sub.set_label(f"Everything shares all {total} CPUs. Turn it "
+                               f"on to keep cores {core_words} free for the "
+                               "game.")
+        else:
+            self.hero.set_label("Game Mode is half on")
+            self.sub.set_label("Some of the fences are up and some are not. "
+                               "Turning it on or off puts that right.")
+
+        self._show_banner(state, mode)
+        self._set_toggle(on)
+
+    def _show_banner(self, state, mode):
+        if mode != "off" and state.get("steam") == "outside":
+            self.banner.set_title("Steam started after Game Mode, so it is "
+                                  "fenced off with everything else.")
+            self.banner.set_button_label("Bring it in")
+            self.banner_action = "on"
+        elif mode != "off" and not state.get("cpuset_delegated", True):
+            self.banner.set_title("Your own apps and tests are not fenced yet. "
+                                  "Log out and back in once to finish setup.")
+            self.banner.set_button_label(None)
+            self.banner_action = None
+        elif mode == "partial":
+            self.banner.set_title("Game Mode is only partly on.")
+            self.banner.set_button_label("Turn it on")
+            self.banner_action = "on"
+        else:
+            self.banner.set_revealed(False)
+            return
+        self.banner.set_revealed(True)
+
+    def _banner_action(self):
+        if self.banner_action:
+            self._run_toggle(self.banner_action)
+
+    def _set_toggle(self, on):
+        for cls in ("gm-on", "gm-off"):
+            self.toggle.remove_css_class(cls)
+        if on:
+            self.toggle.add_css_class("gm-off")
+            self.toggle_icon.set_from_icon_name("media-playback-stop-symbolic")
+            self.toggle_title.set_label("Turn off Game Mode")
+            self.toggle_sub.set_label("Give the cores back")
+        else:
+            self.toggle.add_css_class("gm-on")
+            self.toggle_icon.set_from_icon_name("applications-games-symbolic")
+            self.toggle_title.set_label("Turn on Game Mode")
+            self.toggle_sub.set_label("Keep the fastest cores for the game")
+
+    # -- toggling ---------------------------------------------------------
+
+    def _on_toggle(self):
+        on = (self.state or {}).get("mode") == "on"
+        self._run_toggle("off" if on else "on")
+
+    def _run_toggle(self, verb):
+        if self.busy:
+            return
+        self.busy = True
+        self.toggle.set_sensitive(False)
+        self.toggle_spinner.set_visible(True)
+
+        def done(ok, text):
+            self.busy = False
+            self.toggle.set_sensitive(True)
+            self.toggle_spinner.set_visible(False)
+            if not ok:
+                self.show_error(f"Could not turn Game Mode {verb}", text)
+                return
+            self.refresh_status(quiet=True)
+
+        run_backend([verb], done)
+
+    # -- live numbers -----------------------------------------------------
+
+    def _sample(self):
+        self.view.set_loads(self.cpus.sample())
+        if self.state:
+            self._update_rows()
+        return GLib.SOURCE_CONTINUE
+
+    def _update_rows(self):
+        st = self.state
+        cg = st.get("cgroups", {})
+        steam_cg = cg.get("steam")
+        steam_outside = st.get("steam") == "outside"
+        used = self.groups.sample({
+            "game": steam_cg if steam_outside else cg.get("game"),
+            "apps": cg.get("apps"),
+            "background": cg.get("background"),
+            "vms": cg.get("vms"),
+            "services": cg.get("services"),
+        })
+        # Steam outside game.slice is still inside app.slice; count it once.
+        apps = used["apps"] + used["background"]
+        if steam_outside:
+            apps = max(0.0, apps - used["game"])
+
+        total = sum(len(c["cpus"]) for c in st.get("cores", []))
+        reserved = st.get("reserved", [])
+        on = st.get("mode") == "on"
+        fence = (f"kept off CPUs {ranges(reserved)}" if on
+                 else "free to use every CPU")
+        apps_fenced = on and st.get("cpuset_delegated")
+
+        self.rows["game"].update(used["game"], total,
+                                 "not running" if st.get("steam") == "none"
+                                 else "never fenced" if not steam_outside
+                                 else "fenced, outside the game lane"
+                                 if on else "free to use every CPU")
+        self.rows["apps"].update(apps, total,
+                                 fence if apps_fenced or not on
+                                 else "not fenced until you log in again")
+        self.rows["vms"].update(used["vms"], total, fence)
+        self.rows["services"].update(used["services"], total, fence)
+
+    # -- errors -----------------------------------------------------------
+
+    def show_error(self, title, body):
+        self.busy = False
+        self.error_title.set_label(title)
+        self.error_body.set_label(body or "No further detail.")
+        self.stack.set_visible_child_name("error")
+        self.error_back.grab_focus()
+
+
+def load_css():
+    Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+    display = Gdk.Display.get_default()
+    if display is None:
+        return
+    provider = Gtk.CssProvider()
+    provider.load_from_data(CSS)
+    Gtk.StyleContext.add_provider_for_display(
+        display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+
+class GameModeApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id="io.mgalgs.GameMode")
+        self.window = None
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        load_css()
+
+    def do_activate(self):
+        if not self.window:
+            self.window = GameModeWindow(self)
+            self.window.refresh_status()
+        self.window.present()
+
+
+SAMPLE_STATE = {
+    "mode": "on",
+    "reserved": [3, 4, 13, 14],
+    "cores": [{"core": c, "cpus": [i, i + 10], "max_khz": 4300000}
+              for i, c in enumerate([0, 1, 2, 3, 4, 8, 9, 10, 11, 12])],
+    "cpuset_delegated": False,
+    "steam": "game",
+    "cgroups": {"game": None, "steam": None, "apps": None,
+                "background": None, "vms": None, "services": None},
+}
+
+
+def self_test():
+    """Build every page and draw every state against a real surface.
+
+    Cairo draws that are wrong mostly paint nothing rather than raise, so
+    this proves the code paths run, not that the picture looks right.
+    """
+    Adw.init()
+    load_css()
+    win = GameModeWindow(None)
+    for name in ("loading", "home", "error"):
+        win.stack.set_visible_child_name(name)
+        assert win.stack.get_visible_child_name() == name, name
+
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 520, 260)
+    cr = cairo.Context(surface)
+    for mode in ("on", "off", "partial"):
+        for steam in ("game", "outside", "none"):
+            for delegated in (True, False):
+                st = dict(SAMPLE_STATE, mode=mode, steam=steam,
+                          cpuset_delegated=delegated)
+                win.apply_state(st)
+                win._update_rows()
+                assert win.hero.get_label()
+                win.view.shown = {c: (c % 7) / 6 for c in range(20)}
+                for win.view.phase in (0.0, 0.7, 3.3):
+                    win.view._draw(win.view, cr, 520, 260)
+    win.view._draw(win.view, cr, 60, 40)  # drives every clamp
+
+    win.apply_state(dict(SAMPLE_STATE, mode="on", steam="outside"))
+    assert win.banner.get_revealed() and win.banner_action == "on"
+    win.apply_state(dict(SAMPLE_STATE, mode="off"))
+    assert not win.banner.get_revealed()
+    assert win.toggle_title.get_label() == "Turn on Game Mode"
+
+    loads = win.cpus.sample()
+    loads = win.cpus.sample()
+    assert all(0.0 <= v <= 1.0 for v in loads.values())
+    assert ranges([3, 4, 13, 14]) == "3, 4, 13 and 14"
+
+    win.show_error("t", "body")
+    assert win.stack.get_visible_child_name() == "error"
+    print("self-test ok: pages build, CSS parses, every state draws")
+
+
+def snapshot(path):
+    """Draw the chip off, then on, into one PNG -- no window is shown.
+
+    Uses this machine's live per-CPU load, so it is a real picture of the
+    moment rather than a mock-up.
+    """
+    view = CpuView()
+    sampler = CpuSampler()
+    sampler.sample()
+    GLib.usleep(400_000)
+    view.shown = sampler.sample()
+    w, h = 1040, 520
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, w * 2, h)
+    cr = cairo.Context(surface)
+    bg = cairo.LinearGradient(0, 0, w * 2, h)
+    bg.add_color_stop_rgb(0.0, 0.04, 0.06, 0.13)
+    bg.add_color_stop_rgb(1.0, 0.05, 0.10, 0.20)
+    cr.set_source(bg)
+    cr.paint()
+    for i, on in enumerate((False, True)):
+        view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], on)
+        view.phase = 1.3
+        cr.save()
+        cr.translate(i * w, 0)
+        view._draw(view, cr, w, h)
+        cr.restore()
+    surface.write_to_png(path)
+    print(f"wrote {path}")
+
+
+def main():
+    args = sys.argv[1:]
+    if "--self-test" in args:
+        self_test()
+        return 0
+    if args[:1] == ["--snapshot"] and len(args) == 2:
+        snapshot(args[1])
+        return 0
+    if "--help" in args or "-h" in args:
+        print(__doc__)
+        return 0
+    return GameModeApp().run(sys.argv[:1])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

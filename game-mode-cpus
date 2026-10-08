@@ -1,0 +1,345 @@
+#!/usr/bin/python3 -I
+"""game-mode-cpus: keep background work off a few CPUs while a game runs.
+
+    game-mode-cpus status [--json]   anyone
+    game-mode-cpus on | off          the desktop user; uses sudo -n for the
+                                     system half
+    game-mode-cpus --system on|off   root only; this is what sudoers allows
+
+"On" reserves the machine's fastest cores (and their SMT siblings) for the
+game by fencing everything else off them:
+
+  - Steam, and every game it launched, is moved into game.slice in the
+    user's systemd manager. That slice is never fenced, so the game can
+    still use every CPU; it just has a few that nothing else may touch.
+  - app.slice and background.slice (terminals, tmux, tests, sandboxes) get
+    AllowedCPUs= the remaining CPUs. This needs the cpuset controller
+    delegated to user@.service, which install.sh arranges; until the next
+    login it is not, and only the system half applies.
+  - machine.slice (VMs) and system.slice (docker, services) get the same,
+    from root.
+
+All of it is --runtime: a reboot turns Game Mode off.
+"""
+
+import json
+import os
+import subprocess
+import sys
+
+# How many physical cores to reserve. Each brings its SMT sibling along.
+RESERVE_CORES = 2
+
+# The sudoers rule names this exact path. Running a copy from anywhere else
+# still escalates through the installed one.
+INSTALLED = "/usr/local/bin/game-mode-cpus"
+
+SYSTEM_UNITS = ("machine.slice", "system.slice")
+USER_UNITS = ("app.slice", "background.slice")
+GAME_SLICE = "game.slice"
+
+# Process names that mark a cgroup as the game's. Steam is the parent of
+# everything it launches, so pulling Steam's scope in pulls the game in too.
+GAME_PROCS = ("steam",)
+
+CPU_SYS = "/sys/devices/system/cpu"
+CGROUP_ROOT = "/sys/fs/cgroup"
+
+
+class Fail(Exception):
+    pass
+
+
+def run(argv):
+    proc = subprocess.run(argv, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise Fail(f"{' '.join(argv)}\n{(proc.stderr or proc.stdout).strip()}")
+    return proc.stdout
+
+
+def read(path, default=""):
+    try:
+        with open(path) as fh:
+            return fh.read().strip()
+    except OSError:
+        return default
+
+
+# --------------------------------------------------------------------------
+# Topology
+# --------------------------------------------------------------------------
+
+def cores():
+    """Physical cores, as [{"core", "cpus", "max_khz"}], sorted by core id."""
+    by_core = {}
+    for name in os.listdir(CPU_SYS):
+        if not (name.startswith("cpu") and name[3:].isdigit()):
+            continue
+        base = os.path.join(CPU_SYS, name)
+        core_id = read(os.path.join(base, "topology/core_id"))
+        if not core_id:
+            continue  # offline
+        key = (int(read(os.path.join(base, "topology/physical_package_id"),
+                        "0")), int(core_id))
+        entry = by_core.setdefault(key, {"core": key[1], "cpus": [],
+                                         "max_khz": 0})
+        entry["cpus"].append(int(name[3:]))
+        entry["max_khz"] = max(entry["max_khz"], int(
+            read(os.path.join(base, "cpufreq/cpuinfo_max_freq"), "0")))
+    out = [by_core[k] for k in sorted(by_core)]
+    for entry in out:
+        entry["cpus"].sort()
+    return out
+
+
+def reserved_cpus(topo):
+    """The fastest cores' CPUs.
+
+    The fastest-boosting cores are also the ones the scheduler prefers
+    (Turbo Boost Max 3.0 / preferred cores), so unfenced background work
+    piles onto exactly these first. Ties break by core id, so the choice
+    is stable across boots.
+    """
+    best = sorted(topo, key=lambda c: (-c["max_khz"], c["core"]))
+    return sorted(cpu for c in best[:RESERVE_CORES] for cpu in c["cpus"])
+
+
+def fenced_cpus(topo, reserved):
+    return sorted(cpu for c in topo for cpu in c["cpus"]
+                  if cpu not in reserved)
+
+
+def cpulist(cpus):
+    return ",".join(str(c) for c in cpus)
+
+
+# --------------------------------------------------------------------------
+# The system half (root)
+# --------------------------------------------------------------------------
+
+def system_apply(allowed):
+    for unit in SYSTEM_UNITS:
+        run(["systemctl", "set-property", "--runtime", unit,
+             f"AllowedCPUs={allowed}"])
+
+
+def system_escalate(verb):
+    """sudo -n, never a prompt: the GUI has nowhere to show one."""
+    proc = subprocess.run(["sudo", "-n", INSTALLED, "--system", verb],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        if "password is required" in detail:
+            detail = ("sudo wants a password for the system half. Run "
+                      "install.sh again, or check "
+                      "/etc/sudoers.d/game-mode.\n" + detail)
+        raise Fail(detail)
+
+
+# --------------------------------------------------------------------------
+# The user half
+# --------------------------------------------------------------------------
+
+def user_cgroup(unit):
+    path = run(["systemctl", "--user", "show", "-p", "ControlGroup",
+                "--value", unit]).strip()
+    if not path:
+        # An implicit slice with nothing in it yet has no cgroup; derive it
+        # from app.slice, which always exists in a graphical session.
+        app = run(["systemctl", "--user", "show", "-p", "ControlGroup",
+                   "--value", "app.slice"]).strip()
+        path = os.path.join(os.path.dirname(app), unit)
+    return CGROUP_ROOT + path
+
+
+def cpuset_delegated():
+    controllers = read(os.path.join(user_cgroup("app.slice"),
+                                    "cgroup.controllers"))
+    return "cpuset" in controllers.split()
+
+
+def game_cgroups():
+    """{cgroup path: [pids]} for every cgroup holding a game process, with
+    all the pids under it (recursively) -- the whole scope moves at once."""
+    found = {}
+    uid = os.getuid()
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != uid:
+                continue
+        except OSError:
+            continue
+        if read(f"/proc/{pid}/comm") not in GAME_PROCS:
+            continue
+        line = read(f"/proc/{pid}/cgroup")
+        if not line.startswith("0::"):
+            continue
+        found.setdefault(CGROUP_ROOT + line[3:], None)
+    for cg in found:
+        pids = []
+        for dirpath, _dirs, files in os.walk(cg):
+            if "cgroup.procs" in files:
+                pids += [int(p) for p in read(
+                    os.path.join(dirpath, "cgroup.procs")).split()]
+        found[cg] = pids
+    return found
+
+
+def steam_state(game_cg):
+    groups = game_cgroups()
+    if not groups:
+        return "none", None
+    for cg in groups:
+        if not cg.startswith(game_cg + "/"):
+            return "outside", cg
+    return "game", next(iter(groups))
+
+
+def pull_game_in(game_cg):
+    """Move every game cgroup that is not already in game.slice into a new
+    scope there. StartTransientUnit with PIDs is how gnome-shell itself puts
+    already-running processes into a scope."""
+    for cg, pids in game_cgroups().items():
+        if cg.startswith(game_cg + "/") or not pids:
+            continue
+        unit = f"game-{os.path.basename(cg).removesuffix('.scope')}.scope"
+        # A process can exit between listing and moving, which fails the
+        # whole call with ESRCH; drop the dead and retry once.
+        for _attempt in range(2):
+            pids = [p for p in pids if os.path.exists(f"/proc/{p}")]
+            try:
+                run(["busctl", "--user", "call", "org.freedesktop.systemd1",
+                     "/org/freedesktop/systemd1",
+                     "org.freedesktop.systemd1.Manager", "StartTransientUnit",
+                     "ssa(sv)a(sa(sv))", unit, "fail", "2",
+                     "Slice", "s", GAME_SLICE,
+                     "PIDs", "au", str(len(pids)), *map(str, pids), "0"])
+                print(f"moved {os.path.basename(cg)} ({len(pids)} processes) "
+                      f"into {GAME_SLICE}")
+                break
+            except Fail as exc:
+                if "No such process" not in str(exc):
+                    raise
+        else:
+            raise Fail(f"could not move {cg} into {GAME_SLICE}: its "
+                       "processes kept exiting")
+
+
+def user_apply(on, fenced):
+    game_cg = user_cgroup(GAME_SLICE)
+    if on:
+        pull_game_in(game_cg)
+    # The weight matters on the shared CPUs: there the game competes with
+    # app.slice, and 10x its share keeps it ahead.
+    run(["systemctl", "--user", "set-property", "--runtime", GAME_SLICE,
+         "CPUWeight=1000" if on else "CPUWeight="])
+    if not cpuset_delegated():
+        if on:
+            print("cpuset is not delegated to your session yet, so your own "
+                  "apps and tests are not fenced. Log out and back in once.")
+        return
+    for unit in USER_UNITS:
+        run(["systemctl", "--user", "set-property", "--runtime", unit,
+             f"AllowedCPUs={cpulist(fenced) if on else ''}"])
+
+
+# --------------------------------------------------------------------------
+# Status
+# --------------------------------------------------------------------------
+
+def allowed(unit, user):
+    argv = ["systemctl"] + (["--user"] if user else []) + [
+        "show", "-p", "AllowedCPUs", "--value", unit]
+    return run(argv).strip()
+
+
+def status():
+    topo = cores()
+    reserved = reserved_cpus(topo)
+    system_on = all(allowed(u, False) for u in SYSTEM_UNITS)
+    system_any = any(allowed(u, False) for u in SYSTEM_UNITS)
+    delegated = cpuset_delegated()
+    user_on = all(allowed(u, True) for u in USER_UNITS)
+    user_any = any(allowed(u, True) for u in USER_UNITS)
+    game_cg = user_cgroup(GAME_SLICE)
+    steam, steam_cg = steam_state(game_cg)
+
+    if system_on and (user_on or not delegated):
+        mode = "on"
+    elif not (system_any or user_any):
+        mode = "off"
+    else:
+        mode = "partial"
+
+    return {
+        "mode": mode,
+        "reserved": reserved,
+        "cores": topo,
+        "cpuset_delegated": delegated,
+        "steam": steam,
+        "cgroups": {
+            "game": game_cg,
+            "steam": steam_cg,
+            "apps": user_cgroup("app.slice"),
+            "background": user_cgroup("background.slice"),
+            "vms": f"{CGROUP_ROOT}/machine.slice",
+            "services": f"{CGROUP_ROOT}/system.slice",
+        },
+    }
+
+
+def print_status(st):
+    print(f"Game Mode is {st['mode']}.")
+    print(f"Reserved CPUs: {cpulist(st['reserved'])}")
+    print(f"Steam: {st['steam']}")
+    if not st["cpuset_delegated"]:
+        print("Your own apps are not fenced until you log out and back in.")
+
+
+# --------------------------------------------------------------------------
+
+def main(argv):
+    try:
+        if argv[:1] == ["--system"]:
+            if os.geteuid() != 0 or argv[1:] not in (["on"], ["off"]):
+                print(__doc__, file=sys.stderr)
+                return 2
+            topo = cores()
+            system_apply(cpulist(fenced_cpus(topo, reserved_cpus(topo)))
+                         if argv[1] == "on" else "")
+            return 0
+
+        if argv[:1] == ["status"]:
+            st = status()
+            if "--json" in argv:
+                print(json.dumps(st))
+            else:
+                print_status(st)
+            return 0
+
+        if argv in (["on"], ["off"]):
+            if os.geteuid() == 0:
+                raise Fail("run on/off as yourself, not root: the user half "
+                           "talks to your own systemd manager")
+            on = argv[0] == "on"
+            topo = cores()
+            reserved = reserved_cpus(topo)
+            fenced = fenced_cpus(topo, reserved)
+            user_apply(on, fenced)
+            system_escalate(argv[0])
+            print(f"Game Mode {'on' if on else 'off'}: CPUs "
+                  f"{cpulist(reserved)} "
+                  f"{'reserved for the game' if on else 'shared again'}.")
+            return 0
+    except Fail as exc:
+        print(f"game-mode-cpus: {exc}", file=sys.stderr)
+        return 1
+
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
