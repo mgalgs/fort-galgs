@@ -153,9 +153,12 @@ def user_cgroup(unit):
 
 
 def cpuset_delegated():
-    controllers = read(os.path.join(user_cgroup("app.slice"),
-                                    "cgroup.controllers"))
-    return "cpuset" in controllers.split()
+    # Check the manager's own cgroup, not app.slice: the manager only enables
+    # cpuset below itself while some unit sets AllowedCPUs=, so app.slice
+    # lacks it whenever Game Mode is off.
+    manager = os.path.dirname(user_cgroup("app.slice"))
+    return "cpuset" in read(os.path.join(manager,
+                                         "cgroup.controllers")).split()
 
 
 def game_cgroups():
