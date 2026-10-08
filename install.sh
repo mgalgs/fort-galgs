@@ -63,7 +63,7 @@ sed 's/^/    /' "$SUDOERS"
 # --- cpuset delegation ----------------------------------------------------
 
 # systemd delegates cpu, memory and pids to user@.service by default, so a
-# user's own AllowedCPUs= is silently ignored. Takes effect at next login.
+# user's own AllowedCPUs= is silently ignored.
 mkdir -p "$(dirname "$DELEGATE")"
 cat >"$DELEGATE" <<'EOF'
 # Managed by Game Mode's install.sh -- edit there.
@@ -74,12 +74,19 @@ EOF
 systemctl daemon-reload
 echo "installed $DELEGATE"
 
+# The running user manager probed its controllers when it started, and
+# logging out does not restart it when the user lingers. A re-exec re-probes
+# without stopping any of the user's processes.
+if systemctl --user -M "$USER_NAME@" daemon-reexec 2>/dev/null; then
+    echo "re-executed $USER_NAME's systemd manager to pick up cpuset"
+fi
+
 echo
 uid="$(id -u "$USER_NAME")"
-apps="/sys/fs/cgroup/user.slice/user-$uid.slice/user@$uid.service/app.slice"
-if grep -qsw cpuset "$apps/cgroup.controllers"; then
-    echo "installed. cpuset is already delegated to your session."
+manager="/sys/fs/cgroup/user.slice/user-$uid.slice/user@$uid.service"
+if grep -qsw cpuset "$manager/cgroup.controllers"; then
+    echo "installed. Your own apps, VMs and services can all be fenced."
 else
-    echo "installed. Log out and back in once so your own apps can be fenced"
-    echo "too; VMs and services are fenced from now on."
+    echo "installed, but cpuset is not reaching $USER_NAME's session yet."
+    echo "Run: systemctl --user daemon-reexec"
 fi

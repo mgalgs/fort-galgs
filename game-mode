@@ -695,7 +695,7 @@ class GameModeWindow(Adw.ApplicationWindow):
             self.banner_action = "on"
         elif mode != "off" and not state.get("cpuset_delegated", True):
             self.banner.set_title("Your own apps and tests are not fenced yet. "
-                                  "Log out and back in once to finish setup.")
+                                  "Run systemctl --user daemon-reexec to finish setup.")
             self.banner.set_button_label(None)
             self.banner_action = None
         elif mode == "partial":
@@ -788,7 +788,7 @@ class GameModeWindow(Adw.ApplicationWindow):
                                  if on else "free to use every CPU")
         self.rows["apps"].update(apps, total,
                                  fence if apps_fenced or not on
-                                 else "not fenced until you log in again")
+                                 else "not fenced: cpuset is not delegated")
         self.rows["vms"].update(used["vms"], total, fence)
         self.rows["services"].update(used["services"], total, fence)
 

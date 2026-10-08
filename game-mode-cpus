@@ -14,8 +14,8 @@ game by fencing everything else off them:
     still use every CPU; it just has a few that nothing else may touch.
   - app.slice and background.slice (terminals, tmux, tests, sandboxes) get
     AllowedCPUs= the remaining CPUs. This needs the cpuset controller
-    delegated to user@.service, which install.sh arranges; until the next
-    login it is not, and only the system half applies.
+    delegated to user@.service, which install.sh arranges; without it only
+    the system half applies.
   - machine.slice (VMs) and system.slice (docker, services) get the same,
     from root.
 
@@ -241,7 +241,8 @@ def user_apply(on, fenced):
     if not cpuset_delegated():
         if on:
             print("cpuset is not delegated to your session yet, so your own "
-                  "apps and tests are not fenced. Log out and back in once.")
+                  "apps and tests are not fenced. Run: systemctl --user "
+                  "daemon-reexec")
         return
     for unit in USER_UNITS:
         run(["systemctl", "--user", "set-property", "--runtime", unit,
@@ -298,7 +299,8 @@ def print_status(st):
     print(f"Reserved CPUs: {cpulist(st['reserved'])}")
     print(f"Steam: {st['steam']}")
     if not st["cpuset_delegated"]:
-        print("Your own apps are not fenced until you log out and back in.")
+        print("Your own apps cannot be fenced yet. Run: systemctl --user "
+              "daemon-reexec")
 
 
 # --------------------------------------------------------------------------

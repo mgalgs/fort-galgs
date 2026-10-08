@@ -37,7 +37,8 @@ does no harm.
 Two cases need attention:
 
 - **Step 2 needs cpuset delegated** to `user@.service`. systemd does not do
-  that by default, and the drop-in only applies at the next login. Until
+  that by default. install.sh adds a drop-in and re-executes the running
+  user manager, which a logout would not restart while the user lingers. Until
   then, step 2 is skipped, and the window and `status` say so.
 - **A Steam started after "on"** lands in the fenced `app.slice`. The window
   shows a banner for this, and running `on` again pulls Steam in.
@@ -49,7 +50,7 @@ cd game-mode
 sudo bash install.sh
 ```
 
-Then log out and back in once, and pin it to the dash:
+Then pin it to the dash:
 
 ```bash
 gsettings get org.gnome.shell favorite-apps   # read first: set replaces the list
