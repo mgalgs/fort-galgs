@@ -28,7 +28,7 @@ import subprocess
 import sys
 
 # How many physical cores to reserve. Each brings its SMT sibling along.
-RESERVE_CORES = 2
+RESERVE_CORES = 4
 
 # The sudoers rule names this exact path. Running a copy from anywhere else
 # still escalates through the installed one.
@@ -98,9 +98,11 @@ def reserved_cpus(topo):
     The fastest-boosting cores are also the ones the scheduler prefers
     (Turbo Boost Max 3.0 / preferred cores), so unfenced background work
     piles onto exactly these first. Ties break by core id, so the choice
-    is stable across boots.
+    is stable across boots, except that CPU 0's core goes last: it takes
+    more interrupts and kernel housekeeping than any other.
     """
-    best = sorted(topo, key=lambda c: (-c["max_khz"], c["core"]))
+    best = sorted(topo, key=lambda c: (-c["max_khz"], 0 in c["cpus"],
+                                       c["core"]))
     return sorted(cpu for c in best[:RESERVE_CORES] for cpu in c["cpus"])
 
 

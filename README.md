@@ -1,7 +1,7 @@
 # Game Mode: CPU reservation on this machine
 
 One icon in the GNOME dash on this machine. While it is on, nothing but the game may
-run on the machine's two fastest cores, so a CI run in a VM,
+run on four of the machine's fastest cores, so a CI run in a VM,
 a busy Kubernetes worker, or a test sweep in tmux cannot starve Rocket League.
 
 | File | Installed to | Does |
@@ -17,10 +17,13 @@ League orange and blue.
 
 ## What "on" does
 
-The reserved CPUs are the `RESERVE_CORES` (2) cores with the highest
-`cpuinfo_max_freq`, plus their SMT siblings. On an i9-7900X that is cores 3
-and 4, CPUs 3, 4, 13 and 14. Those are the Turbo Boost Max cores, which the
-scheduler prefers, so without a fence background work lands on them first.
+The reserved CPUs are the `RESERVE_CORES` (4) cores with the highest
+`cpuinfo_max_freq`, plus their SMT siblings. Ties go by core id, with CPU 0's
+core last, since it takes the most interrupts. On an i9-7900X that is
+cores 1–4, CPUs 1–4 and 11–14. Cores 3 and 4 are the Turbo Boost Max cores,
+which the scheduler prefers, so without a fence background work lands on them
+first. Two cores (4 threads) still let Rocket League stutter under a full
+load, which is why it is four.
 
 1. Steam's scope, with every game it launched, moves into `game.slice` in the
    user's systemd manager, which gets `CPUWeight=1000`. `game.slice` is never
