@@ -1,0 +1,36 @@
+# Maintainer: Mitchel Humpherys <mitch.special@gmail.com>
+pkgname=fort-galgs-git
+_pkgname=fort-galgs
+pkgver=r0
+pkgrel=1
+pkgdesc="Reserve a few CPU cores for the apps you care about and fence everything else off them"
+arch=('any')
+url="https://github.com/mgalgs/fort-galgs"
+license=('LicenseRef-unknown')
+depends=('python' 'python-gobject' 'python-cairo' 'gtk4' 'libadwaita'
+         'systemd' 'sudo')
+makedepends=('git')
+checkdepends=('desktop-file-utils')
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+backup=('etc/fort-galgs.toml')
+install=fort-galgs.install
+# FORT_GALGS_GIT points a local build at a checkout:
+#   FORT_GALGS_GIT=git+file://$HOME/src/fort-galgs makepkg -si
+source=("$_pkgname::${FORT_GALGS_GIT:-git+https://github.com/mgalgs/fort-galgs.git}")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$_pkgname"
+  printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+check() {
+  cd "$_pkgname"
+  make check
+}
+
+package() {
+  cd "$_pkgname"
+  make DESTDIR="$pkgdir" PREFIX=/usr install
+}

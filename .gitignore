@@ -1,0 +1,5 @@
+/packaging/arch/src/
+/packaging/arch/pkg/
+/packaging/arch/fort-galgs/
+/packaging/arch/*.pkg.tar.*
+__pycache__/

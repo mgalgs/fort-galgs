@@ -1,0 +1,8 @@
+[Unit]
+Description=Fort Galgs: pull protected apps into the fort as they start
+
+# No [Install]: 'fortctl on' starts this and 'fortctl off' stops it.
+[Service]
+ExecStart=@BINDIR@/fortctl watch
+Restart=on-failure
+Slice=fort.slice

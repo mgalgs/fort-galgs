@@ -1,0 +1,10 @@
+# Installed by fort-galgs.
+#
+# Lets members of fort-galgs fence system services and VMs off the fort's
+# CPUs without a password; the window runs sudo -n and has nowhere to show a
+# prompt. sudoers matches the whole command line, so nothing else after the
+# path is allowed.
+Cmnd_Alias FORT_GALGS = @BINDIR@/fortctl --system on, \
+                        @BINDIR@/fortctl --system off
+
+%fort-galgs ALL=(root) NOPASSWD: FORT_GALGS
