@@ -1,0 +1,506 @@
+#!/usr/bin/python3 -I
+"""fortctl: keep background work off a few CPUs, for the apps you care about.
+
+    fortctl status [--json]       anyone
+    fortctl on | off              the desktop user; uses sudo -n for the
+                                  system half
+    fortctl protect <app>...      move running apps into the fort; an <app>
+                                  is a process name (firefox) or a scope unit
+    fortctl unprotect <app>...    move them back out
+    fortctl adopt <pid>           move one of your processes into the fort
+    fortctl watch                 keep pulling the configured apps in; run by
+                                  fort-galgs-watch.service while the fort is up
+    fortctl --system on|off       root only; this is what sudoers allows
+
+"On" reserves the machine's fastest cores (and their SMT siblings) for the
+apps in the fort by fencing everything else off them:
+
+  - The apps in /etc/fort-galgs.toml's `protect` list, and any you protect by
+    hand, live in fort.slice in the user's systemd manager. That slice is
+    never fenced, so they can still use every CPU; they just have a few that
+    nothing else may touch.
+  - app.slice and background.slice (terminals, tmux, tests, sandboxes) get
+    AllowedCPUs= the remaining CPUs. This needs the cpuset controller
+    delegated to user@.service, which the package's drop-in arranges;
+    without it only the system half applies.
+  - machine.slice (VMs) and system.slice (docker, services) get the same,
+    from root.
+
+All of it is --runtime: a reboot takes the fort down.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+import tomllib
+
+CONFIG = "/etc/fort-galgs.toml"
+DEFAULTS = {"reserve_cores": 2, "protect": []}
+
+# The sudoers rule names this exact path, and the Makefile rewrites this line
+# to match. Running a copy from anywhere else still escalates through it.
+INSTALLED = "/usr/bin/fortctl"
+
+SYSTEM_UNITS = ("machine.slice", "system.slice")
+USER_UNITS = ("app.slice", "background.slice")
+FORT_SLICE = "fort.slice"
+WATCH_UNIT = "fort-galgs-watch.service"
+WATCH_EVERY_S = 3
+
+CPU_SYS = "/sys/devices/system/cpu"
+CGROUP_ROOT = "/sys/fs/cgroup"
+
+
+class Fail(Exception):
+    pass
+
+
+def run(argv):
+    proc = subprocess.run(argv, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise Fail(f"{' '.join(argv)}\n{(proc.stderr or proc.stdout).strip()}")
+    return proc.stdout
+
+
+def read(path, default=""):
+    try:
+        with open(path) as fh:
+            return fh.read().strip()
+    except OSError:
+        return default
+
+
+def load_config():
+    try:
+        with open(CONFIG, "rb") as fh:
+            raw = tomllib.load(fh)
+    except FileNotFoundError:
+        raw = {}
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise Fail(f"{CONFIG}: {exc}") from None
+    cfg = dict(DEFAULTS, **raw)
+    unknown = set(cfg) - set(DEFAULTS)
+    if unknown:
+        raise Fail(f"{CONFIG}: unknown keys {', '.join(sorted(unknown))}")
+    if not isinstance(cfg["reserve_cores"], int) or cfg["reserve_cores"] < 1:
+        raise Fail(f"{CONFIG}: reserve_cores must be a whole number >= 1")
+    if not (isinstance(cfg["protect"], list)
+            and all(isinstance(p, str) and p for p in cfg["protect"])):
+        raise Fail(f"{CONFIG}: protect must be a list of process names")
+    return cfg
+
+
+# --------------------------------------------------------------------------
+# Topology
+# --------------------------------------------------------------------------
+
+def cores():
+    """Physical cores, as [{"core", "cpus", "max_khz"}], sorted by core id."""
+    by_core = {}
+    for name in os.listdir(CPU_SYS):
+        if not (name.startswith("cpu") and name[3:].isdigit()):
+            continue
+        base = os.path.join(CPU_SYS, name)
+        core_id = read(os.path.join(base, "topology/core_id"))
+        if not core_id:
+            continue  # offline
+        key = (int(read(os.path.join(base, "topology/physical_package_id"),
+                        "0")), int(core_id))
+        entry = by_core.setdefault(key, {"core": key[1], "cpus": [],
+                                         "max_khz": 0})
+        entry["cpus"].append(int(name[3:]))
+        entry["max_khz"] = max(entry["max_khz"], int(
+            read(os.path.join(base, "cpufreq/cpuinfo_max_freq"), "0")))
+    out = [by_core[k] for k in sorted(by_core)]
+    for entry in out:
+        entry["cpus"].sort()
+    return out
+
+
+def reserved_cpus(topo, count):
+    """The fastest cores' CPUs.
+
+    The fastest-boosting cores are also the ones the scheduler prefers
+    (Turbo Boost Max 3.0 / preferred cores, P-cores on hybrid parts), so
+    unfenced background work piles onto exactly these first. Ties break by
+    core id, so the choice is stable across boots, except that CPU 0's core
+    goes last: it takes more interrupts and kernel housekeeping than any
+    other.
+    """
+    if count >= len(topo):
+        raise Fail(f"reserve_cores is {count}, but this machine has only "
+                   f"{len(topo)} cores; leave at least one for everything "
+                   "else")
+    best = sorted(topo, key=lambda c: (-c["max_khz"], 0 in c["cpus"],
+                                       c["core"]))
+    return sorted(cpu for c in best[:count] for cpu in c["cpus"])
+
+
+def fenced_cpus(topo, reserved):
+    return sorted(cpu for c in topo for cpu in c["cpus"]
+                  if cpu not in reserved)
+
+
+def cpulist(cpus):
+    return ",".join(str(c) for c in cpus)
+
+
+# --------------------------------------------------------------------------
+# The system half (root)
+# --------------------------------------------------------------------------
+
+def system_apply(allowed):
+    for unit in SYSTEM_UNITS:
+        run(["systemctl", "set-property", "--runtime", unit,
+             f"AllowedCPUs={allowed}"])
+
+
+def system_escalate(verb):
+    """sudo -n, never a prompt: the GUI has nowhere to show one."""
+    proc = subprocess.run(["sudo", "-n", INSTALLED, "--system", verb],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        if "password is required" in detail:
+            detail = ("sudo wants a password for the system half. Are you "
+                      "in the fort-galgs group? sudo gpasswd -a $USER "
+                      "fort-galgs\n" + detail)
+        raise Fail(detail)
+
+
+# --------------------------------------------------------------------------
+# The user half
+# --------------------------------------------------------------------------
+
+def user_cgroup(unit):
+    path = run(["systemctl", "--user", "show", "-p", "ControlGroup",
+                "--value", unit]).strip()
+    if not path:
+        # An implicit slice with nothing in it yet has no cgroup; derive it
+        # from app.slice, which always exists in a graphical session.
+        app = run(["systemctl", "--user", "show", "-p", "ControlGroup",
+                   "--value", "app.slice"]).strip()
+        path = os.path.join(os.path.dirname(app), unit)
+    return CGROUP_ROOT + path
+
+
+def cpuset_delegated():
+    # Check the manager's own cgroup, not app.slice: the manager only enables
+    # cpuset below itself while some unit sets AllowedCPUs=, so app.slice
+    # lacks it whenever the fort is down.
+    manager = os.path.dirname(user_cgroup("app.slice"))
+    return "cpuset" in read(os.path.join(manager,
+                                         "cgroup.controllers")).split()
+
+
+def started(pid):
+    # Field 22 of stat; the comm before it may hold spaces and parens.
+    fields = read(f"/proc/{pid}/stat").rpartition(")")[2].split()
+    return int(fields[19]) if len(fields) > 19 else 0
+
+
+def desktop_ids(unit):
+    """Guesses at the .desktop id behind a scope, longest first.
+
+    Launchers name scopes app[-<launcher>]-<app id>-<random>.scope, with
+    literal dashes in the id escaped as \\x2d; fortctl adds fort- in front
+    and, moving one back, may add a suffix.
+    """
+    name = unit.removesuffix(".scope").removeprefix("fort-")
+    name = name.removeprefix("app-")
+    segs = name.split("-")
+    out = []
+    for end in range(len(segs), 0, -1):
+        for start in (0, 1):
+            if start < end:
+                guess = "-".join(segs[start:end]).replace("\\x2d", "-")
+                if guess not in out:
+                    out.append(guess)
+    return out
+
+
+def scopes(config):
+    """Every scope with processes in app.slice, background.slice and
+    fort.slice. Only scopes: moving a service's processes out from under it
+    would break the service."""
+    fort_cg = user_cgroup(FORT_SLICE)
+    out = []
+    for slice_ in USER_UNITS + (FORT_SLICE,):
+        top = os.path.join(os.path.dirname(fort_cg), slice_)
+        for dirpath, dirs, _files in os.walk(top):
+            if not dirpath.endswith(".scope"):
+                continue
+            dirs[:] = []
+            pids = []
+            for sub, _d, subfiles in os.walk(dirpath):
+                if "cgroup.procs" in subfiles:
+                    pids += [int(p) for p in read(
+                        os.path.join(sub, "cgroup.procs")).split()]
+            if not pids:
+                continue
+            comms = {p: read(f"/proc/{p}/comm") for p in pids}
+            leader = min(pids, key=lambda p: (started(p), p))
+            unit = os.path.basename(dirpath)
+            out.append({
+                "unit": unit,
+                "cgroup": dirpath,
+                "slice": slice_,
+                "pids": pids,
+                "comms": sorted(set(comms.values()) - {""}),
+                "name": comms[leader] or unit,
+                "inside": slice_ == FORT_SLICE,
+                "always": bool(set(comms.values()) & set(config["protect"])),
+                "desktop_ids": desktop_ids(unit),
+            })
+    return out
+
+
+def move(unit, pids, what, slice_):
+    """Put running processes into a new scope in slice_.
+
+    StartTransientUnit with PIDs is how gnome-shell itself puts
+    already-running processes into a scope.
+    """
+    # A process can exit between listing and moving, which fails the whole
+    # call with ESRCH; drop the dead and retry once.
+    for _attempt in range(2):
+        pids = [p for p in pids if os.path.exists(f"/proc/{p}")]
+        if not pids:
+            return
+        try:
+            run(["busctl", "--user", "call", "org.freedesktop.systemd1",
+                 "/org/freedesktop/systemd1",
+                 "org.freedesktop.systemd1.Manager", "StartTransientUnit",
+                 "ssa(sv)a(sa(sv))", unit, "fail", "2",
+                 "Slice", "s", slice_,
+                 "PIDs", "au", str(len(pids)), *map(str, pids), "0"])
+            print(f"moved {what} ({len(pids)} processes) into {slice_}")
+            return
+        except Fail as exc:
+            if "No such process" not in str(exc):
+                raise
+    raise Fail(f"could not move {what} into {slice_}: its processes "
+               "kept exiting")
+
+
+def matching(found, app):
+    """The scopes app names: a unit by its name, else by a process name."""
+    if app.endswith(".scope"):
+        return [s for s in found if s["unit"] == app]
+    return [s for s in found if app in s["comms"]]
+
+
+def move_in(s):
+    move(f"fort-{s['unit']}", s["pids"], s["unit"], FORT_SLICE)
+
+
+def pull_in(config, names):
+    """Move every scope outside the fort holding one of names into it."""
+    for s in scopes(config):
+        if not s["inside"] and set(s["comms"]) & set(names):
+            move_in(s)
+
+
+def protect(config, app):
+    hits = [s for s in matching(scopes(config), app) if not s["inside"]]
+    if not hits:
+        raise Fail(f"nothing outside the fort matches {app!r} (a process "
+                   "name from /proc/<pid>/comm, or a scope unit)")
+    for s in hits:
+        move_in(s)
+
+
+def unprotect(config, app):
+    hits = [s for s in matching(scopes(config), app) if s["inside"]]
+    if not hits:
+        raise Fail(f"nothing in the fort matches {app!r}")
+    for s in hits:
+        if s["always"]:
+            raise Fail(f"{s['name']} is always in the fort: it is in "
+                       f"{CONFIG}'s protect list")
+    for s in hits:
+        base = s["unit"].removeprefix("fort-").removesuffix(".scope")
+        try:
+            move(f"{base}.scope", s["pids"], s["unit"], "app.slice")
+        except Fail as exc:
+            # The scope it came from may not have been collected yet.
+            if "already exists" not in str(exc):
+                raise
+            move(f"{base}-{os.getpid()}.scope", s["pids"], s["unit"],
+                 "app.slice")
+
+
+def adopt(pid):
+    """Move one process of this user's into the fort, unless it is there.
+
+    The GUI adopts itself, so its animation keeps running while the fenced
+    CPUs are pegged.
+    """
+    try:
+        owner = os.stat(f"/proc/{pid}").st_uid
+    except OSError:
+        raise Fail(f"no such process: {pid}") from None
+    if owner != os.getuid():
+        raise Fail(f"pid {pid} is not yours")
+    fort_cg = user_cgroup(FORT_SLICE)
+    if (CGROUP_ROOT + read(f"/proc/{pid}/cgroup")[3:]).startswith(
+            fort_cg + "/"):
+        return
+    move(f"fort-adopted-{pid}.scope", [pid], f"pid {pid}", FORT_SLICE)
+
+
+def watch(config):
+    """Pull configured apps in as they start. 'on' starts the unit that runs
+    this and 'off' stops it, so it never checks whether the fort is up."""
+    while True:
+        try:
+            pull_in(config, config["protect"])
+        except Fail as exc:
+            print(f"fortctl watch: {exc}", file=sys.stderr, flush=True)
+        time.sleep(WATCH_EVERY_S)
+
+
+def user_apply(config, on, fenced):
+    if on:
+        pull_in(config, config["protect"])
+    # The weight matters on the shared CPUs: there the fort competes with
+    # app.slice, and 10x its share keeps it ahead.
+    run(["systemctl", "--user", "set-property", "--runtime", FORT_SLICE,
+         "CPUWeight=1000" if on else "CPUWeight="])
+    try:
+        run(["systemctl", "--user", "start" if on else "stop", WATCH_UNIT])
+    except Fail as exc:
+        print(f"apps that start later will not be pulled in: {exc}",
+              file=sys.stderr)
+    if not cpuset_delegated():
+        if on:
+            print("cpuset is not delegated to your session yet, so your own "
+                  "apps and tests are not fenced. Run: systemctl --user "
+                  "daemon-reexec")
+        return
+    for unit in USER_UNITS:
+        run(["systemctl", "--user", "set-property", "--runtime", unit,
+             f"AllowedCPUs={cpulist(fenced) if on else ''}"])
+
+
+# --------------------------------------------------------------------------
+# Status
+# --------------------------------------------------------------------------
+
+def allowed(unit, user):
+    argv = ["systemctl"] + (["--user"] if user else []) + [
+        "show", "-p", "AllowedCPUs", "--value", unit]
+    return run(argv).strip()
+
+
+def status(config):
+    topo = cores()
+    reserved = reserved_cpus(topo, config["reserve_cores"])
+    system_on = all(allowed(u, False) for u in SYSTEM_UNITS)
+    system_any = any(allowed(u, False) for u in SYSTEM_UNITS)
+    delegated = cpuset_delegated()
+    user_on = all(allowed(u, True) for u in USER_UNITS)
+    user_any = any(allowed(u, True) for u in USER_UNITS)
+
+    if system_on and (user_on or not delegated):
+        mode = "on"
+    elif not (system_any or user_any):
+        mode = "off"
+    else:
+        mode = "partial"
+
+    apps = scopes(config)
+    for app in apps:
+        del app["pids"]
+    return {
+        "mode": mode,
+        "reserved": reserved,
+        "cores": topo,
+        "cpuset_delegated": delegated,
+        "config": dict(config, path=CONFIG),
+        "apps": apps,
+        "cgroups": {
+            "fort": user_cgroup(FORT_SLICE),
+            "apps": user_cgroup("app.slice"),
+            "background": user_cgroup("background.slice"),
+            "vms": f"{CGROUP_ROOT}/machine.slice",
+            "services": f"{CGROUP_ROOT}/system.slice",
+        },
+    }
+
+
+def print_status(st):
+    print(f"The fort is {st['mode']}.")
+    print(f"Reserved CPUs: {cpulist(st['reserved'])}")
+    inside = [a["name"] + (" (always)" if a["always"] else "")
+              for a in st["apps"] if a["inside"]]
+    print(f"In the fort: {', '.join(inside) or 'nothing'}")
+    stray = [a["name"] for a in st["apps"] if a["always"] and not a["inside"]]
+    if stray and st["mode"] != "off":
+        print(f"Outside, though always protected: {', '.join(stray)}")
+    if not st["cpuset_delegated"]:
+        print("Your own apps cannot be fenced yet. Run: systemctl --user "
+              "daemon-reexec")
+
+
+# --------------------------------------------------------------------------
+
+def main(argv):
+    try:
+        config = load_config()
+        if argv[:1] == ["--system"]:
+            if os.geteuid() != 0 or argv[1:] not in (["on"], ["off"]):
+                print(__doc__, file=sys.stderr)
+                return 2
+            topo = cores()
+            reserved = reserved_cpus(topo, config["reserve_cores"])
+            system_apply(cpulist(fenced_cpus(topo, reserved))
+                         if argv[1] == "on" else "")
+            return 0
+
+        if argv[:1] == ["status"]:
+            st = status(config)
+            if "--json" in argv:
+                print(json.dumps(st))
+            else:
+                print_status(st)
+            return 0
+
+        if len(argv) == 2 and argv[0] == "adopt" and argv[1].isdigit():
+            adopt(int(argv[1]))
+            return 0
+
+        if len(argv) >= 2 and argv[0] in ("protect", "unprotect"):
+            for app in argv[1:]:
+                (protect if argv[0] == "protect" else unprotect)(config, app)
+            return 0
+
+        if argv == ["watch"]:
+            watch(config)
+
+        if argv in (["on"], ["off"]):
+            if os.geteuid() == 0:
+                raise Fail("run on/off as yourself, not root: the user half "
+                           "talks to your own systemd manager")
+            on = argv[0] == "on"
+            topo = cores()
+            reserved = reserved_cpus(topo, config["reserve_cores"])
+            fenced = fenced_cpus(topo, reserved)
+            user_apply(config, on, fenced)
+            system_escalate(argv[0])
+            print(f"The fort is {'up' if on else 'down'}: CPUs "
+                  f"{cpulist(reserved)} "
+                  f"{'reserved' if on else 'shared again'}.")
+            return 0
+    except Fail as exc:
+        print(f"fortctl: {exc}", file=sys.stderr)
+        return 1
+
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

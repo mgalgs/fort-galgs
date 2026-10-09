@@ -1,0 +1,1481 @@
+#!/usr/bin/env python3
+"""Fort Galgs: a front end for fortctl's CPU reservation.
+
+This is a front end. Every change to the machine belongs to fortctl, which
+this program shells out to; if a change fails, its own words are what the
+user sees. The live picture reads /proc/stat and cgroup cpu.stat directly,
+because those are read-only and cheap.
+
+Run with --self-test to build every page and draw every state once, or with
+--snapshot <png> to draw the chip from live load.
+"""
+
+import json
+import math
+import os
+import sys
+
+import cairo
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
+
+try:
+    gi.require_version("GioUnix", "2.0")
+    from gi.repository import GioUnix  # noqa: E402
+    DesktopAppInfo = GioUnix.DesktopAppInfo
+except (ValueError, ImportError):  # GLib before 2.86
+    DesktopAppInfo = Gio.DesktopAppInfo
+
+APP_ID = "io.mgalgs.FortGalgs"
+BACKEND = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                       "fortctl")
+
+SAMPLE_MS = 500
+STATUS_EVERY_S = 5
+
+# An unfocused window is capped at 30 fps: smooth to watch from beside the
+# app it protects, at half the cost of a 60 Hz repaint.
+IDLE_REDRAW_S = 1 / 30
+
+# Campfire orange is the fort; blue is everything outside it.
+FORT_RGB = (1.00, 0.55, 0.12)
+FORT_HOT_RGB = (1.00, 0.33, 0.38)
+REST_RGB = (0.24, 0.62, 1.00)
+DIM_RGB = (0.62, 0.66, 0.85)
+
+# The stockade and the men on it.
+WOOD_RGB = (0.47, 0.31, 0.18)
+WOOD_HI_RGB = (0.64, 0.45, 0.27)
+SEAM_RGB = (0.19, 0.12, 0.07)
+YARD_RGB = (0.17, 0.13, 0.10)
+BUCK_RGB = (0.80, 0.63, 0.42)
+BUCK_DARK_RGB = (0.60, 0.44, 0.28)
+FUR_RGB = (0.52, 0.38, 0.25)
+STRIPE_RGB = (0.20, 0.14, 0.09)
+SKIN_RGB = (0.92, 0.75, 0.60)
+BEARD_RGB = (0.36, 0.24, 0.15)
+RIFLE_WOOD_RGB = (0.42, 0.24, 0.11)
+STEEL_RGB = (0.78, 0.80, 0.85)
+
+
+CSS = b"""
+.gm-root {
+  background-image:
+    radial-gradient(ellipse at 15% 0%, rgba(255,140,30,0.16), transparent 55%),
+    radial-gradient(ellipse at 90% 100%, rgba(60,150,255,0.18), transparent 60%),
+    linear-gradient(165deg, #0a0f22 0%, #141235 50%, #0b1a33 100%);
+}
+
+.gm-hero {
+  font-size: 21pt;
+  font-weight: 800;
+  letter-spacing: -0.5px;
+  color: #f6f4ff;
+}
+
+.gm-sub {
+  font-size: 11.5pt;
+  color: #c3c8ec;
+}
+
+.gm-big {
+  font-size: 15pt;
+  font-weight: 700;
+  padding: 16px 12px;
+  border-radius: 18px;
+}
+
+.gm-on {
+  background-image: linear-gradient(120deg, #ff9a1f, #ff4f6d);
+  color: #ffffff;
+  border: none;
+  box-shadow: 0 6px 22px rgba(255,110,40,0.38);
+}
+
+.gm-on:hover {
+  background-image: linear-gradient(120deg, #ffb04a, #ff6a84);
+}
+
+.gm-off {
+  background-image: linear-gradient(120deg, rgba(60,150,255,0.85), rgba(80,90,230,0.85));
+  color: #ffffff;
+  border: none;
+}
+
+.gm-off:hover {
+  background-image: linear-gradient(120deg, rgba(90,170,255,0.95), rgba(105,115,245,0.95));
+}
+
+.gm-card {
+  background-color: rgba(255,255,255,0.05);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 16px;
+  padding: 12px 16px;
+}
+
+.gm-row-title {
+  font-weight: 600;
+  color: #e9eaff;
+}
+
+.gm-row-value {
+  font-family: monospace;
+  font-size: 10.5pt;
+  color: #e9eaff;
+}
+
+.gm-row-note {
+  font-size: 9pt;
+  color: #9ea5d4;
+}
+
+.gm-log {
+  font-family: monospace;
+  font-size: 9pt;
+  color: #e9eaff;
+}
+
+levelbar.gm-game block.filled { background-color: #ff8c1f; }
+levelbar.gm-rest block.filled { background-color: #3d9eff; }
+levelbar block.empty { background-color: rgba(255,255,255,0.07); }
+"""
+
+
+# --------------------------------------------------------------------------
+# Measuring
+# --------------------------------------------------------------------------
+
+class CpuSampler:
+    """Per-CPU busy fraction from /proc/stat, as deltas between calls."""
+
+    def __init__(self):
+        self.prev = {}
+
+    def sample(self):
+        loads = {}
+        with open("/proc/stat") as fh:
+            for line in fh:
+                if not line.startswith("cpu") or line.startswith("cpu "):
+                    continue
+                parts = line.split()
+                cpu = int(parts[0][3:])
+                vals = [int(v) for v in parts[1:]]
+                idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+                total = sum(vals[:8])  # guest time is already in user
+                prev = self.prev.get(cpu)
+                self.prev[cpu] = (total, idle)
+                if prev and total > prev[0]:
+                    busy = 1.0 - (idle - prev[1]) / (total - prev[0])
+                    loads[cpu] = min(1.0, max(0.0, busy))
+        return loads
+
+
+class GroupSampler:
+    """CPUs' worth of time used per cgroup, from cpu.stat usage_usec."""
+
+    def __init__(self):
+        self.prev = {}
+
+    @staticmethod
+    def _usage(path):
+        try:
+            with open(os.path.join(path, "cpu.stat")) as fh:
+                for line in fh:
+                    if line.startswith("usage_usec "):
+                        return int(line.split()[1])
+        except (OSError, TypeError):
+            pass
+        return None
+
+    def sample(self, paths):
+        """paths: {name: cgroup dir or None}. Returns {name: cpus used}."""
+        now = GLib.get_monotonic_time()
+        out = {}
+        for name, path in paths.items():
+            usage = self._usage(path)
+            prev = self.prev.get(name)
+            self.prev[name] = (path, now, usage)
+            if usage is None or not prev or prev[0] != path or prev[2] is None:
+                out[name] = 0.0
+                continue
+            dt = now - prev[1]
+            out[name] = max(0.0, (usage - prev[2]) / dt) if dt > 0 else 0.0
+        return out
+
+
+# --------------------------------------------------------------------------
+# The picture: the chip, with the fort's cores fenced off
+# --------------------------------------------------------------------------
+
+class CpuView(Gtk.DrawingArea):
+    """Every physical core as a tile, each of its threads a live load bar.
+
+    The reserved cores stand inside a log stockade and the rest outside it,
+    so which ones they are never depends on telling orange from blue. When
+    the fort is up, mountain men stand watch on its towers and walk its
+    wall, the gate is shut, and embers rise in the reserved tiles; when it
+    is down, the towers are empty and the gate stands open.
+    """
+
+    COLS = 5
+
+    def __init__(self):
+        super().__init__(content_height=340, hexpand=True, vexpand=True)
+        self.cores = []
+        self.reserved = set()
+        self.on = False
+        self.loads = {}       # cpu -> target load
+        self.shown = {}       # cpu -> displayed load, eased toward target
+        self.phase = 0.0
+        self.last_draw = -1.0
+        self._t0 = None
+        self.set_draw_func(self._draw)
+        self.add_tick_callback(self._on_tick)
+
+    def set_state(self, cores, reserved, on):
+        self.cores = cores
+        self.reserved = set(reserved)
+        self.on = on
+        self.queue_draw()
+
+    def set_loads(self, loads):
+        self.loads = loads
+
+    def _on_tick(self, widget, clock):
+        now = clock.get_frame_time()
+        if self._t0 is None:
+            self._t0 = now
+        prev = self.phase
+        self.phase = (now - self._t0) / 1_000_000.0
+        dt = max(0.0, self.phase - prev)
+        # Frame-rate independent easing: the same glide at 30 Hz or 144 Hz.
+        k = 1.0 - math.exp(-dt * 7.0)
+        for cpu, target in self.loads.items():
+            cur = self.shown.get(cpu, target)
+            self.shown[cpu] = cur + (target - cur) * k
+
+        root = widget.get_root()
+        focused = root is not None and root.is_active()
+        if focused or self.phase - self.last_draw >= IDLE_REDRAW_S:
+            self.last_draw = self.phase
+            self.queue_draw()
+        return GLib.SOURCE_CONTINUE
+
+    # -- helpers ----------------------------------------------------------
+
+    @staticmethod
+    def _glow(cr, x, y, radius, rgb, alpha):
+        if radius <= 0 or alpha <= 0:
+            return
+        grad = cairo.RadialGradient(x, y, 0, x, y, radius)
+        grad.add_color_stop_rgba(0.0, *rgb, alpha)
+        grad.add_color_stop_rgba(0.5, *rgb, alpha * 0.3)
+        grad.add_color_stop_rgba(1.0, *rgb, 0.0)
+        cr.set_source(grad)
+        cr.arc(x, y, radius, 0, 2 * math.pi)
+        cr.fill()
+
+    @staticmethod
+    def _rounded(cr, x, y, w, h, r):
+        r = min(r, w / 2, h / 2)
+        cr.new_sub_path()
+        cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+        cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+        cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+        cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+        cr.close_path()
+
+    @staticmethod
+    def _text(cr, x, y, text, size, alpha, bold=False):
+        cr.select_font_face("Cantarell", cairo.FONT_SLANT_NORMAL,
+                            cairo.FONT_WEIGHT_BOLD if bold
+                            else cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(size)
+        ext = cr.text_extents(text)
+        cr.move_to(x - ext.width / 2 - ext.x_bearing, y)
+        cr.set_source_rgba(1, 1, 1, alpha)
+        cr.show_text(text)
+
+    # -- the fort ---------------------------------------------------------
+
+    @staticmethod
+    def _stake(cr, x, bottom, w, top, pointed):
+        """One upright log, sharpened or flat, with a highlight and seam."""
+        tip = w * 0.6 if pointed else 0.0
+        cr.move_to(x, bottom)
+        cr.line_to(x, top + tip)
+        if pointed:
+            cr.line_to(x + w / 2, top)
+        cr.line_to(x + w, top + tip)
+        cr.line_to(x + w, bottom)
+        cr.close_path()
+        cr.set_source_rgb(*WOOD_RGB)
+        cr.fill_preserve()
+        cr.set_source_rgb(*SEAM_RGB)
+        cr.set_line_width(max(0.8, w * 0.08))
+        cr.stroke()
+        cr.set_source_rgba(*WOOD_HI_RGB, 0.8)
+        cr.rectangle(x + w * 0.18, top + tip + w * 0.2, w * 0.16,
+                     max(0.0, bottom - top - tip - w * 0.4))
+        cr.fill()
+
+    def _wall(self, cr, x0, x1, bottom, top, stake_w, pointed):
+        n = max(1, round((x1 - x0) / stake_w))
+        w = (x1 - x0) / n
+        for i in range(n):
+            # Every other stake a little taller, like hand-cut logs.
+            lift = stake_w * 0.25 if (i % 2 and pointed) else 0.0
+            self._stake(cr, x0 + i * w, bottom, w, top - lift, pointed)
+
+    def _blockhouse(self, cr, x, y, w, h):
+        """A square log tower; y is its floor, where a sentry stands."""
+        logs = 4
+        lh = h / logs
+        for i in range(logs):
+            self._rounded(cr, x - lh * 0.15, y + i * lh, w + lh * 0.3, lh,
+                          lh / 2)
+            cr.set_source_rgb(*WOOD_RGB)
+            cr.fill_preserve()
+            cr.set_source_rgb(*SEAM_RGB)
+            cr.set_line_width(max(0.8, lh * 0.1))
+            cr.stroke()
+        # A loophole for the long rifle.
+        cr.set_source_rgb(*SEAM_RGB)
+        cr.rectangle(x + w * 0.42, y + lh * 1.3, w * 0.16, lh * 0.5)
+        cr.fill()
+        cr.rectangle(x - lh * 0.35, y - lh * 0.35, w + lh * 0.7, lh * 0.4)
+        cr.set_source_rgb(*WOOD_HI_RGB)
+        cr.fill()
+
+    def _gate(self, cr, cx, bottom, top, w):
+        """Shut while the fort is up; swung open while it is down."""
+        cr.set_source_rgba(0.02, 0.02, 0.05, 0.9)
+        cr.rectangle(cx - w / 2, top, w, bottom - top)
+        cr.fill()
+        half = w / 2
+        if self.on:
+            for side in (-1, 1):
+                x = cx - half if side < 0 else cx
+                self._stake(cr, x, bottom, half, top, False)
+            cr.set_source_rgb(*SEAM_RGB)
+            cr.set_line_width(max(1.2, w * 0.06))
+            cr.move_to(cx - half * 0.9, top + (bottom - top) * 0.2)
+            cr.line_to(cx + half * 0.9, bottom - (bottom - top) * 0.15)
+            cr.move_to(cx + half * 0.9, top + (bottom - top) * 0.2)
+            cr.line_to(cx - half * 0.9, bottom - (bottom - top) * 0.15)
+            cr.stroke()
+        else:
+            # Doors swung outward, seen edge-on: two slanted planks.
+            for side in (-1, 1):
+                hinge = cx + side * half
+                cr.move_to(hinge, top)
+                cr.line_to(hinge + side * half * 0.45, top + w * 0.15)
+                cr.line_to(hinge + side * half * 0.45, bottom + w * 0.15)
+                cr.line_to(hinge, bottom)
+                cr.close_path()
+                cr.set_source_rgb(*WOOD_RGB)
+                cr.fill_preserve()
+                cr.set_source_rgb(*SEAM_RGB)
+                cr.set_line_width(1.0)
+                cr.stroke()
+
+    @staticmethod
+    def _mountain_man(cr, x, feet, s, facing, step=0.0, shouldered=False,
+                      glint=0.0):
+        """A buckskin-clad mountain man with a coonskin cap and a long rifle.
+
+        Drawn in a 100-unit-tall model with the feet at 0; facing is +1 for
+        right, -1 for left. The rifle stands taller than he does.
+        """
+        cr.save()
+        cr.translate(x, feet)
+        cr.scale(facing * s / 100.0, s / 100.0)
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_line_join(cairo.LINE_JOIN_ROUND)
+
+        def leg(swing, rgb):
+            fx = math.sin(swing) * 40
+            cr.set_source_rgb(*rgb)
+            cr.set_line_width(8)
+            cr.move_to(0, -46)
+            cr.line_to(fx, -2)
+            cr.stroke()
+            cr.set_source_rgb(*SEAM_RGB)
+            cr.save()
+            cr.translate(fx + 3, -1.5)
+            cr.scale(6, 2.6)
+            cr.arc(0, 0, 1, 0, 2 * math.pi)
+            cr.restore()
+            cr.fill()
+
+        def rifle_upright():
+            # Butt on the ground at his side, muzzle well above his cap.
+            cr.set_source_rgb(*RIFLE_WOOD_RGB)
+            cr.move_to(13, -1)
+            cr.line_to(19, -1)
+            cr.line_to(17.5, -32)
+            cr.line_to(15, -32)
+            cr.close_path()
+            cr.fill()
+            cr.set_source_rgb(*STEEL_RGB)
+            cr.set_line_width(2.2)
+            cr.move_to(16.2, -32)
+            cr.line_to(16.2, -128)
+            cr.stroke()
+            return 16.2, -128
+
+        def rifle_shouldered():
+            # Stock in his hand at the hip, barrel over the shoulder.
+            angle = 1.05
+            cr.set_source_rgb(*RIFLE_WOOD_RGB)
+            cr.save()
+            cr.translate(9, -56)
+            cr.rotate(angle)
+            cr.rectangle(-3, -3, 28, 6)
+            cr.fill()
+            cr.set_source_rgb(*STEEL_RGB)
+            cr.set_line_width(2.2)
+            cr.move_to(-2, 0)
+            cr.line_to(-82, 0)
+            cr.stroke()
+            cr.restore()
+            return 9 - 82 * math.cos(angle), -56 - 82 * math.sin(angle)
+
+        leg(-step, BUCK_DARK_RGB)
+        if shouldered:
+            tip = rifle_shouldered()
+
+        # Fringed buckskin shirt.
+        cr.set_source_rgb(*BUCK_RGB)
+        cr.move_to(-12, -44)
+        cr.line_to(12, -44)
+        cr.line_to(10, -78)
+        cr.line_to(-10, -78)
+        cr.close_path()
+        cr.fill()
+        cr.set_source_rgb(*BUCK_DARK_RGB)
+        cr.set_line_width(1.4)
+        for fx in range(-11, 12, 3):
+            cr.move_to(fx, -44)
+            cr.line_to(fx + 0.5, -38.5)
+        cr.stroke()
+        cr.set_source_rgb(*SEAM_RGB)
+        cr.rectangle(-11.5, -53, 23, 4)
+        cr.fill()
+        # Powder horn on its strap.
+        cr.set_line_width(1.6)
+        cr.move_to(-9, -76)
+        cr.line_to(9, -52)
+        cr.stroke()
+        cr.set_source_rgb(0.93, 0.88, 0.74)
+        cr.move_to(4, -55)
+        cr.line_to(12, -51)
+        cr.line_to(6, -50)
+        cr.close_path()
+        cr.fill()
+
+        leg(step, BUCK_RGB)
+
+        # Head, beard, and the coonskin cap with its ringed tail.
+        cr.set_source_rgb(*SKIN_RGB)
+        cr.arc(1, -86, 7.5, 0, 2 * math.pi)
+        cr.fill()
+        cr.set_source_rgb(*BEARD_RGB)
+        cr.move_to(-5, -86)
+        cr.curve_to(-6, -76, 2, -71, 9, -76)
+        cr.line_to(8.5, -84)
+        cr.curve_to(5, -81, 0, -81, -5, -86)
+        cr.fill()
+        cr.set_source_rgb(*FUR_RGB)
+        cr.arc(0.5, -88.5, 8.6, math.pi, 2 * math.pi)
+        cr.fill()
+        cr.rectangle(-8.6, -90, 18.2, 3.2)
+        cr.fill()
+        segs = 6
+        for i in range(segs):
+            u0, u1 = i / segs, (i + 1) / segs
+            p0 = (-8 - 6 * u0 - 3 * math.sin(u0 * math.pi), -89 + 21 * u0)
+            p1 = (-8 - 6 * u1 - 3 * math.sin(u1 * math.pi), -89 + 21 * u1)
+            cr.set_source_rgb(*(STRIPE_RGB if i % 2 else FUR_RGB))
+            cr.set_line_width(5.5 - 1.5 * u0)
+            cr.move_to(*p0)
+            cr.line_to(*p1)
+            cr.stroke()
+        cr.set_source_rgb(*SEAM_RGB)
+        cr.arc(5.5, -88, 1.1, 0, 2 * math.pi)
+        cr.fill()
+
+        if not shouldered:
+            tip = rifle_upright()
+        # The arm that holds the rifle.
+        cr.set_source_rgb(*BUCK_RGB)
+        cr.set_line_width(6)
+        cr.move_to(6, -75)
+        hand = (14, -62) if not shouldered else (9, -56)
+        cr.line_to(*hand)
+        cr.stroke()
+        cr.set_source_rgb(*SKIN_RGB)
+        cr.arc(*hand, 3, 0, 2 * math.pi)
+        cr.fill()
+
+        if glint > 0:
+            gx, gy = tip
+            cr.set_source_rgba(1, 1, 0.92, glint)
+            cr.set_line_width(1.2)
+            for a in range(4):
+                ang = a * math.pi / 4
+                cr.move_to(gx - math.cos(ang) * 7, gy - math.sin(ang) * 7)
+                cr.line_to(gx + math.cos(ang) * 7, gy + math.sin(ang) * 7)
+            cr.stroke()
+        cr.restore()
+
+    def _draw_fort(self, cr, x, y, w, h, t):
+        """The stockade around the yard (x, y, w, h), its gate and towers;
+        returns where sentries may stand."""
+        wall = t * 0.3
+        stake = max(6.0, t * 0.16)
+        X, Y, W, H = x - wall, y - wall, w + 2 * wall, h + 2 * wall
+
+        self._rounded(cr, X, Y, W, H, wall * 0.4)
+        cr.set_source_rgba(*YARD_RGB, 0.75)
+        cr.fill()
+
+        # Side walls are seen from the front, like the rest: a column of
+        # stakes each side, standing full height.
+        for sx in (X, X + W - wall):
+            self._wall(cr, sx, sx + wall, Y + H, Y - wall * 0.6, stake, True)
+        # Back wall, sharpened against the sky; front wall, with the gate.
+        self._wall(cr, X + wall, X + W - wall, y, Y - wall * 0.9, stake, True)
+        gate_w = min(t * 0.9, w * 0.35)
+        cx = X + W / 2
+        self._wall(cr, X + wall, cx - gate_w / 2, Y + H, y + h, stake, True)
+        self._wall(cr, cx + gate_w / 2, X + W - wall, Y + H, y + h, stake,
+                   True)
+        self._gate(cr, cx, Y + H, y + h - wall * 0.2, gate_w)
+
+        tower_w = wall * 2.4
+        tower_h = t * 0.5
+        floor = Y - tower_h
+        towers = []
+        for tx in (X - tower_w * 0.35, X + W - tower_w * 0.65):
+            self._blockhouse(cr, tx, floor, tower_w, tower_h + wall)
+            towers.append(tx + tower_w / 2)
+        return towers, floor, (X + tower_w, X + W - tower_w), Y - wall * 0.9
+
+    def _draw_sentries(self, cr, towers, floor, walk, walk_y, t):
+        if not self.on:
+            return  # Nobody on the walls while the fort stands down.
+        s = t * 0.85
+        for i, tx in enumerate(towers):
+            outward = -1 if i == 0 else 1
+            # Each looks out, and now and then glances back into the yard.
+            glance = int(self.phase / 3.1 + i * 1.7) % 4 == 0
+            glint = max(0.0, math.sin(self.phase * 1.3 + i * 2.0)) ** 30
+            self._mountain_man(cr, tx, floor, s, -outward if glance
+                               else outward, glint=glint)
+        x0, x1 = walk
+        if x1 - x0 > s * 0.6:
+            # One more walks the wall from tower to tower and back.
+            u = (self.phase / 9.0) % 2.0
+            pos = u if u < 1.0 else 2.0 - u
+            ease = 0.5 - 0.5 * math.cos(pos * math.pi)
+            step = math.sin(self.phase * 7.0) * 0.38
+            self._mountain_man(cr, x0 + (x1 - x0) * ease, walk_y, s * 0.92,
+                               1 if u < 1.0 else -1, step=step,
+                               shouldered=True)
+
+    # -- the picture ------------------------------------------------------
+
+    def _draw(self, _area, cr, width, height):
+        if not self.cores:
+            return
+        fort = [c for c in self.cores
+                if any(cpu in self.reserved for cpu in c["cpus"])]
+        rest = [c for c in self.cores if c not in fort]
+        gap = max(10.0, width * 0.025)
+        label_h = max(16.0, height * 0.05)
+        cols_f = max(1, min(self.COLS, len(fort)))
+        rows_f = math.ceil(len(fort) / cols_f) if fort else 1
+        cols_o = max(1, min(self.COLS, len(rest)))
+        rows_o = math.ceil(len(rest) / cols_o) if rest else 0
+
+        # Every size is a multiple of the tile width t, plus fixed gaps:
+        # towers and sentries above the wall take 1.6t, the wall 0.3t a
+        # side, and 0.5t of open ground lies between the fort and the rest.
+        t_by_w = min((width - (cols_f + 1) * gap) / (cols_f + 1.4),
+                     (width - (cols_o + 2.6) * gap) / cols_o)
+        a = 1.6 + 0.6 + 1.05 * rows_f + (0.5 + 1.05 * rows_o if rest else 0)
+        b = (rows_f * label_h + (rows_f - 1) * gap
+             + (rows_o * label_h + (rows_o - 1) * gap + 2.6 * gap
+                if rest else 0) + gap)
+        t = max(20.0, min(t_by_w, (height - b) / a))
+        tile_h = t * 1.05
+        y = (height - (a * t + b)) / 2 + gap / 2
+
+        fw = cols_f * t + (cols_f - 1) * gap
+        ow = cols_o * t + (cols_o - 1) * gap
+        # The yard is as wide as the land outside it, so the fort reads as
+        # a fort and the wall has room for a man to walk.
+        yw = max(fw, ow if rest else fw)
+        fh = rows_f * (tile_h + label_h) + (rows_f - 1) * gap
+        yx = (width - yw) / 2
+        fy = y + 1.6 * t + 0.3 * t
+        towers, floor, walk, walk_y = self._draw_fort(cr, yx, fy, yw, fh, t)
+        self._tiles(cr, fort, yx + (yw - fw) / 2, fy, cols_f, t, tile_h,
+                    label_h, gap, True)
+
+        if rest:
+            ox = (width - ow) / 2
+            oy = fy + fh + 0.3 * t + 0.5 * t + 0.8 * gap
+            oh = rows_o * (tile_h + label_h) + (rows_o - 1) * gap
+            self._draw_die(cr, ox, oy, ow, oh, gap)
+            self._tiles(cr, rest, ox, oy, cols_o, t, tile_h, label_h, gap,
+                        False)
+
+        # Last, so a pacing sentry passes in front of the tower roofs.
+        self._draw_sentries(cr, towers, floor, walk, walk_y, t)
+
+    def _tiles(self, cr, cores, x0, y0, cols, t, tile_h, label_h, gap, mine):
+        for i, core in enumerate(cores):
+            col, row = i % cols, i // cols
+            x = x0 + col * (t + gap)
+            y = y0 + row * (tile_h + label_h + gap)
+            self._draw_tile(cr, x, y, t, tile_h, core, mine)
+            label = " · ".join(str(c) for c in core["cpus"])
+            self._text(cr, x + t / 2, y + tile_h + label_h * 0.78,
+                       label, max(9.0, label_h * 0.6),
+                       0.85 if mine else 0.45, bold=mine)
+
+    def _draw_die(self, cr, x, y, w, h, gap):
+        """The package outline with pins, so the tiles read as one chip."""
+        pad = gap * 0.8
+        X, Y, W, H = x - pad, y - pad, w + 2 * pad, h + 2 * pad
+        cr.set_line_width(2.0)
+        cr.set_source_rgba(*DIM_RGB, 0.18)
+        pin = pad * 0.55
+        step = max(14.0, W / 24)
+        px = X + step / 2
+        while px < X + W:
+            cr.move_to(px, Y)
+            cr.line_to(px, Y - pin)
+            cr.move_to(px, Y + H)
+            cr.line_to(px, Y + H + pin)
+            px += step
+        cr.stroke()
+        self._rounded(cr, X, Y, W, H, pad)
+        grad = cairo.LinearGradient(X, Y, X + W, Y + H)
+        grad.add_color_stop_rgba(0.0, 0.16, 0.17, 0.32, 0.55)
+        grad.add_color_stop_rgba(1.0, 0.07, 0.09, 0.20, 0.55)
+        cr.set_source(grad)
+        cr.fill_preserve()
+        cr.set_source_rgba(*DIM_RGB, 0.25)
+        cr.set_line_width(1.4)
+        cr.stroke()
+
+    def _draw_tile(self, cr, x, y, w, h, core, mine):
+        pulse = 0.5 + 0.5 * math.sin(self.phase * 2.2)
+        live = mine and self.on
+        rgb = FORT_RGB if mine else REST_RGB
+        r = w * 0.16
+
+        if live:
+            self._glow(cr, x + w / 2, y + h / 2, w * (0.95 + 0.12 * pulse),
+                       FORT_RGB, 0.30 + 0.12 * pulse)
+
+        self._rounded(cr, x, y, w, h, r)
+        cr.set_source_rgba(0.05, 0.06, 0.14, 0.92)
+        cr.fill()
+
+        # One bar per thread, filled from the bottom by its live load.
+        cpus = core["cpus"]
+        inner = w * 0.14
+        bar_top = y + inner
+        bar_h = y + h - inner - bar_top
+        bar_gap = w * 0.08
+        bar_w = (w - 2 * inner - bar_gap * (len(cpus) - 1)) / len(cpus)
+        for j, cpu in enumerate(cpus):
+            bx = x + inner + j * (bar_w + bar_gap)
+            self._rounded(cr, bx, bar_top, bar_w, bar_h, bar_w * 0.25)
+            cr.set_source_rgba(1, 1, 1, 0.06)
+            cr.fill()
+            load = self.shown.get(cpu, 0.0)
+            fill = bar_h * load
+            if fill < 1.0:
+                continue
+            self._rounded(cr, bx, bar_top + bar_h - fill, bar_w, fill,
+                          min(bar_w * 0.25, fill / 2))
+            grad = cairo.LinearGradient(0, bar_top + bar_h, 0, bar_top)
+            if mine:
+                grad.add_color_stop_rgba(0.0, *FORT_RGB, 0.95)
+                grad.add_color_stop_rgba(1.0, *FORT_HOT_RGB, 0.95)
+            else:
+                grad.add_color_stop_rgba(0.0, *REST_RGB, 0.85)
+                grad.add_color_stop_rgba(1.0, 0.55, 0.45, 1.0, 0.85)
+            cr.set_source(grad)
+            cr.fill()
+
+        if live:
+            self._sparks(cr, x, bar_top, w, bar_h, core["core"])
+
+        # The frame. Its dash pattern, not its colour, is what says "fort".
+        self._rounded(cr, x, y, w, h, r)
+        if mine:
+            cr.set_line_width(2.4 if live else 1.6)
+            cr.set_dash([7.0, 5.0], -self.phase * 18.0 if live else 0.0)
+            cr.set_source_rgba(*rgb, 0.95 if live else 0.55)
+        else:
+            cr.set_line_width(1.2)
+            cr.set_dash([])
+            cr.set_source_rgba(*DIM_RGB, 0.22)
+        cr.stroke()
+        cr.set_dash([])
+
+    def _sparks(self, cr, x, top, w, h, seed):
+        """Campfire embers rising through the reserved tile."""
+        for k in range(4):
+            t = (self.phase * 0.55 + k / 4 + seed * 0.37) % 1.0
+            sx = x + w * (0.25 + 0.5 * ((k * 0.618 + seed * 0.29) % 1.0))
+            sx += math.sin(t * 6.0 + k) * w * 0.04
+            sy = top + h * (1.0 - t)
+            edge = math.sin(t * math.pi)
+            self._glow(cr, sx, sy, w * 0.07, FORT_HOT_RGB, 0.6 * edge)
+            cr.set_source_rgba(1, 0.95, 0.85, 0.9 * edge)
+            cr.arc(sx, sy, max(1.2, w * 0.012), 0, 2 * math.pi)
+            cr.fill()
+
+
+# --------------------------------------------------------------------------
+# Who is using the CPUs
+# --------------------------------------------------------------------------
+
+class UsageRow(Gtk.Box):
+    def __init__(self, icon, title, fort):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self.append(Gtk.Image(icon_name=icon, pixel_size=20,
+                              valign=Gtk.Align.CENTER))
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1,
+                       hexpand=True)
+        head = Gtk.Box(spacing=8)
+        head.append(Gtk.Label(label=title, xalign=0.0, hexpand=True,
+                              css_classes=["gm-row-title"]))
+        self.value = Gtk.Label(label="–", xalign=1.0,
+                               css_classes=["gm-row-value"])
+        head.append(self.value)
+        text.append(head)
+        self.bar = Gtk.LevelBar(min_value=0.0, max_value=1.0,
+                                css_classes=["gm-game" if fort else "gm-rest"])
+        # Without this GTK paints high fills with its own warning colours.
+        for name in ("low", "high", "full"):
+            self.bar.remove_offset_value(name)
+        text.append(self.bar)
+        self.note = Gtk.Label(label="", xalign=0.0, css_classes=["gm-row-note"])
+        text.append(self.note)
+        self.append(text)
+
+    def update(self, cpus, total, note):
+        self.value.set_label(f"{cpus:4.1f} CPUs")
+        self.bar.set_value(min(1.0, cpus / total) if total else 0.0)
+        self.note.set_label(note)
+
+
+# --------------------------------------------------------------------------
+# The apps that can go in or out
+# --------------------------------------------------------------------------
+
+_desktop_cache = {}
+
+
+def desktop_info(ids):
+    """The first .desktop entry among fortctl's guesses, or None."""
+    key = tuple(ids)
+    if key not in _desktop_cache:
+        found = None
+        for guess in ids:
+            try:
+                found = DesktopAppInfo.new(guess + ".desktop")
+            except TypeError:
+                found = None
+            if found is not None:
+                break
+        _desktop_cache[key] = found
+    return _desktop_cache[key]
+
+
+def group_apps(apps):
+    """fortctl's scopes as rows: desktop apps grouped by their .desktop
+    entry (an app often holds two scopes), everything else one per scope."""
+    groups = {}
+    for app in apps:
+        base = app["unit"].removeprefix("fort-")
+        info = desktop_info(app["desktop_ids"]) if base.startswith(
+            "app-") else None
+        if info is not None:
+            key, title, other = "desktop:" + info.get_id(), \
+                info.get_display_name(), False
+        else:
+            key, title, other = "unit:" + app["unit"], app["name"], True
+        g = groups.setdefault(key, {
+            "key": key, "title": title, "other": other,
+            "icon": info.get_icon() if info is not None else None,
+            "units": [], "cgroups": [], "inside": [], "always": False,
+        })
+        g["units"].append(app["unit"])
+        g["cgroups"].append(app["cgroup"])
+        g["inside"].append(app["inside"])
+        g["always"] = g["always"] or app["always"]
+        if other:
+            g["subtitle"] = app["unit"]
+    out = list(groups.values())
+    out.sort(key=lambda g: (not any(g["inside"]), g["title"].lower()))
+    return out
+
+
+class AppRow(Gtk.Box):
+    """One app: icon, name, where it is, live CPU, and a switch."""
+
+    def __init__(self, on_flip):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self.on_flip = on_flip
+        self.group = None
+        self._quiet = False
+        self.icon = Gtk.Image(pixel_size=28, valign=Gtk.Align.CENTER)
+        self.append(self.icon)
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1,
+                       hexpand=True, valign=Gtk.Align.CENTER)
+        self.title = Gtk.Label(xalign=0.0, css_classes=["gm-row-title"],
+                               ellipsize=3)
+        self.note = Gtk.Label(xalign=0.0, css_classes=["gm-row-note"],
+                              ellipsize=3)
+        text.append(self.title)
+        text.append(self.note)
+        self.append(text)
+        self.cpu = Gtk.Label(label="", css_classes=["gm-row-value"],
+                             valign=Gtk.Align.CENTER)
+        self.append(self.cpu)
+        self.spinner = Adw.Spinner(visible=False)
+        self.append(self.spinner)
+        self.switch = Gtk.Switch(valign=Gtk.Align.CENTER)
+        self.switch.connect("state-set", self._on_state_set)
+        self.append(self.switch)
+
+    def update(self, group, mode):
+        self.group = group
+        inside = all(group["inside"])
+        partly = any(group["inside"]) and not inside
+        if group["icon"] is not None:
+            self.icon.set_from_gicon(group["icon"])
+        else:
+            self.icon.set_from_icon_name("application-x-executable-symbolic")
+        self.title.set_label(group["title"])
+        if group["always"] and inside:
+            note = "always in the fort"
+        elif group["always"]:
+            note = ("outside; it will be pulled in within seconds"
+                    if mode != "off" else "always in the fort while it is up")
+        elif inside:
+            note = "in the fort"
+        elif partly:
+            note = "partly in the fort"
+        else:
+            note = ("fenced with everything else" if mode == "on"
+                    else "outside the fort")
+        if group.get("subtitle"):
+            note += " · " + group["subtitle"]
+        self.note.set_label(note)
+        self._quiet = True
+        self.switch.set_active(inside)
+        self.switch.set_state(inside)
+        self._quiet = False
+        self.switch.set_sensitive(not self.spinner.get_visible()
+                                  and not (group["always"] and inside))
+        self.set_tooltip_text("Listed in fort-galgs.toml, so it stays in "
+                              "the fort" if group["always"] else None)
+
+    def set_cpu(self, cpus):
+        self.cpu.set_label(f"{cpus:4.1f}" if cpus >= 0.05 else "")
+
+    def set_busy(self, busy):
+        self.spinner.set_visible(busy)
+        self.switch.set_sensitive(not busy)
+
+    def _on_state_set(self, _switch, want):
+        if self._quiet or self.group is None:
+            return False
+        self.on_flip(self, want)
+        # Hold the state: the next status read sets it to what is true.
+        return True
+
+
+class AppList(Gtk.Box):
+    """Desktop apps first; terminals and other scopes under an expander."""
+
+    def __init__(self, on_flip):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.on_flip = on_flip
+        self.rows = {}
+        self.main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.others = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+                              spacing=10, margin_top=10)
+        self.expander = Gtk.Expander(child=self.others)
+        self.empty = Gtk.Label(label="No apps running.", xalign=0.0,
+                               css_classes=["gm-row-note"])
+        self.append(self.main)
+        self.append(self.empty)
+        self.append(self.expander)
+
+    def update(self, groups, mode):
+        keys = {g["key"] for g in groups}
+        for key in list(self.rows):
+            if key not in keys:
+                row = self.rows.pop(key)
+                row.get_parent().remove(row)
+        for box in (self.main, self.others):
+            while (child := box.get_first_child()) is not None:
+                box.remove(child)
+        n_other = 0
+        for g in groups:
+            row = self.rows.get(g["key"])
+            if row is None:
+                row = self.rows[g["key"]] = AppRow(self.on_flip)
+            row.update(g, mode)
+            (self.others if g["other"] else self.main).append(row)
+            n_other += g["other"]
+        self.empty.set_visible(not any(not g["other"] for g in groups))
+        self.expander.set_label(f"Terminals and other scopes ({n_other})")
+        self.expander.set_visible(n_other > 0)
+
+    def sample_paths(self):
+        return {cg: cg for row in self.rows.values() if row.group
+                for cg in row.group["cgroups"]}
+
+    def set_cpu(self, used):
+        for row in self.rows.values():
+            if row.group:
+                row.set_cpu(sum(used.get(cg, 0.0)
+                                for cg in row.group["cgroups"]))
+
+
+# --------------------------------------------------------------------------
+# Talking to fortctl
+# --------------------------------------------------------------------------
+
+def run_backend(args, callback):
+    """callback(ok, stdout_and_stderr). Never blocks the main loop."""
+    try:
+        proc = Gio.Subprocess.new(
+            [BACKEND] + args,
+            Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE)
+    except GLib.Error as exc:
+        callback(False, f"Could not run {BACKEND}: {exc.message}")
+        return
+
+    def done(source, result):
+        try:
+            _, out, _ = source.communicate_utf8_finish(result)
+        except GLib.Error as exc:
+            callback(False, exc.message)
+            return
+        callback(source.get_successful(), (out or "").strip())
+
+    proc.communicate_utf8_async(None, None, done)
+
+
+def ranges(cpus):
+    """[3, 4, 13, 14] -> "3, 4, 13 and 14": these get read aloud, roughly."""
+    words = [str(c) for c in cpus]
+    if len(words) < 2:
+        return "".join(words)
+    return ", ".join(words[:-1]) + " and " + words[-1]
+
+
+# --------------------------------------------------------------------------
+# The window
+# --------------------------------------------------------------------------
+
+class FortWindow(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(title="Fort Galgs")
+        if app is not None:
+            self.set_application(app)
+        self.set_default_size(560, 900)
+        self.state = None
+        self.busy = False
+        self.cpus = CpuSampler()
+        self.groups = GroupSampler()
+        self.app_cpu = GroupSampler()
+
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE,
+                               transition_duration=220)
+        self.stack.add_named(self._build_loading(), "loading")
+        self.stack.add_named(self._build_home(), "home")
+        self.stack.add_named(self._build_error(), "error")
+
+        header = Adw.HeaderBar(css_classes=["flat"])
+        header.set_title_widget(Adw.WindowTitle(title="Fort Galgs",
+                                                subtitle=os.uname().nodename))
+        toolbar = Adw.ToolbarView()
+        toolbar.add_top_bar(header)
+        toolbar.set_content(self.stack)
+        toolbar.add_css_class("gm-root")
+        self.set_content(toolbar)
+
+        self.sample_id = GLib.timeout_add(SAMPLE_MS, self._sample)
+        self.status_id = GLib.timeout_add_seconds(STATUS_EVERY_S,
+                                                  self._poll_status)
+        self.connect("close-request", self._on_close)
+
+    def _on_close(self, _win):
+        for source in (self.sample_id, self.status_id):
+            if source:
+                GLib.source_remove(source)
+        self.sample_id = self.status_id = 0
+        return False
+
+    # -- pages ------------------------------------------------------------
+
+    def _build_loading(self):
+        page = Adw.StatusPage(title="Reading the CPUs…")
+        page.set_child(Adw.Spinner(width_request=48, height_request=48))
+        return page
+
+    def _build_home(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                      margin_top=2, margin_bottom=18,
+                      margin_start=24, margin_end=24)
+
+        self.view = CpuView()
+        box.append(self.view)
+
+        self.hero = Gtk.Label(css_classes=["gm-hero"], wrap=True,
+                              justify=Gtk.Justification.CENTER)
+        self.sub = Gtk.Label(css_classes=["gm-sub"], wrap=True,
+                             justify=Gtk.Justification.CENTER)
+        box.append(self.hero)
+        box.append(self.sub)
+
+        # At most one banner shows at a time; see _show_banner.
+        self.banner = Adw.Banner(revealed=False)
+        self.banner.connect("button-clicked", lambda _b: self._banner_action())
+        self.banner_action = None
+        box.append(self.banner)
+
+        self.toggle = Gtk.Button(css_classes=["gm-big"], margin_top=4)
+        face = Gtk.Box(spacing=16, halign=Gtk.Align.CENTER)
+        self.toggle_icon = Gtk.Image(pixel_size=30)
+        face.append(self.toggle_icon)
+        words = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2,
+                        valign=Gtk.Align.CENTER)
+        self.toggle_title = Gtk.Label(xalign=0.0, css_classes=["gm-big"])
+        self.toggle_sub = Gtk.Label(xalign=0.0, css_classes=["gm-sub"])
+        words.append(self.toggle_title)
+        words.append(self.toggle_sub)
+        face.append(words)
+        self.toggle_spinner = Adw.Spinner(visible=False)
+        face.append(self.toggle_spinner)
+        self.toggle.set_child(face)
+        self.toggle.connect("clicked", lambda _b: self._on_toggle())
+        box.append(self.toggle)
+
+        apps = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
+                       css_classes=["gm-card"], margin_top=4)
+        apps.append(Gtk.Label(label="Who is in the fort", xalign=0.0,
+                              css_classes=["gm-row-note"]))
+        self.app_list = AppList(self._on_flip)
+        apps.append(self.app_list)
+        box.append(apps)
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
+                       css_classes=["gm-card"], margin_top=4)
+        card.append(Gtk.Label(label="Who is using the CPUs", xalign=0.0,
+                              css_classes=["gm-row-note"]))
+        self.rows = {
+            "fort": UsageRow("security-high-symbolic",
+                             "Apps in the fort", True),
+            "apps": UsageRow("utilities-terminal-symbolic",
+                             "Your other apps, tests and sandboxes", False),
+            "vms": UsageRow("computer-symbolic",
+                            "Virtual machines", False),
+            "services": UsageRow("system-run-symbolic",
+                                 "Services and containers", False),
+        }
+        for row in self.rows.values():
+            card.append(row)
+        box.append(card)
+
+        scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER,
+                                      vexpand=True)
+        scroller.set_child(box)
+        return scroller
+
+    def _build_error(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16,
+                      margin_top=12, margin_bottom=24,
+                      margin_start=24, margin_end=24)
+        box.append(Gtk.Image(icon_name="dialog-warning-symbolic",
+                             pixel_size=56, margin_top=12))
+        self.error_title = Gtk.Label(css_classes=["gm-hero"], wrap=True,
+                                     justify=Gtk.Justification.CENTER)
+        box.append(self.error_title)
+        self.error_body = Gtk.Label(css_classes=["gm-log"], xalign=0.0,
+                                    wrap=True, selectable=True,
+                                    valign=Gtk.Align.START)
+        scroller = Gtk.ScrolledWindow(vexpand=True, css_classes=["gm-card"],
+                                      hscrollbar_policy=Gtk.PolicyType.NEVER)
+        scroller.set_child(self.error_body)
+        box.append(scroller)
+        self.error_back = Gtk.Button(label="Back", css_classes=["pill"],
+                                     halign=Gtk.Align.CENTER)
+        self.error_back.connect("clicked", lambda _b: self.refresh_status())
+        box.append(self.error_back)
+        return box
+
+    # -- state ------------------------------------------------------------
+
+    def refresh_status(self, quiet=False):
+        if not quiet:
+            self.stack.set_visible_child_name("loading")
+        run_backend(["status", "--json"], self._got_status)
+
+    def _poll_status(self):
+        if not self.busy and self.stack.get_visible_child_name() == "home":
+            self.refresh_status(quiet=True)
+        return GLib.SOURCE_CONTINUE
+
+    def _got_status(self, ok, text):
+        if not ok:
+            self.show_error("Could not read the fort's state", text)
+            return
+        try:
+            state = json.loads(text)
+        except ValueError as exc:
+            self.show_error("fortctl said something unreadable",
+                            f"{exc}\n\n{text}")
+            return
+        self.apply_state(state)
+        self.stack.set_visible_child_name("home")
+
+    def apply_state(self, state):
+        self.state = state
+        mode = state.get("mode", "unknown")
+        on = mode == "on"
+        reserved = state.get("reserved", [])
+        cores = [c["core"] for c in state.get("cores", [])
+                 if any(cpu in reserved for cpu in c["cpus"])]
+        core_words = ranges(cores)
+        total = sum(len(c["cpus"]) for c in state.get("cores", []))
+        self.view.set_state(state.get("cores", []), reserved, on)
+
+        if on:
+            self.hero.set_label(f"The fort holds cores {core_words}")
+            self.sub.set_label(
+                f"Everything outside it is kept off CPUs {ranges(reserved)}. "
+                f"Apps in the fort can still use all {total}.")
+        elif mode == "off":
+            self.hero.set_label("The fort is down")
+            self.sub.set_label(f"Everything shares all {total} CPUs. Raise "
+                               f"it to keep cores {core_words} free for the "
+                               "apps inside.")
+        else:
+            self.hero.set_label("The fort is half built")
+            self.sub.set_label("Some of the fences are up and some are not. "
+                               "Raising it or standing down puts that right.")
+
+        self.app_list.update(group_apps(state.get("apps", [])), mode)
+        self._show_banner(state, mode)
+        self._set_toggle(on)
+
+    def _show_banner(self, state, mode):
+        stray = sorted({a["name"] for a in state.get("apps", [])
+                        if a["always"] and not a["inside"]})
+        if mode != "off" and stray:
+            self.banner.set_title(f"{', '.join(stray)} is outside the fort, "
+                                  "fenced with everything else.")
+            self.banner.set_button_label("Bring it in")
+            self.banner_action = "on"
+        elif mode != "off" and not state.get("cpuset_delegated", True):
+            self.banner.set_title("Your own apps and tests are not fenced yet. "
+                                  "Run systemctl --user daemon-reexec to finish setup.")
+            self.banner.set_button_label(None)
+            self.banner_action = None
+        elif mode == "partial":
+            self.banner.set_title("The fort is only partly up.")
+            self.banner.set_button_label("Raise it")
+            self.banner_action = "on"
+        else:
+            self.banner.set_revealed(False)
+            return
+        self.banner.set_revealed(True)
+
+    def _banner_action(self):
+        if self.banner_action:
+            self._run_toggle(self.banner_action)
+
+    def _set_toggle(self, on):
+        for cls in ("gm-on", "gm-off"):
+            self.toggle.remove_css_class(cls)
+        if on:
+            self.toggle.add_css_class("gm-off")
+            self.toggle_icon.set_from_icon_name("media-playback-stop-symbolic")
+            self.toggle_title.set_label("Stand down")
+            self.toggle_sub.set_label("Give the cores back")
+        else:
+            self.toggle.add_css_class("gm-on")
+            self.toggle_icon.set_from_icon_name("security-high-symbolic")
+            self.toggle_title.set_label("Raise the fort")
+            self.toggle_sub.set_label("Keep the fastest cores for the apps "
+                                      "inside")
+
+    # -- toggling ---------------------------------------------------------
+
+    def _on_toggle(self):
+        on = (self.state or {}).get("mode") == "on"
+        self._run_toggle("off" if on else "on")
+
+    def _run_toggle(self, verb):
+        if self.busy:
+            return
+        self.busy = True
+        self.toggle.set_sensitive(False)
+        self.toggle_spinner.set_visible(True)
+
+        def done(ok, text):
+            self.busy = False
+            self.toggle.set_sensitive(True)
+            self.toggle_spinner.set_visible(False)
+            if not ok:
+                self.show_error("Could not raise the fort" if verb == "on"
+                                else "Could not stand down", text)
+                return
+            self.refresh_status(quiet=True)
+
+        run_backend([verb], done)
+
+    def _on_flip(self, row, want):
+        group = row.group
+        verb = "protect" if want else "unprotect"
+        units = [u for u, inside in zip(group["units"], group["inside"])
+                 if inside != want]
+        if not units:
+            return
+        row.set_busy(True)
+
+        def done(ok, text):
+            row.set_busy(False)
+            if not ok:
+                self.show_error(f"Could not move {group['title']} "
+                                f"{'into' if want else 'out of'} the fort",
+                                text)
+                return
+            self.refresh_status(quiet=True)
+
+        run_backend([verb] + units, done)
+
+    # -- live numbers -----------------------------------------------------
+
+    def _sample(self):
+        self.view.set_loads(self.cpus.sample())
+        if self.state:
+            self._update_rows()
+            self.app_list.set_cpu(
+                self.app_cpu.sample(self.app_list.sample_paths()))
+        return GLib.SOURCE_CONTINUE
+
+    def _update_rows(self):
+        st = self.state
+        cg = st.get("cgroups", {})
+        used = self.groups.sample({
+            "fort": cg.get("fort"),
+            "apps": cg.get("apps"),
+            "background": cg.get("background"),
+            "vms": cg.get("vms"),
+            "services": cg.get("services"),
+        })
+        apps = used["apps"] + used["background"]
+
+        total = sum(len(c["cpus"]) for c in st.get("cores", []))
+        reserved = st.get("reserved", [])
+        on = st.get("mode") == "on"
+        fence = (f"kept off CPUs {ranges(reserved)}" if on
+                 else "free to use every CPU")
+        apps_fenced = on and st.get("cpuset_delegated")
+        n_inside = sum(1 for a in st.get("apps", []) if a["inside"])
+
+        self.rows["fort"].update(used["fort"], total,
+                                 "nothing inside" if not n_inside
+                                 else "never fenced")
+        self.rows["apps"].update(apps, total,
+                                 fence if apps_fenced or not on
+                                 else "not fenced: cpuset is not delegated")
+        self.rows["vms"].update(used["vms"], total, fence)
+        self.rows["services"].update(used["services"], total, fence)
+
+    # -- errors -----------------------------------------------------------
+
+    def show_error(self, title, body):
+        self.busy = False
+        self.error_title.set_label(title)
+        self.error_body.set_label(body or "No further detail.")
+        self.stack.set_visible_child_name("error")
+        self.error_back.grab_focus()
+
+
+def load_css():
+    Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+    display = Gdk.Display.get_default()
+    if display is None:
+        return
+    provider = Gtk.CssProvider()
+    provider.load_from_data(CSS)
+    Gtk.StyleContext.add_provider_for_display(
+        display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+
+class FortApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID)
+        self.window = None
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        load_css()
+        # Out of the fenced app.slice, or the animation stutters under
+        # exactly the load the fort exists for. Failing only costs that.
+        run_backend(["adopt", str(os.getpid())],
+                    lambda ok, text: ok or print(text, file=sys.stderr))
+
+    def do_activate(self):
+        if not self.window:
+            self.window = FortWindow(self)
+            self.window.refresh_status()
+        self.window.present()
+
+
+def _sample_app(unit, name, inside=False, always=False):
+    return {"unit": unit, "cgroup": None, "slice": "app.slice",
+            "comms": [name], "name": name, "inside": inside,
+            "always": always, "desktop_ids": [name]}
+
+
+SAMPLE_STATE = {
+    "mode": "on",
+    "reserved": [3, 4, 13, 14],
+    "cores": [{"core": c, "cpus": [i, i + 10], "max_khz": 4300000}
+              for i, c in enumerate([0, 1, 2, 3, 4, 8, 9, 10, 11, 12])],
+    "cpuset_delegated": False,
+    "config": {"reserve_cores": 2, "protect": ["steam"], "path": "x"},
+    "apps": [
+        _sample_app("fort-app-gnome-steam-1.scope", "steam", True, True),
+        _sample_app("app-gnome-firefox-2.scope", "firefox"),
+        _sample_app("app-firefox-3.scope", "firefox", True),
+        _sample_app("tmux-spawn-4.scope", "zsh"),
+    ],
+    "cgroups": {"fort": None, "apps": None, "background": None,
+                "vms": None, "services": None},
+}
+
+
+def self_test():
+    """Build every page and draw every state against a real surface.
+
+    Cairo draws that are wrong mostly paint nothing rather than raise, so
+    this proves the code paths run, not that the picture looks right.
+    """
+    Adw.init()
+    load_css()
+    win = FortWindow(None)
+    for name in ("loading", "home", "error"):
+        win.stack.set_visible_child_name(name)
+        assert win.stack.get_visible_child_name() == name, name
+
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 520, 260)
+    cr = cairo.Context(surface)
+    for mode in ("on", "off", "partial"):
+        for delegated in (True, False):
+            for apps in (SAMPLE_STATE["apps"], []):
+                st = dict(SAMPLE_STATE, mode=mode, apps=apps,
+                          cpuset_delegated=delegated)
+                win.apply_state(st)
+                win._update_rows()
+                win.app_list.set_cpu({})
+                assert win.hero.get_label()
+                win.view.shown = {c: (c % 7) / 6 for c in range(20)}
+                for win.view.phase in (0.0, 0.7, 3.3):
+                    win.view._draw(win.view, cr, 520, 260)
+    win.view._draw(win.view, cr, 60, 40)  # drives every clamp
+
+    win.apply_state(SAMPLE_STATE)
+    assert win.banner.get_revealed() and win.banner_action is None
+    stray = [dict(a, inside=False) if a["always"] else a
+             for a in SAMPLE_STATE["apps"]]
+    win.apply_state(dict(SAMPLE_STATE, apps=stray))
+    assert win.banner.get_revealed() and win.banner_action == "on"
+    win.apply_state(dict(SAMPLE_STATE, mode="off"))
+    assert not win.banner.get_revealed()
+    assert win.toggle_title.get_label() == "Raise the fort"
+
+    groups = group_apps(SAMPLE_STATE["apps"])
+    assert any(groups[0]["inside"]), "apps in the fort sort first"
+    assert not any(groups[-1]["inside"]), groups[-1]
+    rows = win.app_list.rows
+    assert len(rows) == len(groups), (len(rows), len(groups))
+
+    loads = win.cpus.sample()
+    loads = win.cpus.sample()
+    assert all(0.0 <= v <= 1.0 for v in loads.values())
+    assert ranges([3, 4, 13, 14]) == "3, 4, 13 and 14"
+
+    win.show_error("t", "body")
+    assert win.stack.get_visible_child_name() == "error"
+    print("self-test ok: pages build, CSS parses, every state draws")
+
+
+def snapshot(path):
+    """Draw the chip down, then up, into one PNG -- no window is shown.
+
+    Uses this machine's live per-CPU load, so it is a real picture of the
+    moment rather than a mock-up.
+    """
+    view = CpuView()
+    sampler = CpuSampler()
+    sampler.sample()
+    GLib.usleep(400_000)
+    view.shown = sampler.sample()
+    w, h = 1024, 680  # the window's own shape, at 2x
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, w * 2, h)
+    cr = cairo.Context(surface)
+    bg = cairo.LinearGradient(0, 0, w * 2, h)
+    bg.add_color_stop_rgb(0.0, 0.04, 0.06, 0.13)
+    bg.add_color_stop_rgb(1.0, 0.05, 0.10, 0.20)
+    cr.set_source(bg)
+    cr.paint()
+    for i, on in enumerate((False, True)):
+        view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], on)
+        view.phase = 1.3
+        cr.save()
+        cr.translate(i * w, 0)
+        view._draw(view, cr, w, h)
+        cr.restore()
+    surface.write_to_png(path)
+    print(f"wrote {path}")
+
+
+def main():
+    args = sys.argv[1:]
+    if "--self-test" in args:
+        self_test()
+        return 0
+    if args[:1] == ["--snapshot"] and len(args) == 2:
+        snapshot(args[1])
+        return 0
+    if "--help" in args or "-h" in args:
+        print(__doc__)
+        return 0
+    return FortApp().run(sys.argv[:1])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

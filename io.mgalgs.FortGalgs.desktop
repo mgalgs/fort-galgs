@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Fort Galgs
+GenericName=CPU reservation
+Comment=Keep the fastest cores free for the apps you care about
+Exec=fort-galgs
+Icon=io.mgalgs.FortGalgs
+Terminal=false
+Categories=System;Monitor;
+Keywords=cpu;cores;game;steam;meeting;video;call;reserve;fort;
+StartupNotify=true
+# Ties the window to this entry, so the dash highlights this icon while it runs.
+StartupWMClass=io.mgalgs.FortGalgs
