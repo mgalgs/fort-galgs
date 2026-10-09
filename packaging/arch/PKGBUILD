@@ -6,7 +6,7 @@ pkgrel=1
 pkgdesc="Reserve a few CPU cores for the apps you care about and fence everything else off them"
 arch=('any')
 url="https://github.com/mgalgs/fort-galgs"
-license=('LicenseRef-unknown')
+license=('MIT')
 depends=('python' 'python-gobject' 'python-cairo' 'gtk4' 'libadwaita'
          'systemd' 'sudo')
 makedepends=('git')
@@ -33,4 +33,5 @@ check() {
 package() {
   cd "$_pkgname"
   make DESTDIR="$pkgdir" PREFIX=/usr install
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
