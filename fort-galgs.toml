@@ -1,15 +1,7 @@
-# Fort Galgs: which cores the fort holds, and which apps always live inside
-# it for every user. Each user can pin more from the window, which writes
+# Fort Galgs: how many cores the fort holds. Which apps live inside it is
+# each user's own choice, pinned from the window into
 # ~/.config/fort-galgs.toml.
 
 # How many physical cores to reserve. Each brings its SMT sibling along, and
 # the fastest-boosting cores are picked first. Leave at least one outside.
 reserve_cores = 2
-
-# Apps pulled into the fort whenever it is up, including ones that start
-# later, by .desktop id: "steam" for steam.desktop.
-apps = []
-
-# The same, by process name (as in /proc/<pid>/comm, at most 15
-# characters), for apps without a .desktop entry.
-protect = []

@@ -21,28 +21,32 @@ Requires systemd with cgroup v2. Arch Linux is the packaged target.
 |------|--------------|------|
 | `fort-galgs` | `/usr/bin` | GTK front end |
 | `fortctl` | `/usr/bin` | Backend: `status [--json]`, `on`, `off`, `protect`/`unprotect <app>...`, `pin`/`unpin <app>...`, `adopt <pid>`, `watch`; root half via `--system on\|off` |
-| `fort-galgs.toml` | `/etc` | How many cores to reserve, and which apps always live in the fort |
+| `fort-galgs.toml` | `/etc` | How many cores to reserve |
 | `sudoers.in` | `/etc/sudoers.d/fort-galgs` | Lets the `fort-galgs` group run exactly `fortctl --system on` and `… off` |
 | `sysusers.conf` | `/usr/lib/sysusers.d/fort-galgs.conf` | Creates that group |
 | `systemd/fort-galgs-cpuset.conf` | `/usr/lib/systemd/system/user@.service.d/` | Delegates the cpuset controller to user sessions |
-| `systemd/fort-galgs-watch.service` | `/usr/lib/systemd/user/` | Pulls configured apps in as they start, while the fort is up |
+| `systemd/fort-galgs-watch.service` | `/usr/lib/systemd/user/` | Pulls pinned apps in as they start, while the fort is up |
 
 ## Configuring
 
-`/etc/fort-galgs.toml` sets the machine-wide part:
+`/etc/fort-galgs.toml` sets how many cores the fort holds:
 
 ```toml
 reserve_cores = 4      # physical cores; each brings its SMT sibling
-apps = ["steam"]       # always in the fort, by .desktop id
-protect = []           # always in the fort, by process name (/proc/<pid>/comm)
 ```
 
-Apps can also be pinned per user: the pin beside each app in the window
-writes `apps` in `~/.config/fort-galgs.toml` (or `fortctl pin steam`, `fortctl
-unpin steam`). Apps pinned in `/etc` show a pin that is on and locked.
+Which apps always live in the fort is each user's choice. Pin one with the
+pin beside it in the window, or `fortctl pin steam` (`fortctl unpin steam`).
+Pins go in `~/.config/fort-galgs.toml`:
+
+```toml
+apps = ["steam"]       # by .desktop id; the window writes these
+protect = []           # by process name (/proc/<pid>/comm), for apps
+                       # without a .desktop entry; edit by hand
+```
 
 Pinned apps are pulled into the fort whenever it is up, including ones that
-start later; the watcher rereads both files every few seconds. A pinned app
+start later; the watcher rereads the file every few seconds. A pinned app
 cannot be switched out of the fort while it stays pinned.
 
 ## What "on" does

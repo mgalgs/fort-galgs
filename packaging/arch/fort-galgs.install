@@ -3,6 +3,6 @@ post_install() {
 ==> Fort Galgs: two steps for each desktop user, once:
       sudo gpasswd -a <user> fort-galgs     # may raise the fort
       systemctl --user daemon-reexec        # as that user: picks up cpuset
-    Set the core count and always-protected apps in /etc/fort-galgs.toml.
+    Set the core count in /etc/fort-galgs.toml; pin apps from the window.
 EOF
 }
