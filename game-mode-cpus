@@ -6,6 +6,9 @@
                                      system half
     game-mode-cpus adopt <pid>       move one of your processes into
                                      game.slice
+    game-mode-cpus protect <name>    move a running app (by process name,
+                                     e.g. firefox) into game.slice
+    game-mode-cpus unprotect <name>  move it back to app.slice
     game-mode-cpus --system on|off   root only; this is what sudoers allows
 
 "On" reserves the machine's fastest cores (and their SMT siblings) for the
@@ -165,9 +168,10 @@ def cpuset_delegated():
                                          "cgroup.controllers")).split()
 
 
-def game_cgroups():
-    """{cgroup path: [pids]} for every cgroup holding a game process, with
-    all the pids under it (recursively) -- the whole scope moves at once."""
+def game_cgroups(names=GAME_PROCS):
+    """{cgroup path: [pids]} for every cgroup holding a process named in
+    names, with all the pids under it (recursively) -- the whole scope moves
+    at once."""
     found = {}
     uid = os.getuid()
     for pid in os.listdir("/proc"):
@@ -178,7 +182,7 @@ def game_cgroups():
                 continue
         except OSError:
             continue
-        if read(f"/proc/{pid}/comm") not in GAME_PROCS:
+        if read(f"/proc/{pid}/comm") not in names:
             continue
         line = read(f"/proc/{pid}/cgroup")
         if not line.startswith("0::"):
@@ -204,8 +208,8 @@ def steam_state(game_cg):
     return "game", next(iter(groups))
 
 
-def move_into_game(unit, pids, what):
-    """Put running processes into a new scope in game.slice.
+def move_into_game(unit, pids, what, slice_=GAME_SLICE):
+    """Put running processes into a new scope in game.slice (or slice_).
 
     StartTransientUnit with PIDs is how gnome-shell itself puts
     already-running processes into a scope.
@@ -221,25 +225,50 @@ def move_into_game(unit, pids, what):
                  "/org/freedesktop/systemd1",
                  "org.freedesktop.systemd1.Manager", "StartTransientUnit",
                  "ssa(sv)a(sa(sv))", unit, "fail", "2",
-                 "Slice", "s", GAME_SLICE,
+                 "Slice", "s", slice_,
                  "PIDs", "au", str(len(pids)), *map(str, pids), "0"])
-            print(f"moved {what} ({len(pids)} processes) into {GAME_SLICE}")
+            print(f"moved {what} ({len(pids)} processes) into {slice_}")
             return
         except Fail as exc:
             if "No such process" not in str(exc):
                 raise
-    raise Fail(f"could not move {what} into {GAME_SLICE}: its processes "
+    raise Fail(f"could not move {what} into {slice_}: its processes "
                "kept exiting")
 
 
-def pull_game_in(game_cg):
-    """Move every game cgroup not already in game.slice into it."""
-    for cg, pids in game_cgroups().items():
+def pull_game_in(game_cg, names=GAME_PROCS):
+    """Move every cgroup holding one of names into game.slice, unless it is
+    there already. Returns how many cgroups matched, moved or not."""
+    groups = game_cgroups(names)
+    for cg, pids in groups.items():
         if cg.startswith(game_cg + "/") or not pids:
             continue
         name = os.path.basename(cg)
         move_into_game(f"game-{name.removesuffix('.scope')}.scope", pids,
                        name)
+    return len(groups)
+
+
+def protect(name):
+    """Move a running app's whole scope into game.slice, so it shares the
+    reserved CPUs and the game's weight -- a video call during CI, say."""
+    if not pull_game_in(user_cgroup(GAME_SLICE), (name,)):
+        raise Fail(f"no running process of yours is named {name!r} "
+                   "(see /proc/<pid>/comm)")
+
+
+def unprotect(name):
+    """Move an app protect put in game.slice back to app.slice."""
+    game_cg = user_cgroup(GAME_SLICE)
+    groups = {cg: pids for cg, pids in game_cgroups((name,)).items()
+              if cg.startswith(game_cg + "/") and pids}
+    if not groups:
+        raise Fail(f"nothing named {name!r} is in {GAME_SLICE}")
+    for cg, pids in groups.items():
+        base = os.path.basename(cg).removesuffix(".scope")
+        # A fresh name: the scope it came from may not be collected yet.
+        move_into_game(f"app-unprotected-{base}.scope", pids,
+                       os.path.basename(cg), "app.slice")
 
 
 def adopt(pid):
@@ -357,6 +386,10 @@ def main(argv):
 
         if len(argv) == 2 and argv[0] == "adopt" and argv[1].isdigit():
             adopt(int(argv[1]))
+            return 0
+
+        if len(argv) == 2 and argv[0] in ("protect", "unprotect"):
+            (protect if argv[0] == "protect" else unprotect)(argv[1])
             return 0
 
         if argv in (["on"], ["off"]):
