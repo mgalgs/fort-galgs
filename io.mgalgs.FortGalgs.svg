@@ -15,7 +15,7 @@
     </radialGradient>
   </defs>
   <rect x="4" y="4" width="120" height="120" rx="26" fill="url(#sky)"/>
-  <circle cx="98" cy="26" r="7" fill="#f3ead2" opacity="0.9"/>
+  <circle cx="32" cy="30" r="8" fill="#f3ead2" opacity="0.9"/>
   <circle cx="64" cy="98" r="26" fill="url(#fire)"/>
   <!-- the palisade -->
   <g fill="url(#log)" stroke="#30200f" stroke-width="1.2">
