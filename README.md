@@ -9,6 +9,11 @@ stockade; a switch beside each running app to move it into or out of the fort;
 and one button to raise the fort or stand down. Mountain men stand watch on
 the walls while it is up.
 
+<p align="center">
+  <img src="docs/screenshot.png" width="420"
+       alt="Fort Galgs with the fort up: four cores inside a log stockade with sentries on the walls, the rest outside, and a list of apps with switches">
+</p>
+
 Requires systemd with cgroup v2. Arch Linux is the packaged target.
 
 | File | Installed to | Does |
