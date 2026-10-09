@@ -61,6 +61,15 @@ BEARD_RGB = (0.36, 0.24, 0.15)
 RIFLE_WOOD_RGB = (0.42, 0.24, 0.11)
 STEEL_RGB = (0.78, 0.80, 0.85)
 
+# The grove that grows there while the fort is down.
+PINE_RGB = (0.12, 0.34, 0.22)
+PINE_HI_RGB = (0.17, 0.43, 0.27)
+LEAF_RGB = (0.20, 0.42, 0.20)
+LEAF_HI_RGB = (0.29, 0.53, 0.26)
+TRUNK_RGB = (0.36, 0.24, 0.14)
+MEADOW_RGB = (0.13, 0.24, 0.15)
+PATH_RGB = (0.36, 0.29, 0.20)
+
 
 CSS = b"""
 .gm-root {
@@ -214,11 +223,11 @@ class GroupSampler:
 class CpuView(Gtk.DrawingArea):
     """Every physical core as a tile, each of its threads a live load bar.
 
-    The reserved cores stand inside a log stockade and the rest outside it,
-    so which ones they are never depends on telling orange from blue. When
-    the fort is up, mountain men stand watch on its towers and walk its
-    wall, the gate is shut, and embers rise in the reserved tiles; when it
-    is down, the towers are empty and the gate stands open.
+    While the fort is up, the reserved cores stand inside a log stockade,
+    mountain men watch from its towers and walk its wall, and embers rise
+    in the orange tiles. While it is down, a grove of trees and bushes grows
+    there instead and those cores look like every other. Which state it is
+    in never depends on telling orange from blue.
     """
 
     COLS = 5
@@ -588,6 +597,92 @@ class CpuView(Gtk.DrawingArea):
                                1 if u < 1.0 else -1, step=step,
                                shouldered=True)
 
+    # -- the grove, where the fort stands when it is down ------------------
+
+    def _pine(self, cr, x, base, h, sway):
+        """A conifer: trunk and three tiers, its tip swaying by sway."""
+        w = h * 0.5
+        cr.set_source_rgb(*TRUNK_RGB)
+        cr.rectangle(x - w * 0.07, base - h * 0.2, w * 0.14, h * 0.2)
+        cr.fill()
+        for i, (lo, hi, frac) in enumerate(((0.12, 0.62, 1.0),
+                                            (0.38, 0.84, 0.78),
+                                            (0.60, 1.0, 0.55))):
+            dx = sway * (hi - 0.1)
+            cr.move_to(x - w / 2 * frac + sway * lo, base - h * lo)
+            cr.line_to(x + dx, base - h * hi)
+            cr.line_to(x + w / 2 * frac + sway * lo, base - h * lo)
+            cr.close_path()
+            cr.set_source_rgb(*(PINE_RGB if i % 2 == 0 else PINE_HI_RGB))
+            cr.fill()
+
+    def _round_tree(self, cr, x, base, h, sway):
+        """A broadleaf: trunk and a canopy of three overlapping puffs."""
+        r = h * 0.26
+        cr.set_source_rgb(*TRUNK_RGB)
+        cr.rectangle(x - h * 0.04, base - h * 0.45, h * 0.08, h * 0.45)
+        cr.fill()
+        cy = base - h + r
+        for dx, dy, rr, rgb in ((-0.55, 0.35, 0.85, LEAF_RGB),
+                                (0.55, 0.35, 0.85, LEAF_RGB),
+                                (0.0, 0.0, 1.0, LEAF_HI_RGB)):
+            cr.set_source_rgb(*rgb)
+            cr.arc(x + dx * r + sway, cy + dy * r, r * rr, 0, 2 * math.pi)
+            cr.fill()
+
+    @staticmethod
+    def _bush(cr, x, base, s):
+        for dx, dy, rr, rgb in ((-0.5, 0.0, 0.55, LEAF_RGB),
+                                (0.5, 0.0, 0.55, LEAF_RGB),
+                                (0.0, -0.3, 0.65, LEAF_HI_RGB)):
+            cr.set_source_rgb(*rgb)
+            cr.arc(x + dx * s, base - s * 0.45 + dy * s, s * rr,
+                   0, 2 * math.pi)
+            cr.fill()
+
+    def _draw_grove(self, cr, x, y, w, h, t):
+        """Trees and bushes where the stockade stands while it is up: the
+        same ground, but nothing on it is held for anyone."""
+        edge = t * 0.3
+        X, Y, W, H = x - edge, y - edge, w + 2 * edge, h + 2 * edge
+
+        self._rounded(cr, X, Y, W, H, edge)
+        grad = cairo.LinearGradient(0, Y, 0, Y + H)
+        grad.add_color_stop_rgba(0.0, *MEADOW_RGB, 0.55)
+        grad.add_color_stop_rgba(1.0, *MEADOW_RGB, 0.30)
+        cr.set_source(grad)
+        cr.fill()
+
+        # A row of trees along the back, taller ones at the corners where
+        # the towers stand. Sizes vary but stay the same from frame to frame.
+        n = max(4, round(W / (t * 0.5)))
+        for i in range(n + 1):
+            tx = X + W * i / n
+            corner = i in (0, n)
+            th = t * (1.45 if corner else 0.95 + 0.4 * ((i * 0.618) % 1.0))
+            sway = math.sin(self.phase * 0.9 + i * 1.3) * t * 0.03
+            if corner or i % 3 != 1:
+                self._pine(cr, tx, y + edge * 0.2, th, sway)
+            else:
+                self._round_tree(cr, tx, y + edge * 0.2, th * 0.9, sway)
+
+        # Bushes down the sides and along the front, with a gap for a path.
+        s = t * 0.16
+        rows = max(1, round(h / (s * 2.2)))
+        for j in range(rows):
+            by = y + h * (j + 0.8) / rows
+            self._bush(cr, X + edge * 0.5, by, s)
+            self._bush(cr, X + W - edge * 0.5, by, s)
+        path = min(t * 0.9, w * 0.35)
+        cr.set_source_rgba(*PATH_RGB, 0.6)
+        cr.rectangle(X + W / 2 - path / 2, y + h, path, Y + H - (y + h))
+        cr.fill()
+        k = max(2, round((W - path) / 2 / (s * 2.1)))
+        for side in (-1, 1):
+            for j in range(k):
+                bx = X + W / 2 + side * (path / 2 + s + j * (W - path) / 2 / k)
+                self._bush(cr, bx, Y + H, s)
+
     # -- the picture ------------------------------------------------------
 
     def _draw(self, _area, cr, width, height):
@@ -624,9 +719,14 @@ class CpuView(Gtk.DrawingArea):
         fh = rows_f * (tile_h + label_h) + (rows_f - 1) * gap
         yx = (width - yw) / 2
         fy = y + 1.6 * t + 0.3 * t
-        towers, floor, walk, walk_y = self._draw_fort(cr, yx, fy, yw, fh, t)
+        if self.on:
+            towers, floor, walk, walk_y = self._draw_fort(cr, yx, fy, yw, fh,
+                                                          t)
+        else:
+            self._draw_grove(cr, yx, fy, yw, fh, t)
+        # Orange only while the fort holds them; down, they are like any other.
         self._tiles(cr, fort, yx + (yw - fw) / 2, fy, cols_f, t, tile_h,
-                    label_h, gap, True)
+                    label_h, gap, self.on)
 
         if rest:
             ox = (width - ow) / 2
@@ -637,7 +737,8 @@ class CpuView(Gtk.DrawingArea):
                         False)
 
         # Last, so a pacing sentry passes in front of the tower roofs.
-        self._draw_sentries(cr, towers, floor, walk, walk_y, t)
+        if self.on:
+            self._draw_sentries(cr, towers, floor, walk, walk_y, t)
 
     def _tiles(self, cr, cores, x0, y0, cols, t, tile_h, label_h, gap, mine):
         for i, core in enumerate(cores):
