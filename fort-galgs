@@ -810,9 +810,8 @@ def group_apps(apps):
     entry (an app often holds two scopes), everything else one per scope."""
     groups = {}
     for app in apps:
-        base = app["unit"].removeprefix("fort-")
-        info = desktop_info(app["desktop_ids"]) if base.startswith(
-            "app-") else None
+        info = (desktop_info(app["desktop_ids"]) if app.get("launched")
+                else None)
         if info is not None:
             key, title, other = "desktop:" + info.get_id(), \
                 info.get_display_name(), False
@@ -1357,7 +1356,9 @@ class FortApp(Adw.Application):
 def _sample_app(unit, name, inside=False, always=False):
     return {"unit": unit, "cgroup": None, "slice": "app.slice",
             "comms": [name], "name": name, "inside": inside,
-            "always": always, "desktop_ids": [name]}
+            "always": always,
+            "launched": unit.startswith(("app-", "fort-app-")),
+            "desktop_ids": [name]}
 
 
 SAMPLE_STATE = {

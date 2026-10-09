@@ -31,6 +31,7 @@ All of it is --runtime: a reboot takes the fort down.
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -48,6 +49,10 @@ USER_UNITS = ("app.slice", "background.slice")
 FORT_SLICE = "fort.slice"
 WATCH_UNIT = "fort-galgs-watch.service"
 WATCH_EVERY_S = 3
+
+# A scope a launcher started for a desktop app, under any prefixes that
+# moving it added since.
+APP_PREFIX = re.compile(r"^(?:[A-Za-z]+-)*?app-")
 
 CPU_SYS = "/sys/devices/system/cpu"
 CGROUP_ROOT = "/sys/fs/cgroup"
@@ -205,11 +210,10 @@ def desktop_ids(unit):
     """Guesses at the .desktop id behind a scope, longest first.
 
     Launchers name scopes app[-<launcher>]-<app id>-<random>.scope, with
-    literal dashes in the id escaped as \\x2d; fortctl adds fort- in front
-    and, moving one back, may add a suffix.
+    literal dashes in the id escaped as \\x2d. Moving one adds a prefix
+    (fort-, or an older tool's game-) and may add a suffix.
     """
-    name = unit.removesuffix(".scope").removeprefix("fort-")
-    name = name.removeprefix("app-")
+    name = APP_PREFIX.sub("", unit.removesuffix(".scope"), count=1)
     segs = name.split("-")
     out = []
     for end in range(len(segs), 0, -1):
@@ -222,13 +226,20 @@ def desktop_ids(unit):
 
 
 def scopes(config):
-    """Every scope with processes in app.slice, background.slice and
-    fort.slice. Only scopes: moving a service's processes out from under it
-    would break the service."""
-    fort_cg = user_cgroup(FORT_SLICE)
+    """Every scope with processes in any of the user manager's slices.
+
+    Only scopes: moving a service's processes out from under it would break
+    the service. Only inside slices: the manager itself runs in init.scope,
+    at the top.
+    """
+    manager = os.path.dirname(user_cgroup(FORT_SLICE))
+    try:
+        slices = sorted(e for e in os.listdir(manager) if e.endswith(".slice"))
+    except OSError as exc:
+        raise Fail(f"cannot list {manager}: {exc}") from None
     out = []
-    for slice_ in USER_UNITS + (FORT_SLICE,):
-        top = os.path.join(os.path.dirname(fort_cg), slice_)
+    for slice_ in slices:
+        top = os.path.join(manager, slice_)
         for dirpath, dirs, _files in os.walk(top):
             if not dirpath.endswith(".scope"):
                 continue
@@ -252,6 +263,7 @@ def scopes(config):
                 "name": comms[leader] or unit,
                 "inside": slice_ == FORT_SLICE,
                 "always": bool(set(comms.values()) & set(config["protect"])),
+                "launched": bool(APP_PREFIX.match(unit)),
                 "desktop_ids": desktop_ids(unit),
             })
     return out
