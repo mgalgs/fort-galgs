@@ -85,11 +85,14 @@ would only pull them back.
 
 ## Installing
 
+Fort Galgs is not on the AUR; build the package from this repo:
+
 ```bash
-cd packaging/arch
+git clone https://github.com/mgalgs/fort-galgs
+cd fort-galgs/packaging/arch
 makepkg -si
-# or, building from a local checkout:
-FORT_GALGS_GIT=git+file://$HOME/src/fort-galgs makepkg -si
+# that builds what is on GitHub; to build your local checkout instead:
+FORT_GALGS_GIT=git+file://$PWD/../.. makepkg -si
 ```
 
 Then, once per desktop user:
