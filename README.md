@@ -5,9 +5,10 @@ about — a game, a video call — and fence everything else off them, so a CI
 run in a VM, a container build, or a test sweep in tmux cannot starve them.
 
 One window: a live map of the chip, with the reserved cores inside a log
-stockade; a switch beside each running app to move it into or out of the fort;
-and one button to raise the fort or stand down. Mountain men stand watch on
-the walls while it is up.
+stockade while the fort is up and a grove of trees where it stood while it is
+down; beside each running app, a switch to move it into or out of the fort
+now and a pin to keep it there; and one button to raise the fort or stand
+down. Mountain men stand watch on the walls while it is up.
 
 <p align="center">
   <img src="docs/screenshot.png" width="420"
@@ -19,7 +20,7 @@ Requires systemd with cgroup v2. Arch Linux is the packaged target.
 | File | Installed to | Does |
 |------|--------------|------|
 | `fort-galgs` | `/usr/bin` | GTK front end |
-| `fortctl` | `/usr/bin` | Backend: `status [--json]`, `on`, `off`, `protect`/`unprotect <app>...`, `adopt <pid>`, `watch`; root half via `--system on\|off` |
+| `fortctl` | `/usr/bin` | Backend: `status [--json]`, `on`, `off`, `protect`/`unprotect <app>...`, `pin`/`unpin <app>...`, `adopt <pid>`, `watch`; root half via `--system on\|off` |
 | `fort-galgs.toml` | `/etc` | How many cores to reserve, and which apps always live in the fort |
 | `sudoers.in` | `/etc/sudoers.d/fort-galgs` | Lets the `fort-galgs` group run exactly `fortctl --system on` and `… off` |
 | `sysusers.conf` | `/usr/lib/sysusers.d/fort-galgs.conf` | Creates that group |
@@ -28,15 +29,21 @@ Requires systemd with cgroup v2. Arch Linux is the packaged target.
 
 ## Configuring
 
-`/etc/fort-galgs.toml`:
+`/etc/fort-galgs.toml` sets the machine-wide part:
 
 ```toml
 reserve_cores = 4      # physical cores; each brings its SMT sibling
-protect = ["steam"]    # process names, as in /proc/<pid>/comm
+apps = ["steam"]       # always in the fort, by .desktop id
+protect = []           # always in the fort, by process name (/proc/<pid>/comm)
 ```
 
-Both the user and root halves read it, so a change applies the next time the
-fort is raised.
+Apps can also be pinned per user: the pin beside each app in the window
+writes `apps` in `~/.config/fort-galgs.toml` (or `fortctl pin steam`, `fortctl
+unpin steam`). Apps pinned in `/etc` show a pin that is on and locked.
+
+Pinned apps are pulled into the fort whenever it is up, including ones that
+start later; the watcher rereads both files every few seconds. A pinned app
+cannot be switched out of the fort while it stays pinned.
 
 ## What "on" does
 
@@ -46,7 +53,7 @@ scheduler prefers (Turbo Boost Max, preferred cores, P-cores on hybrid
 parts), so without a fence background work lands on them first. Ties go by
 core id, with CPU 0's core last, since it takes the most interrupts.
 
-1. Every scope holding a process named in `protect` moves into `fort.slice`
+1. Every pinned app's scope moves into `fort.slice`
    in the user's systemd manager, which gets `CPUWeight=1000`. `fort.slice` is
    never fenced: apps inside keep every CPU and have the reserved ones to
    themselves. `fort-galgs-watch.service` starts and keeps pulling such apps
@@ -80,8 +87,9 @@ fortctl protect app-gnome-firefox-2435960.scope   # one scope, exactly
 ```
 
 It helps only while the fort is up, and lasts until the app quits or the
-machine reboots. Apps in the `protect` list cannot be moved out: the watcher
-would only pull them back.
+machine reboots. To keep an app in the fort for good, pin it instead (see
+Configuring). Pinned apps cannot be moved out: the watcher would only pull
+them back.
 
 ## Installing
 

@@ -7,16 +7,20 @@
     fortctl protect <app>...      move running apps into the fort; an <app>
                                   is a process name (firefox) or a scope unit
     fortctl unprotect <app>...    move them back out
+    fortctl pin <app>...          keep apps in the fort from now on; an <app>
+                                  is a .desktop id (steam) or a scope unit
+    fortctl unpin <app>...        stop keeping them there
     fortctl adopt <pid>           move one of your processes into the fort
-    fortctl watch                 keep pulling the configured apps in; run by
+    fortctl watch                 keep pulling the pinned apps in; run by
                                   fort-galgs-watch.service while the fort is up
     fortctl --system on|off       root only; this is what sudoers allows
 
 "On" reserves the machine's fastest cores (and their SMT siblings) for the
 apps in the fort by fencing everything else off them:
 
-  - The apps in /etc/fort-galgs.toml's `protect` list, and any you protect by
-    hand, live in fort.slice in the user's systemd manager. That slice is
+  - Pinned apps -- in /etc/fort-galgs.toml for everyone, in
+    ~/.config/fort-galgs.toml for you -- and any you protect by hand, live
+    in fort.slice in the user's systemd manager. That slice is
     never fenced, so they can still use every CPU; they just have a few that
     nothing else may touch.
   - app.slice and background.slice (terminals, tmux, tests, sandboxes) get
@@ -38,7 +42,8 @@ import time
 import tomllib
 
 CONFIG = "/etc/fort-galgs.toml"
-DEFAULTS = {"reserve_cores": 2, "protect": []}
+LIST_KEYS = ("protect", "apps")
+SYSTEM_DEFAULTS = {"reserve_cores": 2, "protect": [], "apps": []}
 
 # The sudoers rule names this exact path, and the Makefile rewrites this line
 # to match. Running a copy from anywhere else still escalates through it.
@@ -77,24 +82,82 @@ def read(path, default=""):
         return default
 
 
-def load_config():
+def user_config_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser(
+        "~/.config")
+    return os.path.join(base, "fort-galgs.toml")
+
+
+def read_toml(path, allowed):
     try:
-        with open(CONFIG, "rb") as fh:
+        with open(path, "rb") as fh:
             raw = tomllib.load(fh)
     except FileNotFoundError:
-        raw = {}
+        return {}
     except (OSError, tomllib.TOMLDecodeError) as exc:
-        raise Fail(f"{CONFIG}: {exc}") from None
-    cfg = dict(DEFAULTS, **raw)
-    unknown = set(cfg) - set(DEFAULTS)
+        raise Fail(f"{path}: {exc}") from None
+    unknown = set(raw) - set(allowed)
     if unknown:
-        raise Fail(f"{CONFIG}: unknown keys {', '.join(sorted(unknown))}")
-    if not isinstance(cfg["reserve_cores"], int) or cfg["reserve_cores"] < 1:
+        raise Fail(f"{path}: unknown keys {', '.join(sorted(unknown))}")
+    for key in LIST_KEYS:
+        items = raw.get(key, [])
+        if not (isinstance(items, list)
+                and all(isinstance(p, str) and p for p in items)):
+            raise Fail(f"{path}: {key} must be a list of names")
+    return raw
+
+
+def load_config(user=True):
+    """The system config, and unless user is False, the user's own pins.
+
+    Each of "system" and "user" holds `protect` (process names, as in
+    /proc/<pid>/comm) and `apps` (.desktop ids). Root reads only the
+    system file: the system half needs nothing but reserve_cores.
+    """
+    system = dict(SYSTEM_DEFAULTS, **read_toml(CONFIG, SYSTEM_DEFAULTS))
+    if (not isinstance(system["reserve_cores"], int)
+            or system["reserve_cores"] < 1):
         raise Fail(f"{CONFIG}: reserve_cores must be a whole number >= 1")
-    if not (isinstance(cfg["protect"], list)
-            and all(isinstance(p, str) and p for p in cfg["protect"])):
-        raise Fail(f"{CONFIG}: protect must be a list of process names")
-    return cfg
+    path = user_config_path() if user else None
+    mine = read_toml(path, LIST_KEYS) if user else {}
+    return {
+        "reserve_cores": system["reserve_cores"],
+        "system": {k: system[k] for k in LIST_KEYS},
+        "user": {k: mine.get(k, []) for k in LIST_KEYS},
+        "path": CONFIG,
+        "user_path": path,
+    }
+
+
+def write_user_config(config):
+    """Rewrite the user's file from config["user"]; the window's pins do
+    this, so the file holds nothing else worth keeping."""
+    path = config["user_path"]
+    lines = [
+        "# Fort Galgs: apps that always live in the fort, for this user.",
+        "# The pins in the Fort Galgs window rewrite this file.",
+        "#   apps:    .desktop ids (firefox, for firefox.desktop)",
+        "#   protect: process names, as in /proc/<pid>/comm",
+    ]
+    for key in ("apps", "protect"):
+        # json.dumps writes a valid TOML basic string.
+        items = ", ".join(json.dumps(s) for s in sorted(config["user"][key]))
+        lines.append(f"{key} = [{items}]")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    os.replace(tmp, path)
+
+
+def pinned_by(config, comms, desktop):
+    """Which config keeps a scope in the fort: "system", "user" or None."""
+    for source in ("system", "user"):
+        rules = config[source]
+        if set(comms) & set(rules["protect"]) or (
+                desktop and desktop in rules["apps"]):
+            return source
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -225,6 +288,26 @@ def desktop_ids(unit):
     return out
 
 
+def desktop_entries():
+    """The ids of every installed .desktop file, from the XDG data dirs."""
+    home = os.environ.get("XDG_DATA_HOME") or os.path.expanduser(
+        "~/.local/share")
+    dirs = [home] + (os.environ.get("XDG_DATA_DIRS")
+                     or "/usr/local/share:/usr/share").split(":")
+    # A user service may start without the session's XDG_DATA_DIRS.
+    dirs += [os.path.join(home, "flatpak/exports/share"),
+             "/var/lib/flatpak/exports/share"]
+    found = set()
+    for d in dirs:
+        try:
+            names = os.listdir(os.path.join(d, "applications"))
+        except OSError:
+            continue
+        found.update(n.removesuffix(".desktop") for n in names
+                     if n.endswith(".desktop"))
+    return found
+
+
 def scopes(config):
     """Every scope with processes in any of the user manager's slices.
 
@@ -232,6 +315,7 @@ def scopes(config):
     the service. Only inside slices: the manager itself runs in init.scope,
     at the top.
     """
+    entries = desktop_entries()
     manager = os.path.dirname(user_cgroup(FORT_SLICE))
     try:
         slices = sorted(e for e in os.listdir(manager) if e.endswith(".slice"))
@@ -254,6 +338,10 @@ def scopes(config):
             comms = {p: read(f"/proc/{p}/comm") for p in pids}
             leader = min(pids, key=lambda p: (started(p), p))
             unit = os.path.basename(dirpath)
+            launched = bool(APP_PREFIX.match(unit))
+            desktop = next((d for d in desktop_ids(unit) if d in entries),
+                           None) if launched else None
+            pinned = pinned_by(config, set(comms.values()), desktop)
             out.append({
                 "unit": unit,
                 "cgroup": dirpath,
@@ -262,9 +350,10 @@ def scopes(config):
                 "comms": sorted(set(comms.values()) - {""}),
                 "name": comms[leader] or unit,
                 "inside": slice_ == FORT_SLICE,
-                "always": bool(set(comms.values()) & set(config["protect"])),
-                "launched": bool(APP_PREFIX.match(unit)),
-                "desktop_ids": desktop_ids(unit),
+                "always": pinned is not None,
+                "pinned_by": pinned,
+                "launched": launched,
+                "desktop": desktop,
             })
     return out
 
@@ -308,11 +397,46 @@ def move_in(s):
     move(f"fort-{s['unit']}", s["pids"], s["unit"], FORT_SLICE)
 
 
-def pull_in(config, names):
-    """Move every scope outside the fort holding one of names into it."""
+def pull_in(config):
+    """Move every scope outside the fort that the config pins into it."""
     for s in scopes(config):
-        if not s["inside"] and set(s["comms"]) & set(names):
+        if not s["inside"] and s["always"]:
             move_in(s)
+
+
+def pin(config, app):
+    """Keep an app in the fort from now on: app is a .desktop id, or a scope
+    unit standing for its app."""
+    app = desktop_of(config, app)
+    if app in config["system"]["apps"]:
+        return
+    config["user"]["apps"] = sorted(set(config["user"]["apps"]) | {app})
+    write_user_config(config)
+    pull_in(config)
+
+
+def unpin(config, app):
+    """Stop keeping an app in the fort. It stays where it is until moved."""
+    app = desktop_of(config, app)
+    if app in config["system"]["apps"]:
+        raise Fail(f"{app} is pinned for everyone, in {CONFIG}")
+    if app not in config["user"]["apps"]:
+        raise Fail(f"{app} is not pinned in {config['user_path']}")
+    config["user"]["apps"] = [a for a in config["user"]["apps"] if a != app]
+    write_user_config(config)
+
+
+def desktop_of(config, app):
+    if app.endswith(".scope"):
+        found = [s for s in scopes(config) if s["unit"] == app]
+        if not found or not found[0]["desktop"]:
+            raise Fail(f"{app} is not a running desktop app")
+        return found[0]["desktop"]
+    app = app.removesuffix(".desktop")
+    if app not in desktop_entries():
+        raise Fail(f"no {app}.desktop is installed; to pin by process "
+                   f"name, add it to protect in {config['user_path']}")
+    return app
 
 
 def protect(config, app):
@@ -330,8 +454,10 @@ def unprotect(config, app):
         raise Fail(f"nothing in the fort matches {app!r}")
     for s in hits:
         if s["always"]:
-            raise Fail(f"{s['name']} is always in the fort: it is in "
-                       f"{CONFIG}'s protect list")
+            where = (CONFIG if s["pinned_by"] == "system"
+                     else config["user_path"])
+            raise Fail(f"{s['name']} is always in the fort: it is pinned "
+                       f"in {where}")
     for s in hits:
         base = s["unit"].removeprefix("fort-").removesuffix(".scope")
         try:
@@ -363,12 +489,13 @@ def adopt(pid):
     move(f"fort-adopted-{pid}.scope", [pid], f"pid {pid}", FORT_SLICE)
 
 
-def watch(config):
-    """Pull configured apps in as they start. 'on' starts the unit that runs
-    this and 'off' stops it, so it never checks whether the fort is up."""
+def watch():
+    """Pull pinned apps in as they start. 'on' starts the unit that runs
+    this and 'off' stops it, so it never checks whether the fort is up.
+    The config is read every pass, so a new pin applies within seconds."""
     while True:
         try:
-            pull_in(config, config["protect"])
+            pull_in(load_config())
         except Fail as exc:
             print(f"fortctl watch: {exc}", file=sys.stderr, flush=True)
         time.sleep(WATCH_EVERY_S)
@@ -376,7 +503,7 @@ def watch(config):
 
 def user_apply(config, on, fenced):
     if on:
-        pull_in(config, config["protect"])
+        pull_in(config)
     # The weight matters on the shared CPUs: there the fort competes with
     # app.slice, and 10x its share keeps it ahead.
     run(["systemctl", "--user", "set-property", "--runtime", FORT_SLICE,
@@ -431,7 +558,7 @@ def status(config):
         "reserved": reserved,
         "cores": topo,
         "cpuset_delegated": delegated,
-        "config": dict(config, path=CONFIG),
+        "config": config,
         "apps": apps,
         "cgroups": {
             "fort": user_cgroup(FORT_SLICE),
@@ -461,17 +588,18 @@ def print_status(st):
 
 def main(argv):
     try:
-        config = load_config()
         if argv[:1] == ["--system"]:
             if os.geteuid() != 0 or argv[1:] not in (["on"], ["off"]):
                 print(__doc__, file=sys.stderr)
                 return 2
+            config = load_config(user=False)
             topo = cores()
             reserved = reserved_cpus(topo, config["reserve_cores"])
             system_apply(cpulist(fenced_cpus(topo, reserved))
                          if argv[1] == "on" else "")
             return 0
 
+        config = load_config()
         if argv[:1] == ["status"]:
             st = status(config)
             if "--json" in argv:
@@ -489,8 +617,13 @@ def main(argv):
                 (protect if argv[0] == "protect" else unprotect)(config, app)
             return 0
 
+        if len(argv) >= 2 and argv[0] in ("pin", "unpin"):
+            for app in argv[1:]:
+                (pin if argv[0] == "pin" else unpin)(config, app)
+            return 0
+
         if argv == ["watch"]:
-            watch(config)
+            watch()
 
         if argv in (["on"], ["off"]):
             if os.geteuid() == 0:

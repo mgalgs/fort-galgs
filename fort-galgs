@@ -894,20 +894,19 @@ class UsageRow(Gtk.Box):
 _desktop_cache = {}
 
 
-def desktop_info(ids):
-    """The first .desktop entry among fortctl's guesses, or None."""
-    key = tuple(ids)
-    if key not in _desktop_cache:
-        found = None
-        for guess in ids:
-            try:
-                found = DesktopAppInfo.new(guess + ".desktop")
-            except TypeError:
-                found = None
-            if found is not None:
-                break
-        _desktop_cache[key] = found
-    return _desktop_cache[key]
+def desktop_info(desktop):
+    """The .desktop entry fortctl matched to a scope, or None."""
+    if desktop not in _desktop_cache:
+        try:
+            found = DesktopAppInfo.new(desktop + ".desktop")
+        except TypeError:
+            found = None
+        _desktop_cache[desktop] = found
+    return _desktop_cache[desktop]
+
+
+# Which pin wins when an app's scopes disagree: the system's is locked.
+PIN_RANK = {None: 0, "user": 1, "system": 2}
 
 
 def group_apps(apps):
@@ -915,22 +914,26 @@ def group_apps(apps):
     entry (an app often holds two scopes), everything else one per scope."""
     groups = {}
     for app in apps:
-        info = (desktop_info(app["desktop_ids"]) if app.get("launched")
-                else None)
+        desktop = app.get("desktop")
+        info = desktop_info(desktop) if desktop else None
         if info is not None:
-            key, title, other = "desktop:" + info.get_id(), \
+            key, title, other = "desktop:" + desktop, \
                 info.get_display_name(), False
         else:
             key, title, other = "unit:" + app["unit"], app["name"], True
         g = groups.setdefault(key, {
             "key": key, "title": title, "other": other,
+            "desktop": desktop if info is not None else None,
             "icon": info.get_icon() if info is not None else None,
             "units": [], "cgroups": [], "inside": [], "always": False,
+            "pinned_by": None,
         })
         g["units"].append(app["unit"])
         g["cgroups"].append(app["cgroup"])
         g["inside"].append(app["inside"])
         g["always"] = g["always"] or app["always"]
+        if PIN_RANK[app.get("pinned_by")] > PIN_RANK[g["pinned_by"]]:
+            g["pinned_by"] = app["pinned_by"]
         if other:
             g["subtitle"] = app["unit"]
     out = list(groups.values())
@@ -939,11 +942,13 @@ def group_apps(apps):
 
 
 class AppRow(Gtk.Box):
-    """One app: icon, name, where it is, live CPU, and a switch."""
+    """One app: icon, name, where it is, live CPU, a pin that keeps it in
+    the fort from now on, and a switch that moves it in or out now."""
 
-    def __init__(self, on_flip):
+    def __init__(self, on_flip, on_pin):
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         self.on_flip = on_flip
+        self.on_pin = on_pin
         self.group = None
         self._quiet = False
         self.icon = Gtk.Image(pixel_size=28, valign=Gtk.Align.CENTER)
@@ -962,6 +967,11 @@ class AppRow(Gtk.Box):
         self.append(self.cpu)
         self.spinner = Adw.Spinner(visible=False)
         self.append(self.spinner)
+        self.pin = Gtk.ToggleButton(icon_name="view-pin-symbolic",
+                                    valign=Gtk.Align.CENTER,
+                                    css_classes=["flat", "circular"])
+        self.pin.connect("toggled", self._on_pin_toggled)
+        self.append(self.pin)
         self.switch = Gtk.Switch(valign=Gtk.Align.CENTER)
         self.switch.connect("state-set", self._on_state_set)
         self.append(self.switch)
@@ -993,18 +1003,38 @@ class AppRow(Gtk.Box):
         self._quiet = True
         self.switch.set_active(inside)
         self.switch.set_state(inside)
+        self.pin.set_active(group["pinned_by"] is not None)
         self._quiet = False
-        self.switch.set_sensitive(not self.spinner.get_visible()
-                                  and not (group["always"] and inside))
-        self.set_tooltip_text("Listed in fort-galgs.toml, so it stays in "
-                              "the fort" if group["always"] else None)
+        self._sensitize()
+        by = group["pinned_by"]
+        self.pin.set_visible(group["desktop"] is not None)
+        self.pin.set_tooltip_text(
+            "Pinned for everyone in /etc/fort-galgs.toml" if by == "system"
+            else "Pinned: always in the fort" if by == "user"
+            else "Pin: keep it in the fort from now on")
+        self.switch.set_tooltip_text(
+            "Unpin it to move it out" if group["always"] and inside
+            else None)
+
+    def _sensitize(self):
+        busy = self.spinner.get_visible()
+        g = self.group
+        self.switch.set_sensitive(not busy and not (g["always"]
+                                                    and all(g["inside"])))
+        self.pin.set_sensitive(not busy and g["pinned_by"] != "system")
 
     def set_cpu(self, cpus):
         self.cpu.set_label(f"{cpus:4.1f}" if cpus >= 0.05 else "")
 
     def set_busy(self, busy):
         self.spinner.set_visible(busy)
-        self.switch.set_sensitive(not busy)
+        if self.group is not None:
+            self._sensitize()
+
+    def _on_pin_toggled(self, button):
+        if self._quiet or self.group is None:
+            return
+        self.on_pin(self, button.get_active())
 
     def _on_state_set(self, _switch, want):
         if self._quiet or self.group is None:
@@ -1017,9 +1047,10 @@ class AppRow(Gtk.Box):
 class AppList(Gtk.Box):
     """Desktop apps first; terminals and other scopes under an expander."""
 
-    def __init__(self, on_flip):
+    def __init__(self, on_flip, on_pin):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         self.on_flip = on_flip
+        self.on_pin = on_pin
         self.rows = {}
         self.main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         self.others = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
@@ -1044,7 +1075,7 @@ class AppList(Gtk.Box):
         for g in groups:
             row = self.rows.get(g["key"])
             if row is None:
-                row = self.rows[g["key"]] = AppRow(self.on_flip)
+                row = self.rows[g["key"]] = AppRow(self.on_flip, self.on_pin)
             row.update(g, mode)
             (self.others if g["other"] else self.main).append(row)
             n_other += g["other"]
@@ -1188,7 +1219,7 @@ class FortWindow(Adw.ApplicationWindow):
                        css_classes=["gm-card"], margin_top=4)
         apps.append(Gtk.Label(label="Who is in the fort", xalign=0.0,
                               css_classes=["gm-row-note"]))
-        self.app_list = AppList(self._on_flip)
+        self.app_list = AppList(self._on_flip, self._on_pin)
         apps.append(self.app_list)
         box.append(apps)
 
@@ -1378,6 +1409,20 @@ class FortWindow(Adw.ApplicationWindow):
 
         run_backend([verb] + units, done)
 
+    def _on_pin(self, row, want):
+        group = row.group
+        row.set_busy(True)
+
+        def done(ok, text):
+            row.set_busy(False)
+            if not ok:
+                self.show_error(f"Could not {'pin' if want else 'unpin'} "
+                                f"{group['title']}", text)
+                return
+            self.refresh_status(quiet=True)
+
+        run_backend(["pin" if want else "unpin", group["desktop"]], done)
+
     # -- live numbers -----------------------------------------------------
 
     def _sample(self):
@@ -1458,12 +1503,12 @@ class FortApp(Adw.Application):
         self.window.present()
 
 
-def _sample_app(unit, name, inside=False, always=False):
+def _sample_app(unit, name, inside=False, pinned_by=None):
+    launched = unit.startswith(("app-", "fort-app-"))
     return {"unit": unit, "cgroup": None, "slice": "app.slice",
             "comms": [name], "name": name, "inside": inside,
-            "always": always,
-            "launched": unit.startswith(("app-", "fort-app-")),
-            "desktop_ids": [name]}
+            "always": pinned_by is not None, "pinned_by": pinned_by,
+            "launched": launched, "desktop": name if launched else None}
 
 
 SAMPLE_STATE = {
@@ -1472,11 +1517,13 @@ SAMPLE_STATE = {
     "cores": [{"core": c, "cpus": [i, i + 10], "max_khz": 4300000}
               for i, c in enumerate([0, 1, 2, 3, 4, 8, 9, 10, 11, 12])],
     "cpuset_delegated": False,
-    "config": {"reserve_cores": 2, "protect": ["steam"], "path": "x"},
+    "config": {"reserve_cores": 2, "path": "x", "user_path": "y",
+               "system": {"protect": ["steam"], "apps": []},
+               "user": {"protect": [], "apps": ["firefox"]}},
     "apps": [
-        _sample_app("fort-app-gnome-steam-1.scope", "steam", True, True),
+        _sample_app("fort-app-gnome-steam-1.scope", "steam", True, "system"),
         _sample_app("app-gnome-firefox-2.scope", "firefox"),
-        _sample_app("app-firefox-3.scope", "firefox", True),
+        _sample_app("app-firefox-3.scope", "firefox", True, "user"),
         _sample_app("tmux-spawn-4.scope", "zsh"),
     ],
     "cgroups": {"fort": None, "apps": None, "background": None,
@@ -1528,6 +1575,12 @@ def self_test():
     assert not any(groups[-1]["inside"]), groups[-1]
     rows = win.app_list.rows
     assert len(rows) == len(groups), (len(rows), len(groups))
+    pins = {g["title"]: g["pinned_by"] for g in groups}
+    assert "system" in pins.values() and "user" in pins.values(), pins
+    for row in rows.values():
+        locked = row.group["pinned_by"] == "system"
+        assert row.pin.get_sensitive() != locked, row.group["title"]
+        assert row.pin.get_active() == (row.group["pinned_by"] is not None)
 
     loads = win.cpus.sample()
     loads = win.cpus.sample()

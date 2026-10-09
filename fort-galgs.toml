@@ -1,12 +1,15 @@
-# Fort Galgs: which cores the fort holds and who always lives inside it.
-# Read by fortctl, as you and as root, each time it runs.
+# Fort Galgs: which cores the fort holds, and which apps always live inside
+# it for every user. Each user can pin more from the window, which writes
+# ~/.config/fort-galgs.toml.
 
 # How many physical cores to reserve. Each brings its SMT sibling along, and
 # the fastest-boosting cores are picked first. Leave at least one outside.
 reserve_cores = 2
 
-# Process names (as in /proc/<pid>/comm, at most 15 characters) whose apps
-# are pulled into the fort whenever it is up, including ones that start
-# later. Anything else can be moved in and out by hand, in the window or
-# with `fortctl protect <name>`.
+# Apps pulled into the fort whenever it is up, including ones that start
+# later, by .desktop id: "steam" for steam.desktop.
+apps = []
+
+# The same, by process name (as in /proc/<pid>/comm, at most 15
+# characters), for apps without a .desktop entry.
 protect = []
