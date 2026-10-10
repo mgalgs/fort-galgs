@@ -97,6 +97,10 @@ MUD_RGB = (0.27, 0.21, 0.14)
 STONE_RGB = (0.50, 0.50, 0.52)
 STONE_DARK_RGB = (0.33, 0.33, 0.36)
 
+# What lives along the river.
+BEAVER_RGB = (0.45, 0.29, 0.17)
+BEAVER_DARK_RGB = (0.22, 0.15, 0.10)
+
 
 CSS = b"""
 .gm-root {
@@ -1958,6 +1962,81 @@ class CpuView(Gtk.DrawingArea):
             cr.set_source_rgb(*STONE_RGB)
             cr.fill()
 
+    BEAVER_S = 46.0     # a beaver takes this long to swim the picture
+
+    def _swim_u(self):
+        return (self.phase / self.BEAVER_S + 0.3) % 1.0
+
+    def _swim_at(self, u):
+        x = -30 + u * (self.river["w"] + 60)
+        return x, self._river_y(x) + 0.45 * self._river_half(x)
+
+    def _swimmer(self):
+        """The swimming beaver: (x, y, dive), x None while he is under.
+        dive is seconds since his tail slapped the water, or negative."""
+        u = self._swim_u()
+        x, y = self._swim_at(u)
+        dive = (u - 0.58) * self.BEAVER_S if 0.58 <= u < 0.78 else -1.0
+        return (None if 0.62 <= u < 0.78 else x), y, dive
+
+    def _draw_swimmer(self, cr):
+        """A beaver swimming downstream with a V of ripples behind him;
+        partway he slaps his tail and dives, and comes up again further
+        on."""
+        x, y, dive = self._swimmer()
+        s = self.river["half"] * 1.5
+        if 0 <= dive < 1.6:
+            # The splash stays where he went down.
+            sx, sy = self._swim_at(0.58)
+            self._splash(cr, sx - s * 0.4, sy, s, dive)
+        if x is None:
+            # A string of bubbles marks where he swims below.
+            bx, by = self._swim_at(self._swim_u())
+            cr.set_source_rgba(*WATER_HI_RGB, 0.6)
+            for k in range(3):
+                b = (self.phase * 1.7 + k / 3) % 1.0
+                cr.arc(bx - k * s * 0.3, by - b * 2, max(0.6, s * 0.05),
+                       0, 2 * math.pi)
+                cr.fill()
+            return
+        ln = s * (1.6 + 0.2 * math.sin(self.phase * 3))
+        nose = x + s * 0.5
+        cr.set_line_width(1.1)
+        for side in (-1, 1):
+            grad = cairo.LinearGradient(nose, y, nose - ln, y)
+            grad.add_color_stop_rgba(0.0, *WATER_HI_RGB, 0.8)
+            grad.add_color_stop_rgba(1.0, *WATER_HI_RGB, 0.0)
+            cr.set_source(grad)
+            cr.move_to(nose - s * 0.1, y)
+            cr.line_to(nose - ln, y + side * ln * 0.32)
+            cr.stroke()
+        self._beaver(cr, x, y, s, 1, swim=True,
+                     dive=min(1.0, dive / 1.8) if dive >= 0 else 0.0)
+
+    def _splash(self, cr, x, y, s, e):
+        """Rings and drops where a tail slapped the water, e seconds on."""
+        cr.set_line_width(1.0)
+        for k in range(3):
+            u = e / 1.6 - k * 0.15
+            if u <= 0:
+                continue
+            cr.set_source_rgba(1, 1, 1, 0.7 * (1 - u))
+            cr.save()
+            cr.translate(x, y)
+            cr.scale(1.0, 0.35)
+            cr.arc(0, 0, s * (0.2 + 0.9 * u), 0, 2 * math.pi)
+            cr.restore()
+            cr.stroke()
+        if e < 0.7:
+            cr.set_source_rgba(1, 1, 1, 0.9 * (1 - e / 0.7))
+            for k in range(5):
+                a = math.pi * (0.2 + 0.15 * k)
+                v = s * (1.6 + 0.4 * (k % 2))
+                cr.arc(x + math.cos(a) * v * e,
+                       y - math.sin(a) * v * e + s * 5 * e * e,
+                       max(0.7, s * 0.06), 0, 2 * math.pi)
+                cr.fill()
+
     # -- the grove, where the fort stands when it is down ------------------
 
     def _pine(self, cr, x, base, h, sway):
@@ -2000,6 +2079,65 @@ class CpuView(Gtk.DrawingArea):
             cr.arc(x + dx * s, base - s * 0.45 + dy * s, s * rr,
                    0, 2 * math.pi)
             cr.fill()
+
+    @staticmethod
+    def _beaver(cr, x, y, s, facing, thrash=0.0, swim=False, dive=0.0):
+        """A beaver about s long, nose toward facing, belly at y. Swimming,
+        y is the waterline and only his head and back show; dive runs 0..1
+        as he tips nose-down, tail flung up, and sinks. thrash rocks him,
+        in radians."""
+        if s < 2:
+            return
+        cr.save()
+        cr.translate(x, y)
+        cr.scale(facing, 1)
+        if swim:
+            cr.save()
+            cr.rectangle(-s * 2, -s * 2, s * 4, s * 2 + s * 0.04)
+            cr.clip()
+            cr.translate(0, s * 0.6 * dive)
+        tip = min(1.0, dive * 4)
+        cr.rotate(thrash + 0.7 * tip)
+        if not swim or dive > 0:
+            # The flat, scaly paddle of a tail.
+            cr.save()
+            cr.translate(-s * 0.42, -s * 0.12)
+            cr.rotate(-1.4 * tip)
+            cr.translate(-s * 0.2, 0)
+            cr.scale(s * 0.24, s * 0.08)
+            cr.arc(0, 0, 1, 0, 2 * math.pi)
+            cr.restore()
+            cr.set_source_rgb(*BEAVER_DARK_RGB)
+            cr.fill()
+        cr.save()
+        cr.translate(0, -s * 0.2)
+        cr.scale(s * 0.38, s * 0.21)
+        cr.arc(0, 0, 1, 0, 2 * math.pi)
+        cr.restore()
+        cr.set_source_rgb(*BEAVER_RGB)
+        cr.fill()
+        cr.arc(s * 0.36, -s * 0.28, s * 0.15, 0, 2 * math.pi)
+        cr.fill()
+        cr.set_source_rgb(*BEAVER_DARK_RGB)
+        cr.arc(s * 0.29, -s * 0.42, s * 0.05, 0, 2 * math.pi)
+        cr.fill()
+        cr.arc(s * 0.5, -s * 0.29, s * 0.045, 0, 2 * math.pi)
+        cr.fill()
+        cr.set_source_rgb(0.02, 0.02, 0.02)
+        cr.arc(s * 0.41, -s * 0.33, max(0.4, s * 0.025), 0, 2 * math.pi)
+        cr.fill()
+        if not swim:
+            cr.set_source_rgb(*BEAVER_DARK_RGB)
+            for fx in (-0.2, 0.18):
+                cr.save()
+                cr.translate(s * fx, -s * 0.01)
+                cr.scale(s * 0.08, s * 0.035)
+                cr.arc(0, 0, 1, 0, 2 * math.pi)
+                cr.restore()
+                cr.fill()
+        if swim:
+            cr.restore()
+        cr.restore()
 
     def _draw_grove(self, cr, x, y, w, h, t):
         """Trees and bushes where the stockade stands while it is up: the
@@ -2099,6 +2237,7 @@ class CpuView(Gtk.DrawingArea):
         chip_foot = oy + t_o * 1.05 + label_h + gap * 1.25 if rest else 0.0
         self._lay_river(width, chip_foot, fy - 0.9 * t, t)
         self._draw_river(cr)
+        self._draw_swimmer(cr)
 
         self.trails = None
         self.fords = [None, None]
@@ -3001,6 +3140,15 @@ def self_test():
     win.view._draw(win.view, cr, 60, 40)  # drives every clamp
 
     view = win.view
+    # The beaver swims the river, and dives for part of each crossing.
+    view._draw(view, cr, 1024, 680)
+    seen = set()
+    for k in range(40):
+        view.phase = view.BEAVER_S * k / 40
+        x, y, dive = view._swimmer()
+        seen.add("under" if x is None else "dive" if dive >= 0 else "swim")
+    assert seen == {"swim", "dive", "under"}, seen
+
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], True)
     for facing, phase in ((1, 0.0), (-1, 10.0)):
         view.bugle_at = None
