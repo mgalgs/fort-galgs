@@ -101,6 +101,9 @@ STONE_DARK_RGB = (0.33, 0.33, 0.36)
 # What lives along the river.
 BEAVER_RGB = (0.45, 0.29, 0.17)
 BEAVER_DARK_RGB = (0.22, 0.15, 0.10)
+PELT_RGB = (0.56, 0.38, 0.22)
+PELT_DARK_RGB = (0.35, 0.22, 0.12)
+CORD_RGB = (0.83, 0.74, 0.52)
 
 
 CSS = b"""
@@ -505,6 +508,7 @@ class CpuView(Gtk.DrawingArea):
         if self._bugling() or self.relief is not None:
             self.walker_halted += dt
         if not self.on:
+            self._advance_wilds(dt)
             return
         self._advance_relief()
         speed = (self.MARCH_FAR - self.MARCH_NEAR) / self.MARCH_S
@@ -726,7 +730,7 @@ class CpuView(Gtk.DrawingArea):
     @staticmethod
     def _mountain_man(cr, x, feet, s, facing, step=0.0, shouldered=False,
                       glint=0.0, kneel=0.0, aim=0.0, shot=-1.0, bugle=0.0,
-                      toot=-1.0, elev=0.04):
+                      toot=-1.0, elev=0.04, beaver=False):
         """A buckskin-clad mountain man with a coonskin cap and a long rifle.
 
         Drawn in a 100-unit-tall model with the feet at 0; facing is +1 for
@@ -734,7 +738,8 @@ class CpuView(Gtk.DrawingArea):
         aim run 0..1 from standing at ease; shot is the seconds since he
         fired, or negative if he has not. bugle runs 0..1 from his hip to
         his lips, and toot is the seconds since he began to blow it. elev is
-        how far above level, in radians, he aims.
+        how far above level, in radians, he aims. beaver slings one over
+        his shoulder, hanging down his back.
         """
         cr.save()
         cr.translate(x, feet)
@@ -821,6 +826,31 @@ class CpuView(Gtk.DrawingArea):
         leg(-step, BUCK_DARK_RGB, False)
         if shouldered:
             tip = rifle_shouldered()
+        if beaver:
+            cr.save()
+            cr.translate(0, drop)
+            cr.set_source_rgb(*BEAVER_DARK_RGB)
+            cr.save()
+            cr.translate(-19, -46)
+            cr.rotate(0.25)
+            cr.scale(4.5, 9)
+            cr.arc(0, 0, 1, 0, 2 * math.pi)
+            cr.restore()
+            cr.fill()
+            cr.set_source_rgb(*BEAVER_RGB)
+            cr.save()
+            cr.translate(-15, -64)
+            cr.rotate(1.35)
+            cr.scale(15, 8)
+            cr.arc(0, 0, 1, 0, 2 * math.pi)
+            cr.restore()
+            cr.fill()
+            cr.arc(-8, -79, 6, 0, 2 * math.pi)
+            cr.fill()
+            cr.set_source_rgb(*BEAVER_DARK_RGB)
+            cr.arc(-3.5, -82, 2, 0, 2 * math.pi)
+            cr.fill()
+            cr.restore()
 
         # Fringed buckskin shirt.
         cr.save()
@@ -2196,7 +2226,7 @@ class CpuView(Gtk.DrawingArea):
         trapper keeps to one flank of the grove, with a cache of pelts on
         the near bank, traps along both banks, and stepping stones across.
         A flank too small for any of it simply goes without."""
-        s = t * 0.5
+        s = t * 0.58
         mud = self.river["half"] * 0.35 + 2
         gx0, gy0, gx1, gy1 = grove
         floor = height * 0.94
@@ -2269,7 +2299,7 @@ class CpuView(Gtk.DrawingArea):
         # Points the woods must leave in plain view: (x, feet, half width,
         # height) of whatever stands there.
         keep = [(st["stand"][0], st["stand"][1], 0.5 * s, s) for st in sites]
-        keep += [(st["x"], st["y"], 0.4 * s, 0.6 * s) for st in sites]
+        keep += [(st["x"], st["y"], 0.7 * s, 0.8 * s) for st in sites]
         keep += [(fl["cache"][0], fl["cache"][1], 0.9 * s, s)
                  for fl in flanks if fl["cache"]]
         for fl in flanks:
@@ -2324,15 +2354,296 @@ class CpuView(Gtk.DrawingArea):
                      "flanks": flanks, "pastures": pastures, "grove": grove}
         self.sites = sites
         self.trappers = []
+        for f, fl in enumerate(flanks):
+            if fl["near"] is not None:
+                x, y = self._cache_stand(f)
+                self.trappers.append({
+                    "flank": f, "x": x, "y": y, "facing": -1, "job": "rest",
+                    "route": [], "then": None, "began": self.phase,
+                    "until": self.phase + 1.0 + f, "carry": False,
+                    "site": None})
         self.horses = []
+
+    # The trap line: how long each piece of work takes him, kneeling.
+    JOB_S = {"set": 3.0, "collect": 2.5, "stash": 2.0}
+    PELT_BALE = 5       # pelts on the stack before he ties them in a bale
+    BALE_MAX = 3
+
+    def _cache_stand(self, f):
+        x, y = self.wild["flanks"][f]["cache"]
+        return x + 0.75 * self.wild["s"], y + 0.05 * self.wild["s"]
+
+    def _stash(self, f):
+        pelts, bales = self.pelts[f]
+        pelts += 1
+        if pelts >= self.PELT_BALE:
+            pelts, bales = 0, min(bales + 1, self.BALE_MAX)
+        self.pelts[f] = [pelts, bales]
+
+    def _route(self, tr, dest):
+        """Waypoints from where he stands to dest that keep to dry land:
+        along his own flank, over the river only on its stones."""
+        fl = self.wild["flanks"][tr["flank"]]
+
+        def bank(x, y):
+            return 1 if y > self._river_y(x) else -1
+
+        def leg(a, b, side):
+            # Above the near rect's top (below the far rect's bottom) the
+            # bank curves; going straight down to it and along is dry.
+            lim = fl["near"][1] if side > 0 else fl["far"][3]
+            pts = []
+            if (a[1] - lim) * side < 0:
+                pts.append((a[0], lim))
+            if (b[1] - lim) * side < 0:
+                pts.append((b[0], lim))
+            return pts + [b]
+
+        here = (tr["x"], tr["y"])
+        side = bank(*here)
+        if bank(*dest) == side or fl["ford"] is None:
+            return leg(here, dest, side)
+        mine, theirs = fl["ford"] if side < 0 else fl["ford"][::-1]
+        return leg(here, mine, side) + leg(theirs, dest, -side)
+
+    def _go(self, tr, dest, then, site=None):
+        tr["route"] = self._route(tr, dest)
+        tr["then"], tr["site"] = then, site
+
+    def _trapper_next(self, tr):
+        """Pick his next errand: a pelt to stash, a beaver to collect, a
+        trap to set, or a stroll and a rest."""
+        f = tr["flank"]
+        mine = [st for st in self.sites if st["flank"] == f]
+        caught = [st for st in mine if st["state"] == "caught"]
+        empty = [st for st in mine if st["state"] == "empty"]
+        if tr["carry"]:
+            self._go(tr, self._cache_stand(f), "stash")
+        elif caught:
+            self._go(tr, caught[0]["stand"], "collect", caught[0])
+        elif empty and self.rng.random() < 0.7:
+            st = self.rng.choice(empty)
+            self._go(tr, st["stand"], "set", st)
+        elif self.rng.random() < 0.45:
+            self._start(tr, "rest")
+        else:
+            fl = self.wild["flanks"][f]
+            s = self.wild["s"]
+            rects = [fl["near"]] * 2 + ([fl["far"]] if fl["ford"] else [])
+            x0, y0, x1, y1 = self.rng.choice(rects)
+            dest = (self.rng.uniform(x0 + 0.4 * s, max(x0 + 0.4 * s,
+                                                       x1 - 0.4 * s)),
+                    self.rng.uniform(y0 + 0.1 * s, max(y0 + 0.1 * s,
+                                                       y1 - 0.1 * s)))
+            self._go(tr, dest, "rest")
+
+    def _start(self, tr, job):
+        tr["job"], tr["began"] = job, self.phase
+        tr["until"] = self.phase + self.JOB_S.get(
+            job, self.rng.uniform(3.0, 8.0))
+        st = tr["site"]
+        if st is not None and job in ("set", "collect"):
+            tr["facing"] = st["face"]
+            if job == "set":
+                st["state"], st["since"] = "setting", self.phase
+        elif job == "stash":
+            tr["facing"] = -1
+
+    def _finish(self, tr):
+        st = tr["site"]
+        if tr["job"] == "set" and st is not None:
+            st["state"], st["since"] = "set", self.phase
+            st["catch_in"] = self.rng.uniform(15.0, 35.0)
+        elif tr["job"] == "collect" and st is not None:
+            st["state"] = "empty"
+            tr["carry"] = True
+        elif tr["job"] == "stash":
+            tr["carry"] = False
+            self._stash(tr["flank"])
+        tr["site"] = None
+
+    def _advance_wilds(self, dt):
+        """Step the idle scene: traps that catch, and trappers that walk
+        their line and work it."""
+        if self.wild is None:
+            return
+        for st in self.sites:
+            if st["state"] == "set" and \
+                    self.phase - st["since"] >= st["catch_in"]:
+                st["state"], st["since"] = "caught", self.phase
+        speed = self.wild["t"] * 0.55
+        for tr in self.trappers:
+            if tr["route"]:
+                tx, ty = tr["route"][0]
+                dx, dy = tx - tr["x"], ty - tr["y"]
+                dist = math.hypot(dx, dy)
+                if abs(dx) > 0.5:
+                    tr["facing"] = 1 if dx > 0 else -1
+                if dist <= speed * dt:
+                    tr["x"], tr["y"] = tx, ty
+                    tr["route"].pop(0)
+                    if not tr["route"]:
+                        self._start(tr, tr["then"])
+                else:
+                    tr["x"] += dx / dist * speed * dt
+                    tr["y"] += dy / dist * speed * dt
+            elif self.phase >= tr["until"]:
+                self._finish(tr)
+                self._trapper_next(tr)
 
     def _draw_wilds(self, cr):
         """The woods, the trappers and the horses, nearest last."""
         items = [(tree[1], 0, self._draw_tree, tree)
                  for tree in self.wild["trees"]]
+        items += [(st["y"], 1, self._draw_site, st) for st in self.sites]
+        items += [(fl["cache"][1], 1, self._draw_cache, f)
+                  for f, fl in enumerate(self.wild["flanks"]) if fl["cache"]]
+        items += [(tr["y"], 2, self._draw_trapper, tr)
+                  for tr in self.trappers]
         items.sort(key=lambda it: it[:2])
         for _, _, draw, arg in items:
             draw(cr, arg)
+
+    def _draw_trapper(self, cr, tr):
+        walking = bool(tr["route"])
+        kneel = 0.0
+        if not walking and tr["job"] in self.JOB_S:
+            kneel = self._ramp(self.phase - tr["began"], 0.0, 0.4) \
+                - self._ramp(self.phase, tr["until"] - 0.4, tr["until"])
+        step = math.sin(self.phase * 7.0 + tr["flank"]) * 0.38 \
+            if walking else 0.0
+        facing = tr["facing"]
+        if tr["job"] == "rest" and not walking and \
+                int((self.phase - tr["began"]) / 2.5) % 2:
+            facing = -facing  # looks about him
+        self._mountain_man(cr, tr["x"], tr["y"], self.wild["s"], facing,
+                           step=step, shouldered=walking, kneel=kneel,
+                           beaver=tr["carry"])
+
+    def _draw_site(self, cr, st):
+        """A trap at the water's edge: its stake in the bank, the chain
+        running into the water and a float stick marking the jaws; once it
+        has caught, the beaver thrashing on it."""
+        state = st["state"]
+        if state == "empty":
+            return
+        s = self.wild["s"]
+        x, side = st["x"], st["bank"]
+        edge = self._river_edge(x, side)
+        rh = self._river_half(x)
+        if state == "caught":
+            busy = any(tr["site"] is st and not tr["route"]
+                       for tr in self.trappers)
+            fight = 0.0 if busy else math.sin(self.phase * 12 + x) * 0.35
+            bx = x + st["face"] * 0.25 * s
+            by = edge - side * rh * 0.25 + (0.12 * s if side > 0 else 0)
+            if not busy:
+                e = (self.phase + x * 0.1) % 0.8
+                self._splash(cr, bx, by - 0.05 * s, s * 0.45, e * 1.6 / 0.8)
+            self._beaver(cr, bx, by, s * 0.6, -st["face"], thrash=fight)
+        stake = (x, edge + side * self.wild["mud"] * 0.5)
+        jaws = (x + st["face"] * 0.28 * s, edge - side * rh * 0.3)
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_source_rgb(*RIFLE_WOOD_RGB)
+        cr.set_line_width(max(1.0, s * 0.06))
+        # While he sets it, the stake goes in a blow at a time, and the
+        # jaws go out on their chain once it holds.
+        u = 1.0 if state != "setting" else min(1.0, (
+            self.phase - st["since"]) / self.JOB_S["set"])
+        cr.move_to(*stake)
+        cr.line_to(stake[0] - st["face"] * 0.08 * s,
+                   stake[1] - 0.32 * s * (1.6 - 0.6 * math.floor(u * 4) / 4))
+        cr.stroke()
+        if u < 0.6:
+            return
+        cr.set_source_rgb(*IRON_RGB)
+        for k in range(1, 5):
+            u = k / 5
+            sag = math.sin(u * math.pi) * 0.04 * s
+            cr.arc(stake[0] + (jaws[0] - stake[0]) * u,
+                   stake[1] + (jaws[1] - stake[1]) * u + sag,
+                   max(0.5, s * 0.025), 0, 2 * math.pi)
+            cr.fill()
+        if state != "caught":
+            bob = math.sin(self.phase * 2.3 + x) * 0.02 * s
+            fx, fy = jaws[0], jaws[1] - 0.06 * s + bob
+            cr.set_source_rgb(*TRUNK_RGB)
+            cr.set_line_width(max(1.0, s * 0.045))
+            cr.move_to(fx - 0.12 * s, fy + 0.02 * s)
+            cr.line_to(fx + 0.12 * s, fy - 0.03 * s)
+            cr.stroke()
+            cr.set_source_rgba(*WATER_HI_RGB, 0.5)
+            cr.set_line_width(0.8)
+            cr.save()
+            cr.translate(fx, fy + 0.02 * s)
+            cr.scale(1.0, 0.3)
+            cr.arc(0, 0, 0.2 * s, 0, 2 * math.pi)
+            cr.restore()
+            cr.stroke()
+
+    def _draw_cache(self, cr, f):
+        x, y = self.wild["flanks"][f]["cache"]
+        self._cache(cr, x, y, self.wild["s"], *self.pelts[f])
+
+    @staticmethod
+    def _cache(cr, x, y, s, pelts, bales):
+        """A trapper's cache: a willow hoop with a pelt stretched to dry,
+        a stack of loose pelts, and bales of them tied up beside it."""
+        cr.set_source_rgba(0, 0, 0, 0.25)
+        cr.save()
+        cr.translate(x - 0.25 * s, y)
+        cr.scale(0.9 * s, 0.14 * s)
+        cr.arc(0, 0, 1, 0, 2 * math.pi)
+        cr.restore()
+        cr.fill()
+        # The drying hoop leans on its stake behind the stack.
+        hx, hy, r = x + 0.1 * s, y - 0.42 * s, 0.26 * s
+        cr.set_source_rgb(*RIFLE_WOOD_RGB)
+        cr.set_line_width(max(1.0, s * 0.04))
+        cr.move_to(hx + 0.1 * s, y)
+        cr.line_to(hx + 0.05 * s, hy - r * 1.1)
+        cr.stroke()
+        cr.set_source_rgb(*PELT_RGB)
+        cr.arc(hx, hy, r * 0.85, 0, 2 * math.pi)
+        cr.fill()
+        cr.set_source_rgb(*TRUNK_RGB)
+        cr.arc(hx, hy, r, 0, 2 * math.pi)
+        cr.stroke()
+        cr.set_source_rgb(*PELT_DARK_RGB)
+        cr.set_line_width(max(0.6, s * 0.015))
+        for a in range(8):
+            ang = a * math.pi / 4
+            cr.move_to(hx + math.cos(ang) * r * 0.85,
+                       hy + math.sin(ang) * r * 0.85)
+            cr.line_to(hx + math.cos(ang) * r, hy + math.sin(ang) * r)
+        cr.stroke()
+        ph = 0.11 * s
+        for k in range(pelts):
+            off = (0.05 if k % 2 else -0.05) * s
+            CpuView._rounded(cr, x - 0.3 * s + off, y - ph * (k + 1),
+                             0.6 * s, ph, ph * 0.5)
+            cr.set_source_rgb(*(PELT_RGB if k % 2 else BEAVER_RGB))
+            cr.fill_preserve()
+            cr.set_source_rgb(*PELT_DARK_RGB)
+            cr.set_line_width(max(0.5, s * 0.02))
+            cr.stroke()
+        bw, bh = 0.5 * s, 0.34 * s
+        spots = ((-0.95, 0), (-0.5, 0), (-0.72, 1))
+        for k in range(bales):
+            dx, row = spots[k]
+            bx, by = x + dx * s - bw / 2, y - bh * (row + 1) + row * 0.04 * s
+            CpuView._rounded(cr, bx, by, bw, bh, bh * 0.25)
+            cr.set_source_rgb(*PELT_RGB)
+            cr.fill_preserve()
+            cr.set_source_rgb(*PELT_DARK_RGB)
+            cr.set_line_width(max(0.5, s * 0.02))
+            cr.stroke()
+            cr.set_source_rgb(*CORD_RGB)
+            cr.set_line_width(max(0.8, s * 0.035))
+            for u in (0.3, 0.7):
+                cr.move_to(bx + bw * u, by)
+                cr.line_to(bx + bw * u, by + bh)
+            cr.stroke()
 
     def _draw_tree(self, cr, tree):
         x, base, h, kind, i = tree
@@ -3347,6 +3658,50 @@ def self_test():
     for x, base, h, kind, i in trees:
         assert not view._in_box(view.wild["grove"], x, base), (x, base)
         assert abs(base - view._river_y(x)) > view._river_half(x), (x, base)
+
+    # Four idle minutes: the trappers set traps, collect what they catch,
+    # and stash the pelts, keeping out of the grove and off the water but
+    # for their stepping stones.
+    seen, carried = set(), False
+    s = view.wild["s"]
+    for frame in range(240 * 30):
+        view.phase += 1 / 30
+        view._advance(1 / 30)
+        if frame % 30 == 0:
+            view._draw(view, cr, 1024, 680)
+        seen |= {st["state"] for st in view.sites}
+        for tr in view.trappers:
+            carried |= tr["carry"]
+            x, y = tr["x"], tr["y"]
+            assert not view._in_box(view.wild["grove"], x, y), (x, y)
+            if abs(y - view._river_y(x)) < view._river_half(x):
+                ford = view.wild["flanks"][tr["flank"]]["ford"]
+                assert ford and abs(x - ford[0][0]) < s, (x, y)
+    assert {"set", "caught"} <= seen and carried, (seen, carried)
+    assert sum(sum(p) for p in view.pelts) >= 1, view.pelts
+    pelts = [list(p) for p in view.pelts]
+    where = [(tr["x"], tr["y"]) for tr in view.trappers]
+
+    # A stack of pelts becomes a bale, and the bales stop piling up.
+    keep = [list(p) for p in view.pelts]
+    view.pelts[0] = [view.PELT_BALE - 1, 0]
+    view._stash(0)
+    assert view.pelts[0] == [0, 1], view.pelts
+    view.pelts[0] = [view.PELT_BALE - 1, view.BALE_MAX]
+    view._stash(0)
+    assert view.pelts[0] == [0, view.BALE_MAX], view.pelts
+    view.pelts = keep
+
+    # Raising the fort freezes the trap line; standing down picks it up.
+    view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], True)
+    for _ in range(5 * 30):
+        view.phase += 1 / 30
+        view._advance(1 / 30)
+    view._draw(view, cr, 1024, 680)
+    view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
+    view._draw(view, cr, 1024, 680)
+    assert [(tr["x"], tr["y"]) for tr in view.trappers] == where
+    assert view.pelts == pelts, (view.pelts, pelts)
 
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], True)
     for facing, phase in ((1, 0.0), (-1, 10.0)):
