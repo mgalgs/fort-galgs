@@ -1929,31 +1929,34 @@ class CpuView(Gtk.DrawingArea):
                 prev = (p, d)
 
     def _draw_fords(self, cr):
-        """Stepping stones across the water where a trail fords it, and
-        the current breaking white over them."""
+        """Stepping stones across the water where a trail fords it."""
         for side, p in enumerate(self.fords):
-            if p is None:
-                continue
-            x, y = self._bezier(self.trails[side], p)
-            half = self.redcoat_s * 0.5 * self._depth_scale(p)
-            rh = self._river_half(x)
-            for j in range(3):
-                sx = x + (j - 1) * half * 0.6
-                sy = self._river_y(sx) + (j - 1) * rh * 0.5
-                foam = 0.4 + 0.3 * math.sin(self.phase * 5 + j * 2 + side)
-                cr.set_source_rgba(1, 1, 1, foam)
-                cr.set_line_width(1.0)
-                cr.move_to(sx + half * 0.3, sy - rh * 0.2)
-                cr.line_to(sx + half * 0.6, sy)
-                cr.line_to(sx + half * 0.3, sy + rh * 0.2)
-                cr.stroke()
-                cr.save()
-                cr.translate(sx, sy)
-                cr.scale(half * 0.28, rh * 0.32)
-                cr.arc(0, 0, 1, 0, 2 * math.pi)
-                cr.restore()
-                cr.set_source_rgb(*STONE_RGB)
-                cr.fill()
+            if p is not None:
+                x = self._bezier(self.trails[side], p)[0]
+                self._draw_ford(cr, x, self.redcoat_s * 0.5
+                                * self._depth_scale(p), side)
+
+    def _draw_ford(self, cr, x, half, seed):
+        """Three stepping stones across the water at x, and the current
+        breaking white over them."""
+        rh = self._river_half(x)
+        for j in range(3):
+            sx = x + (j - 1) * half * 0.6
+            sy = self._river_y(sx) + (j - 1) * rh * 0.5
+            foam = 0.4 + 0.3 * math.sin(self.phase * 5 + j * 2 + seed)
+            cr.set_source_rgba(1, 1, 1, foam)
+            cr.set_line_width(1.0)
+            cr.move_to(sx + half * 0.3, sy - rh * 0.2)
+            cr.line_to(sx + half * 0.6, sy)
+            cr.line_to(sx + half * 0.3, sy + rh * 0.2)
+            cr.stroke()
+            cr.save()
+            cr.translate(sx, sy)
+            cr.scale(half * 0.28, rh * 0.32)
+            cr.arc(0, 0, 1, 0, 2 * math.pi)
+            cr.restore()
+            cr.set_source_rgb(*STONE_RGB)
+            cr.fill()
 
     # -- the grove, where the fort stands when it is down ------------------
 
