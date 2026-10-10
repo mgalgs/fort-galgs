@@ -86,6 +86,17 @@ TRUNK_RGB = (0.36, 0.24, 0.14)
 MEADOW_RGB = (0.13, 0.24, 0.15)
 PATH_RGB = (0.36, 0.29, 0.20)
 
+# The land everything stands on, and the river across it.
+GRASS_RGB = (0.15, 0.29, 0.16)
+GRASS_LOW_RGB = (0.10, 0.20, 0.12)
+GRASS_HI_RGB = (0.27, 0.45, 0.24)
+TRODDEN_RGB = (0.21, 0.24, 0.15)
+WATER_RGB = (0.13, 0.33, 0.52)
+WATER_HI_RGB = (0.55, 0.75, 0.90)
+MUD_RGB = (0.27, 0.21, 0.14)
+STONE_RGB = (0.50, 0.50, 0.52)
+STONE_DARK_RGB = (0.33, 0.33, 0.36)
+
 
 CSS = b"""
 .gm-root {
@@ -286,6 +297,8 @@ class CpuView(Gtk.DrawingArea):
         self.walker_halted = 0.0          # seconds he has stood still
         self.walker_facing = 1            # as last drawn
         self.fort_box = None              # (x0, y0, x1, y1) as last drawn
+        self.river = None                 # its course, as last laid out
+        self.fords = [None, None]         # p where each trail crosses it
         self.set_draw_func(self._draw)
         self.add_tick_callback(self._on_tick)
         click = Gtk.GestureClick()
@@ -1801,6 +1814,147 @@ class CpuView(Gtk.DrawingArea):
                2 * math.pi)
         cr.fill()
 
+    # -- the land, and the river across it --------------------------------
+
+    def _draw_land(self, cr, width, height):
+        """Grass over the whole picture, fading out at the foot into the
+        window below it; worn browner while the redcoats are marching."""
+        grass = TRODDEN_RGB if self.on else GRASS_RGB
+        grad = cairo.LinearGradient(0, 0, 0, height)
+        grad.add_color_stop_rgba(0.0, *grass, 0.95)
+        grad.add_color_stop_rgba(0.82, *GRASS_LOW_RGB, 0.9)
+        grad.add_color_stop_rgba(1.0, *GRASS_LOW_RGB, 0.0)
+        cr.rectangle(0, 0, width, height)
+        cr.set_source(grad)
+        cr.fill()
+        # Tufts scattered evenly (an R2 sequence), the same every frame.
+        n = int(min(220, width * height / 1100))
+        cr.set_line_width(1.0)
+        cr.set_source_rgba(*GRASS_HI_RGB, 0.30 if self.on else 0.45)
+        for i in range(n):
+            x = (0.5 + i * 0.7548777) % 1.0 * width
+            y = (0.5 + i * 0.5698403) % 1.0 * height * 0.88
+            h = 3.0 + 2.0 * ((i * 0.618) % 1.0)
+            for dx in (-1.6, 0.0, 1.6):
+                cr.move_to(x + dx * 0.5, y)
+                cr.line_to(x + dx, y - h * (1.0 - abs(dx) * 0.2))
+        cr.stroke()
+
+    def _lay_river(self, width, top, bottom, t):
+        """Run the river from left to right inside the band (top, bottom),
+        meandering as far as the band allows."""
+        room = max(0.0, bottom - top)
+        half = max(3.0, min(t * 0.3, room * 0.14))
+        amp = max(0.0, min(t * 0.6, room / 2 - half - 2))
+        self.river = {"w": width, "y": (top + bottom) / 2, "amp": amp,
+                      "half": half}
+
+    def _river_y(self, x):
+        r = self.river
+        u = x / r["w"]
+        return r["y"] + r["amp"] * (math.sin(u * 8.2 + 0.5) * 0.8
+                                    + math.sin(u * 15.1 + 2.0) * 0.2)
+
+    def _river_half(self, x):
+        """Half the river's width at x; it narrows and widens a little."""
+        r = self.river
+        return r["half"] * (1.0 + 0.15 * math.sin(x / r["w"] * 11.0 + 1.0))
+
+    def _river_edge(self, x, side):
+        """The river's far (side -1) or near (side 1) bank at x."""
+        return self._river_y(x) + side * self._river_half(x)
+
+    def _draw_river(self, cr):
+        """Muddy banks, the water between them, and glints drifting
+        downstream."""
+        w = self.river["w"]
+        xs = [-10 + k * 6.0 for k in range(int((w + 20) / 6) + 2)]
+
+        def band(grow):
+            cr.move_to(xs[0], self._river_edge(xs[0], -1) - grow)
+            for x in xs[1:]:
+                cr.line_to(x, self._river_edge(x, -1) - grow)
+            for x in reversed(xs):
+                cr.line_to(x, self._river_edge(x, 1) + grow)
+            cr.close_path()
+
+        band(self.river["half"] * 0.35 + 1)
+        cr.set_source_rgba(*MUD_RGB, 0.9)
+        cr.fill()
+        band(0)
+        cr.set_source_rgb(*WATER_RGB)
+        cr.fill()
+        # Shallows along the near bank.
+        cr.set_source_rgba(*WATER_HI_RGB, 0.18)
+        cr.set_line_width(self.river["half"] * 0.4)
+        cr.move_to(xs[0], self._river_edge(xs[0], 1)
+                   - self.river["half"] * 0.2)
+        for x in xs[1:]:
+            cr.line_to(x, self._river_edge(x, 1) - self.river["half"] * 0.2)
+        cr.stroke()
+
+        # Glints carried along on the current, each fading in and out.
+        span = w + 40
+        n = max(6, int(w / 26))
+        cr.set_line_width(1.2)
+        for i in range(n):
+            u = ((i * 0.618034) + self.phase * 0.035) % 1.0
+            x = -20 + u * span + (i * 37) % 23
+            lane = ((i * 0.381966) % 1.0) * 1.3 - 0.65
+            y = self._river_y(x) + lane * self._river_half(x)
+            fade = math.sin(u * math.pi * 7 % math.pi)
+            ln = self.river["half"] * 0.9
+            dy = self._river_y(x + ln) - self._river_y(x)
+            cr.set_source_rgba(*WATER_HI_RGB, 0.55 * fade)
+            cr.move_to(x, y)
+            cr.line_to(x + ln, y + dy)
+            cr.stroke()
+
+    def _find_fords(self):
+        """Where each trail crosses the river, as p along the trail, or
+        None where it does not."""
+        self.fords = [None, None]
+        if self.trails is None or self.river is None:
+            return
+        for side, pts in enumerate(self.trails):
+            prev = None
+            for k in range(201):
+                p = k / 200
+                x, y = self._bezier(pts, p)
+                d = y - self._river_y(x)
+                if prev is not None and (prev[1] < 0) != (d < 0):
+                    self.fords[side] = prev[0] + (p - prev[0]) * (
+                        -prev[1] / (d - prev[1]))
+                    break
+                prev = (p, d)
+
+    def _draw_fords(self, cr):
+        """Stepping stones across the water where a trail fords it, and
+        the current breaking white over them."""
+        for side, p in enumerate(self.fords):
+            if p is None:
+                continue
+            x, y = self._bezier(self.trails[side], p)
+            half = self.redcoat_s * 0.5 * self._depth_scale(p)
+            rh = self._river_half(x)
+            for j in range(3):
+                sx = x + (j - 1) * half * 0.6
+                sy = self._river_y(sx) + (j - 1) * rh * 0.5
+                foam = 0.4 + 0.3 * math.sin(self.phase * 5 + j * 2 + side)
+                cr.set_source_rgba(1, 1, 1, foam)
+                cr.set_line_width(1.0)
+                cr.move_to(sx + half * 0.3, sy - rh * 0.2)
+                cr.line_to(sx + half * 0.6, sy)
+                cr.line_to(sx + half * 0.3, sy + rh * 0.2)
+                cr.stroke()
+                cr.save()
+                cr.translate(sx, sy)
+                cr.scale(half * 0.28, rh * 0.32)
+                cr.arc(0, 0, 1, 0, 2 * math.pi)
+                cr.restore()
+                cr.set_source_rgb(*STONE_RGB)
+                cr.fill()
+
     # -- the grove, where the fort stands when it is down ------------------
 
     def _pine(self, cr, x, base, h, sway):
@@ -1936,7 +2090,15 @@ class CpuView(Gtk.DrawingArea):
         oy = y + 1.3 * gap
         fy = y + die_h + (0.2 * t + ground if rest else 0) + 1.6 * t + 0.3 * t
 
+        # The river runs through the open ground between the chip, pins and
+        # all, and the tops of the towers.
+        self._draw_land(cr, width, height)
+        chip_foot = oy + t_o * 1.05 + label_h + gap * 1.25 if rest else 0.0
+        self._lay_river(width, chip_foot, fy - 0.9 * t, t)
+        self._draw_river(cr)
+
         self.trails = None
+        self.fords = [None, None]
         self.barracks_box = [None, None]
         if self.on:
             # Each trail runs from a barracks in a top corner, clear of the
@@ -1949,6 +2111,8 @@ class CpuView(Gtk.DrawingArea):
                    (width * 0.04, far[1] + (near[1] - far[1]) * 0.7), near)
             self.trails = [pts, tuple((width - px, py) for px, py in pts)]
             self._draw_trails(cr)
+            self._find_fords()
+            self._draw_fords(cr)
             for i in (0, 1):
                 self._draw_barracks(cr, i)
             self._draw_redcoats(cr)
@@ -2000,8 +2164,8 @@ class CpuView(Gtk.DrawingArea):
         cr.stroke()
         self._rounded(cr, X, Y, W, H, pad)
         grad = cairo.LinearGradient(X, Y, X + W, Y + H)
-        grad.add_color_stop_rgba(0.0, 0.16, 0.17, 0.32, 0.55)
-        grad.add_color_stop_rgba(1.0, 0.07, 0.09, 0.20, 0.55)
+        grad.add_color_stop_rgba(0.0, 0.16, 0.17, 0.32, 0.92)
+        grad.add_color_stop_rgba(1.0, 0.07, 0.09, 0.20, 0.92)
         cr.set_source(grad)
         cr.fill_preserve()
         cr.set_source_rgba(*DIM_RGB, 0.25)
