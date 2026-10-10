@@ -75,6 +75,7 @@ HORSE_RGB = (0.40, 0.25, 0.15)
 HORSE_DARK_RGB = (0.26, 0.15, 0.09)
 IRON_RGB = (0.22, 0.22, 0.25)
 BALL_RGB = (0.62, 0.63, 0.68)
+BLOOD_RGB = (0.62, 0.04, 0.05)
 
 # The grove that grows there while the fort is down.
 PINE_RGB = (0.12, 0.34, 0.22)
@@ -274,6 +275,8 @@ class CpuView(Gtk.DrawingArea):
         self.relief = None                # a tower's call for the gun
         self.has_walker = False           # room on the wall for him to walk
         self.gun_facing = 1
+        self.gun_at = 0.5                 # along the wall walk, 0..1
+        self.stains = []                  # (x, y, size, phase) of the fallen
         self.wave_in = 45.0
         self.waves = 0
         self.barracks_box = [None, None]  # (x0, y0, x1, y1) as last drawn
@@ -301,6 +304,8 @@ class CpuView(Gtk.DrawingArea):
             self.called = [[], []]
             self.pending_call = None
             self.relief = None
+            self.gun_at = 0.5
+            self.stains = []
             self.drill_start = [None, None]
             self.drill_target = [None, None]
         self.on = on
@@ -413,9 +418,13 @@ class CpuView(Gtk.DrawingArea):
     # runs back while the ball flies.
     HEARD_AT = 0.6
     RUN_S = 1.0
-    FIRE_AT = 3.1
-    FLIGHT_S = 1.7
+    WHEEL_AT = HEARD_AT + RUN_S
+    WHEEL_S = 1.2
+    CRANK_AT = WHEEL_AT + WHEEL_S
+    FIRE_AT = CRANK_AT + 1.2
+    FLIGHT_S = 1.4
     RELIEF_LEN = FIRE_AT + FLIGHT_S + 1.0
+    GUN_POST = (0.2, 0.8)   # where on the wall walk he wheels it, per side
     BLAST_P = 0.85      # the blast takes queued redcoats this near the wall
 
     def _relief_t(self):
@@ -440,7 +449,7 @@ class CpuView(Gtk.DrawingArea):
                         rc["side"] == i and rc["hit"] is None
                         and self._at_wall(rc) for rc in self.redcoats):
                     self.relief = {"side": i, "t0": self.phase,
-                                   "landed": False}
+                                   "landed": False, "from": self.gun_at}
                     return
             return
         t = self.phase - r["t0"]
@@ -453,7 +462,17 @@ class CpuView(Gtk.DrawingArea):
                     rc["hp"] = 0
                     rc["hit"] = self.phase
         if t >= self.RELIEF_LEN:
+            self.gun_at = self.GUN_POST[r["side"]]
             self.relief = None
+
+    def _gun_frac(self):
+        """Where the fort's gun stands, as a fraction of the wall walk."""
+        r = self.relief
+        if r is None:
+            return self.gun_at
+        k = self._ramp(self.phase - r["t0"], self.WHEEL_AT,
+                       self.WHEEL_AT + self.WHEEL_S)
+        return r["from"] + (self.GUN_POST[r["side"]] - r["from"]) * k
 
     def _advance(self, dt):
         """Step the scene: the walker's halts, the redcoats' march, and the
@@ -1488,7 +1507,41 @@ class CpuView(Gtk.DrawingArea):
         self.barracks_box[i] = (x0 - 3, peak - 0.36 * B - 3, x0 + B + 3,
                                 y + 3)
 
+    STAIN_S = 8.0       # a pool of blood fades out over this long
+
+    def _draw_stains(self, cr):
+        """Pools of blood where redcoats fell, spreading, then fading."""
+        self.stains = [st for st in self.stains
+                       if self.phase - st[3] < self.STAIN_S]
+        for x, y, size, born in self.stains:
+            age = self.phase - born
+            fade = 1.0 - max(0.0, age - self.STAIN_S * 0.6) \
+                / (self.STAIN_S * 0.4)
+            r = size * 0.38 * min(1.0, 0.3 + age * 1.2)
+            cr.save()
+            cr.translate(x, y)
+            cr.scale(1.0, 0.3)
+            cr.arc(0, 0, r, 0, 2 * math.pi)
+            cr.restore()
+            cr.set_source_rgba(*BLOOD_RGB, 0.8 * fade)
+            cr.fill()
+
+    def _spray(self, cr, x, y, size, back, e, seed):
+        """Blood flung from a wound at (x, y), back the way the shot came
+        from, e seconds after it."""
+        if e >= 0.7:
+            return
+        cr.set_source_rgba(*BLOOD_RGB, 1.0 - e / 0.7)
+        for k in range(9):
+            a = 0.25 + 0.9 * ((k * 0.618 + seed) % 1.0)
+            v = size * (0.9 + 0.5 * ((k * 0.382 + seed) % 1.0))
+            px = x + back * math.cos(a) * v * e
+            py = y - math.sin(a) * v * e + size * 3.0 * e * e
+            cr.arc(px, py, max(0.6, size * 0.035), 0, 2 * math.pi)
+            cr.fill()
+
     def _draw_redcoats(self, cr):
+        self._draw_stains(cr)
         for rc in sorted(self.redcoats, key=lambda rc: -rc["d"]):
             x, feet, size = self._redcoat_at(rc)
             p = self._trail_p(rc["d"])
@@ -1524,6 +1577,16 @@ class CpuView(Gtk.DrawingArea):
                     if marching else 0.0
                 self._redcoat(cr, x, feet, size, facing, step, fall, pound,
                               rc["n"] * 1.3)
+            if not alive:
+                # The man bleeds, whether rider, gunner or foot.
+                bx = x - facing * size * 0.55 if kind == "cannon" else x
+                chest = 0.75 if kind == "horse" else 0.6
+                if not rc.get("stained"):
+                    rc["stained"] = True
+                    self.stains.append((bx - toward * size * 0.35, feet, size,
+                                        self.phase))
+                self._spray(cr, bx, feet - size * chest, size, -toward,
+                            self.phase - rc["hit"], rc["n"] * 0.37)
 
     def _draw_sentries(self, cr, towers, floor, walk, walk_y, t):
         if not self.on:
@@ -1568,8 +1631,8 @@ class CpuView(Gtk.DrawingArea):
         self.walker_facing = 1 if u < 1.0 else -1
         ws = s * 0.92
 
-        # The fort's gun stands in the middle of the wall walk.
-        gun_x, gs = (x0 + x1) / 2, s * 1.25
+        # The fort's gun stands on the wall walk where it was last wheeled.
+        gun_x, gs = x0 + (x1 - x0) * self._gun_frac(), s * 1.25
         rt = self._relief_t()
         if rt is not None:
             self.gun_facing = -1 if self.relief["side"] == 0 else 1
@@ -1595,12 +1658,27 @@ class CpuView(Gtk.DrawingArea):
                     clear = floor - s * above
                     lift = max(lift,
                                (line - clear) / (4 * over * (1 - over)))
+            # A lighter charge from closer in: the arc tops out inside the
+            # picture, even if that means a closer pass over his head.
+            drop = land[1] - pivot[1]
+
+            def top(lift):
+                u = min(1.0, max(0.0, (1 - drop / (4 * lift)) / 2))
+                return pivot[1] + drop * u - 4 * lift * u * (1 - u)
+
             lift = min(lift, 3.0 * reach)
-            aim = math.atan2(4 * lift - (land[1] - pivot[1]), reach)
-            cranked = self._ramp(rt, self.HEARD_AT + self.RUN_S, self.FIRE_AT)
+            if top(lift) < self.redcoat_s * 0.2:
+                lo, hi = reach * 0.25, lift
+                for _ in range(30):
+                    mid = (lo + hi) / 2
+                    lo, hi = (mid, hi) if top(mid) >= self.redcoat_s * 0.2 \
+                        else (lo, mid)
+                lift = lo
+            aim = math.atan2(4 * lift - drop, reach)
+            cranked = self._ramp(rt, self.CRANK_AT, self.FIRE_AT)
             lowered = self._ramp(rt, self.RELIEF_LEN - 0.8, self.RELIEF_LEN)
             elev = 0.12 + (aim - 0.12) * (cranked - lowered)
-            if self.HEARD_AT + self.RUN_S <= rt < self.FIRE_AT:
+            if self.CRANK_AT <= rt < self.FIRE_AT:
                 crank = rt * 9.0
             boom = rt - self.FIRE_AT
             fly = (rt - self.FIRE_AT) / self.FLIGHT_S
@@ -1612,7 +1690,11 @@ class CpuView(Gtk.DrawingArea):
         if crank is not None:
             handle = (gun_x + gf * (-10 + math.cos(crank) * 9) * gs / 100,
                       walk_y + (-34 + math.sin(crank) * 9) * gs / 100)
-        self._cannon(cr, gun_x, walk_y, gs, gf, 0.0, 0.0, -1.0, boom, elev,
+        elif rt is not None and self.WHEEL_AT <= rt < self.CRANK_AT:
+            # Both hands on the end of the trail, pushing.
+            handle = (gun_x - gf * 34 * gs / 100, walk_y - 9 * gs / 100)
+        self._cannon(cr, gun_x, walk_y, gs, gf, gf * gun_x / (0.14 * gs),
+                     0.0, -1.0, boom, elev,
                      crank if crank is not None else 0.0)
 
         if rt is None:
@@ -1623,11 +1705,15 @@ class CpuView(Gtk.DrawingArea):
                                step=step, shouldered=True, bugle=raised,
                                toot=toot)
         else:
-            # He runs to his place behind the gun, kneels to crank it up,
-            # and once it has fired runs back to where he left off.
-            station = gun_x - gf * gs * 0.3
-            there = self.HEARD_AT + self.RUN_S
+            # He runs to his place behind the gun, wheels it toward the
+            # wall in trouble, kneels to crank it up, and once it has fired
+            # runs back to where he left off.
+            station = gun_x - gf * gs * (
+                0.45 - 0.15 * self._ramp(rt, self.CRANK_AT,
+                                         self.CRANK_AT + 0.3))
+            there = self.WHEEL_AT
             back = self.FIRE_AT + 0.5
+            pushing = there <= rt < self.CRANK_AT
             if rt < self.HEARD_AT or rt >= back + self.RUN_S:
                 wx, facing, run = patrol, self.walker_facing, False
             elif rt < there:
@@ -1640,9 +1726,10 @@ class CpuView(Gtk.DrawingArea):
                 k = self._ramp(rt, back, back + self.RUN_S)
                 wx, run = station + (patrol - station) * k, True
                 facing = 1 if patrol >= station else -1
-            kneel = self._ramp(rt, there, there + 0.3) \
+            kneel = self._ramp(rt, self.CRANK_AT, self.CRANK_AT + 0.3) \
                 - self._ramp(rt, back - 0.3, back)
-            step = math.sin(self.phase * 14.0) * 0.55 if run else 0.0
+            step = math.sin(self.phase * 14.0) * 0.55 if run \
+                else math.sin(self.phase * 8.0) * 0.35 if pushing else 0.0
             self._mountain_man(cr, wx, walk_y, ws, facing, step=step,
                                shouldered=kneel == 0 and not handle,
                                kneel=kneel)
@@ -2819,6 +2906,8 @@ def self_test():
     assert view.relief is None
     assert not any(view._at_wall(rc) for rc in view.redcoats
                    if rc["hit"] is None), "the gun clears the wall"
+    assert view.gun_at == view.GUN_POST[0], "the gun stays where wheeled"
+    assert view.stains, "the fallen leave blood"
 
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
     assert not view.redcoats and not view.called[0], "standing down clears"
