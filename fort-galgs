@@ -60,6 +60,17 @@ SKIN_RGB = (0.92, 0.75, 0.60)
 BEARD_RGB = (0.36, 0.24, 0.15)
 RIFLE_WOOD_RGB = (0.42, 0.24, 0.11)
 STEEL_RGB = (0.78, 0.80, 0.85)
+FLASH_RGB = (1.00, 0.78, 0.30)
+SMOKE_RGB = (0.80, 0.80, 0.82)
+BRASS_RGB = (0.95, 0.76, 0.32)
+COAT_RGB = (0.80, 0.13, 0.13)
+COAT_DARK_RGB = (0.58, 0.08, 0.09)
+KIT_RGB = (0.93, 0.92, 0.87)
+HAT_RGB = (0.10, 0.09, 0.10)
+BRICK_RGB = (0.60, 0.27, 0.20)
+BRICK_DARK_RGB = (0.40, 0.17, 0.13)
+ROOF_RGB = (0.24, 0.22, 0.25)
+WINDOW_RGB = (0.98, 0.80, 0.45)
 
 # The grove that grows there while the fort is down.
 PINE_RGB = (0.12, 0.34, 0.22)
@@ -228,7 +239,9 @@ class CpuView(Gtk.DrawingArea):
     """Every physical core as a tile, each of its threads a live load bar.
 
     While the fort is up, the reserved cores stand inside a log stockade,
-    mountain men watch from its towers and walk its wall, and embers rise
+    mountain men watch from its towers and walk its wall, redcoats march
+    on it down trails from the far corners and the sentries shoot them,
+    and embers rise
     in the orange tiles. While it is down, a grove of trees and bushes grows
     there instead and those cores look like every other. Which state it is
     in never depends on telling orange from blue.
@@ -237,7 +250,7 @@ class CpuView(Gtk.DrawingArea):
     COLS = 5
 
     def __init__(self):
-        super().__init__(content_height=340, hexpand=True, vexpand=True)
+        super().__init__(content_height=400, hexpand=True, vexpand=True)
         self.cores = []
         self.reserved = set()
         self.on = False
@@ -246,12 +259,37 @@ class CpuView(Gtk.DrawingArea):
         self.phase = 0.0
         self.last_draw = -1.0
         self._t0 = None
+        self.drill_start = [None, None]   # phase each tower sentry knelt
+        self.drill_target = [None, None]  # the redcoat he is aiming at
+        self.redcoats = []
+        self.spawned = 0
+        self.spawn_in = 1.0
+        self.called = [0, 0]              # redcoats sent for at each barracks
+        self.barracks_box = [None, None]  # (x0, y0, x1, y1) as last drawn
+        self.trails = None                # each side's trail, as last drawn
+        self.redcoat_s = 14.0             # a redcoat's size at the near end
+        self.bugle_at = None              # phase the walker last sounded
+        self.walker_halted = 0.0          # seconds he has stood still
+        self.walker_facing = 1            # as last drawn
+        self.fort_box = None              # (x0, y0, x1, y1) as last drawn
         self.set_draw_func(self._draw)
         self.add_tick_callback(self._on_tick)
+        click = Gtk.GestureClick()
+        click.connect("pressed", self._on_click)
+        self.add_controller(click)
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", self._on_motion)
+        self.add_controller(motion)
 
     def set_state(self, cores, reserved, on):
         self.cores = cores
         self.reserved = set(reserved)
+        if not on:
+            # Standing down sends everyone home; the next siege starts fresh.
+            self.redcoats = []
+            self.called = [0, 0]
+            self.drill_start = [None, None]
+            self.drill_target = [None, None]
         self.on = on
         self.queue_draw()
 
@@ -265,6 +303,7 @@ class CpuView(Gtk.DrawingArea):
         prev = self.phase
         self.phase = (now - self._t0) / 1_000_000.0
         dt = max(0.0, self.phase - prev)
+        self._advance(min(dt, 0.1))
         # Frame-rate independent easing: the same glide at 30 Hz or 144 Hz.
         k = 1.0 - math.exp(-dt * 7.0)
         for cpu, target in self.loads.items():
@@ -277,6 +316,120 @@ class CpuView(Gtk.DrawingArea):
             self.last_draw = self.phase
             self.queue_draw()
         return GLib.SOURCE_CONTINUE
+
+    @staticmethod
+    def _in_box(box, x, y):
+        return box is not None and box[0] <= x <= box[2] \
+            and box[1] <= y <= box[3]
+
+    def _on_fort(self, x, y):
+        return self._in_box(self.fort_box, x, y)
+
+    def _barracks_at(self, x, y):
+        for i, box in enumerate(self.barracks_box):
+            if self._in_box(box, x, y):
+                return i
+        return None
+
+    def _on_motion(self, _ctl, x, y):
+        hot = self._on_fort(x, y) or self._barracks_at(x, y) is not None
+        self.set_cursor_from_name("pointer" if hot else None)
+
+    def _on_click(self, _gesture, _n, x, y):
+        """A click on a barracks sends out a file of redcoats. One on the
+        fort has the walker sound his bugle the way he faces, and the tower
+        sentry on that side kneels and fires, at a redcoat if one is in
+        sight."""
+        i = self._barracks_at(x, y)
+        if i is not None:
+            self.called[i] = min(self.CALLED_MAX, self.called[i] + 3)
+            return
+        if not self._on_fort(x, y) or self._bugling():
+            return
+        self.bugle_at = self.phase
+        i = 1 if self.walker_facing > 0 else 0
+        if not self._busy(i):
+            self.drill_start[i] = self.phase + self.BUGLE_HEARD
+            self.drill_target[i] = None
+
+    # -- the siege --------------------------------------------------------
+
+    MARCH_FAR = 6.0     # a new redcoat is this many times farther than...
+    MARCH_NEAR = 1.0    # ...one at the near end of the trail
+    MARCH_S = 26.0      # seconds to walk the whole trail
+    ENGAGE_P = 0.5      # how far down the trail a sentry opens fire
+    FALL_S = 1.6        # a shot redcoat topples and fades over this long
+    DOOR_GAP = 0.3      # how far one must march before the next comes out
+    DOOR_OPEN_S = 1.2   # the barracks door stands open this long for each
+    CALLED_MAX = 12     # most redcoats a barracks will hold on call
+
+    @classmethod
+    def _trail_p(cls, d):
+        """Screen position along the trail, 0 far to 1 near, for a redcoat
+        at distance d. Size goes as 1/d, and so does the trail on screen,
+        so a steady march seems to speed up as he comes closer."""
+        far = 1 / cls.MARCH_FAR
+        return (1 / d - far) / (1 / cls.MARCH_NEAR - far)
+
+    def _advance(self, dt):
+        """Step the scene: the walker's halts, the redcoats' march, and the
+        sentries choosing whom to shoot."""
+        if self._bugling():
+            self.walker_halted += dt
+        if not self.on:
+            return
+        speed = (self.MARCH_FAR - self.MARCH_NEAR) / self.MARCH_S
+        for rc in self.redcoats:
+            if rc["hit"] is None:
+                rc["d"] = max(self.MARCH_NEAR, rc["d"] - speed * dt)
+        self.redcoats = [rc for rc in self.redcoats if rc["hit"] is None
+                         or self.phase - rc["hit"] < self.FALL_S]
+
+        def door_clear(side):
+            return all(rc["d"] < self.MARCH_FAR - self.DOOR_GAP
+                       for rc in self.redcoats if rc["side"] == side)
+
+        def send(side):
+            self.redcoats.append({"side": side, "d": self.MARCH_FAR,
+                                  "hit": None, "n": self.spawned,
+                                  "born": self.phase})
+            self.spawned += 1
+
+        for side in (0, 1):
+            if self.called[side] and door_clear(side):
+                send(side)
+                self.called[side] -= 1
+
+        self.spawn_in -= dt
+        if self.spawn_in <= 0:
+            n = self.spawned
+            side = (0, 1, 1, 0, 1, 0, 0, 1)[n % 8]
+            marching = sum(rc["side"] == side and rc["hit"] is None
+                           for rc in self.redcoats)
+            if marching < 2 and door_clear(side):
+                send(side)
+                self.spawn_in = (6.0, 4.5, 7.5, 5.0)[n % 4]
+            else:
+                self.spawn_in = 1.0
+
+        for i in (0, 1):
+            targets = [rc for rc in self.redcoats
+                       if rc["side"] == i and rc["hit"] is None]
+            nearest = min(targets, key=lambda rc: rc["d"], default=None)
+            if not self._busy(i):
+                self.drill_target[i] = None
+                if nearest and self._trail_p(nearest["d"]) >= self.ENGAGE_P:
+                    self.drill_start[i] = self.phase
+                    self.drill_target[i] = nearest
+                continue
+            tau = self._drill_t(i)
+            target = self.drill_target[i]
+            if target is None and 0 <= tau < self.SHOT_AT:
+                # Called by the bugle: he takes whoever is closest.
+                self.drill_target[i] = target = nearest
+            if target is not None and tau >= self.SHOT_AT \
+                    and target["hit"] is None:
+                target["hit"] = self.phase
 
     # -- helpers ----------------------------------------------------------
 
@@ -398,48 +551,81 @@ class CpuView(Gtk.DrawingArea):
 
     @staticmethod
     def _mountain_man(cr, x, feet, s, facing, step=0.0, shouldered=False,
-                      glint=0.0):
+                      glint=0.0, kneel=0.0, aim=0.0, shot=-1.0, bugle=0.0,
+                      toot=-1.0, elev=0.04):
         """A buckskin-clad mountain man with a coonskin cap and a long rifle.
 
         Drawn in a 100-unit-tall model with the feet at 0; facing is +1 for
-        right, -1 for left. The rifle stands taller than he does.
+        right, -1 for left. The rifle stands taller than he does. kneel and
+        aim run 0..1 from standing at ease; shot is the seconds since he
+        fired, or negative if he has not. bugle runs 0..1 from his hip to
+        his lips, and toot is the seconds since he began to blow it. elev is
+        how far above level, in radians, he aims.
         """
         cr.save()
         cr.translate(x, feet)
         cr.scale(facing * s / 100.0, s / 100.0)
         cr.set_line_cap(cairo.LINE_CAP_ROUND)
         cr.set_line_join(cairo.LINE_JOIN_ROUND)
+        drop = 20 * kneel
 
-        def leg(swing, rgb):
+        def lerp(a, b, u):
+            return (a[0] + (b[0] - a[0]) * u, a[1] + (b[1] - a[1]) * u)
+
+        def leg(swing, rgb, front):
             fx = math.sin(swing) * 40
+            # Kneeling, the front knee juts forward and the back one rests
+            # on the ground with the shin trailing behind.
+            knee = lerp((fx / 2, -24), (20, -26) if front else (-4, -5),
+                        kneel)
+            foot = lerp((fx, -2), (21, -2) if front else (-26, -3), kneel)
             cr.set_source_rgb(*rgb)
             cr.set_line_width(8)
-            cr.move_to(0, -46)
-            cr.line_to(fx, -2)
+            cr.move_to(0, -46 + drop)
+            cr.line_to(*knee)
+            cr.line_to(*foot)
             cr.stroke()
             cr.set_source_rgb(*SEAM_RGB)
             cr.save()
-            cr.translate(fx + 3, -1.5)
+            cr.translate(foot[0] + 3, foot[1] + 0.5)
             cr.scale(6, 2.6)
             cr.arc(0, 0, 1, 0, 2 * math.pi)
             cr.restore()
             cr.fill()
 
-        def rifle_upright():
-            # Butt on the ground at his side, muzzle well above his cap.
+        # The long rifle swings from butt-on-the-ground to butt-at-the-
+        # shoulder, and kicks back a little when it fires.
+        kick = max(0.0, 1.0 - shot / 0.25) if shot >= 0 else 0.0
+
+        def rifle_pose(aim, drop, kick):
+            butt = lerp((16, -1), (-2 - 4 * kick, -72 + drop), aim)
+            return butt, aim * (math.pi / 2 - elev) - 0.08 * kick
+
+        def along(pose, dist):
+            (bx, by), ang = pose
+            return bx + math.sin(ang) * dist, by - math.cos(ang) * dist
+
+        pose = rifle_pose(aim, drop, kick)
+
+        def rifle():
+            (bx, by), ang = pose
+            cr.save()
+            cr.translate(bx, by)
+            cr.rotate(ang)
             cr.set_source_rgb(*RIFLE_WOOD_RGB)
-            cr.move_to(13, -1)
-            cr.line_to(19, -1)
-            cr.line_to(17.5, -32)
-            cr.line_to(15, -32)
+            cr.move_to(-3, 0)
+            cr.line_to(3, 0)
+            cr.line_to(1.5, -31)
+            cr.line_to(-1, -31)
             cr.close_path()
             cr.fill()
             cr.set_source_rgb(*STEEL_RGB)
             cr.set_line_width(2.2)
-            cr.move_to(16.2, -32)
-            cr.line_to(16.2, -128)
+            cr.move_to(0.2, -31)
+            cr.line_to(0.2, -127)
             cr.stroke()
-            return 16.2, -128
+            cr.restore()
+            return along(pose, 127)
 
         def rifle_shouldered():
             # Stock in his hand at the hip, barrel over the shoulder.
@@ -458,11 +644,13 @@ class CpuView(Gtk.DrawingArea):
             cr.restore()
             return 9 - 82 * math.cos(angle), -56 - 82 * math.sin(angle)
 
-        leg(-step, BUCK_DARK_RGB)
+        leg(-step, BUCK_DARK_RGB, False)
         if shouldered:
             tip = rifle_shouldered()
 
         # Fringed buckskin shirt.
+        cr.save()
+        cr.translate(0, drop)
         cr.set_source_rgb(*BUCK_RGB)
         cr.move_to(-12, -44)
         cr.line_to(12, -44)
@@ -490,10 +678,13 @@ class CpuView(Gtk.DrawingArea):
         cr.line_to(6, -50)
         cr.close_path()
         cr.fill()
+        cr.restore()
 
-        leg(step, BUCK_RGB)
+        leg(step, BUCK_RGB, True)
 
         # Head, beard, and the coonskin cap with its ringed tail.
+        cr.save()
+        cr.translate(0, drop)
         cr.set_source_rgb(*SKIN_RGB)
         cr.arc(1, -86, 7.5, 0, 2 * math.pi)
         cr.fill()
@@ -521,19 +712,109 @@ class CpuView(Gtk.DrawingArea):
         cr.set_source_rgb(*SEAM_RGB)
         cr.arc(5.5, -88, 1.1, 0, 2 * math.pi)
         cr.fill()
+        cr.restore()
 
+        shoulder = (6, -75 + drop)
+        if not shouldered and aim > 0:
+            # The far hand comes up under the barrel to steady it.
+            grip = lerp(shoulder, along(pose, 48), aim)
+            cr.set_source_rgb(*BUCK_DARK_RGB)
+            cr.set_line_width(6)
+            cr.move_to(4, -73 + drop)
+            cr.line_to(*grip)
+            cr.stroke()
+            cr.set_source_rgb(*SKIN_RGB)
+            cr.arc(*grip, 3, 0, 2 * math.pi)
+            cr.fill()
         if not shouldered:
-            tip = rifle_upright()
+            tip = rifle()
         # The arm that holds the rifle.
         cr.set_source_rgb(*BUCK_RGB)
         cr.set_line_width(6)
-        cr.move_to(6, -75)
-        hand = (14, -62) if not shouldered else (9, -56)
+        cr.move_to(*shoulder)
+        hand = along(pose, 61 - 47 * aim) if not shouldered else (9, -56)
         cr.line_to(*hand)
         cr.stroke()
         cr.set_source_rgb(*SKIN_RGB)
         cr.arc(*hand, 3, 0, 2 * math.pi)
         cr.fill()
+
+        if bugle > 0:
+            # The far hand brings the bugle up from his hip to his lips,
+            # bell forward and a little up.
+            mouth = lerp((12, -50), (8, -81), bugle)
+            ang = math.pi / 2 + (-0.2 - math.pi / 2) * bugle
+            grip = (mouth[0] + math.cos(ang) * 9, mouth[1] + math.sin(ang) * 9)
+            cr.save()
+            cr.translate(*mouth)
+            cr.rotate(ang)
+            cr.set_source_rgb(*BRASS_RGB)
+            cr.set_line_width(2.6)
+            cr.move_to(0, 0)
+            cr.line_to(19, 0)
+            cr.stroke()
+            cr.save()
+            cr.translate(10, 3.5)
+            cr.scale(6, 3)
+            cr.arc(0, 0, 1, 0, 2 * math.pi)
+            cr.restore()
+            cr.set_line_width(1.8)
+            cr.stroke()
+            cr.move_to(18, -1.5)
+            cr.line_to(28, -6.5)
+            cr.line_to(28, 6.5)
+            cr.line_to(18, 1.5)
+            cr.close_path()
+            cr.fill()
+            if toot >= 0:
+                # Sound rolling out of the bell, ring after ring.
+                cr.set_line_width(2.0)
+                for j in range(3):
+                    p = (toot * 1.6 - j / 3) % 1.0
+                    if toot * 1.6 < j / 3:
+                        continue
+                    cr.set_source_rgba(*BRASS_RGB, 0.9 * (1 - p))
+                    cr.new_sub_path()
+                    cr.arc(28, 0, 5 + 26 * p, -0.7, 0.7)
+                    cr.stroke()
+            cr.restore()
+            cr.set_source_rgb(*BUCK_DARK_RGB)
+            cr.set_line_width(6)
+            cr.move_to(4, -73)
+            cr.line_to(*grip)
+            cr.stroke()
+            cr.set_source_rgb(*SKIN_RGB)
+            cr.arc(*grip, 3, 0, 2 * math.pi)
+            cr.fill()
+
+        if 0 <= shot < 2.6:
+            # The smoke hangs where the shot was fired, even once he has
+            # lowered the rifle, so it starts from the fully aimed muzzle.
+            mx, my = along(rifle_pose(1.0, 20, 0.0), 127)
+            dx, dy = math.cos(elev), -math.sin(elev)
+            for j in range(3):
+                u = min(1.0, max(0.0, shot - 0.06 * j) / 2.6)
+                drift = 6 + 26 * math.sqrt(u) + 7 * j
+                cr.set_source_rgba(*SMOKE_RGB, 0.55 * (1 - u))
+                cr.arc(mx + dx * drift, my + dy * drift - 14 * u - 3 * j,
+                       4 + 12 * math.sqrt(u) + 2 * j, 0, 2 * math.pi)
+                cr.fill()
+        if 0 <= shot < 0.14:
+            mx, my = tip
+            flare = 1.0 - shot / 0.14
+            CpuView._glow(cr, mx + 6 * math.cos(elev),
+                          my - 6 * math.sin(elev), 26 * flare + 6,
+                          FLASH_RGB, flare)
+            cr.save()
+            cr.translate(mx, my)
+            cr.rotate(-elev)
+            cr.set_source_rgba(1, 1, 0.9, flare)
+            cr.move_to(0, -4)
+            cr.line_to(22 * flare + 6, 0)
+            cr.line_to(0, 4)
+            cr.close_path()
+            cr.fill()
+            cr.restore()
 
         if glint > 0:
             gx, gy = tip
@@ -544,6 +825,103 @@ class CpuView(Gtk.DrawingArea):
                 cr.move_to(gx - math.cos(ang) * 7, gy - math.sin(ang) * 7)
                 cr.line_to(gx + math.cos(ang) * 7, gy + math.sin(ang) * 7)
             cr.stroke()
+        cr.restore()
+
+    @staticmethod
+    def _redcoat(cr, x, feet, s, facing, step, fall):
+        """A redcoat on the march, musket at the shoulder, in the same
+        100-unit model as the mountain man. fall runs 0..1 as he topples
+        backward and fades once he is shot."""
+        if s < 1.5:
+            return
+        cr.save()
+        cr.translate(x, feet)
+        cr.scale(facing * s / 100.0, s / 100.0)
+        if fall > 0:
+            cr.rotate(-1.45 * min(1.0, fall * 1.8))
+            cr.push_group()
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_line_join(cairo.LINE_JOIN_ROUND)
+
+        def leg(swing):
+            fx = math.sin(swing) * 36
+            cr.set_source_rgb(*KIT_RGB)
+            cr.set_line_width(8)
+            cr.move_to(0, -46)
+            cr.line_to(fx, -2)
+            cr.stroke()
+            cr.set_source_rgb(*HAT_RGB)
+            cr.save()
+            cr.translate(fx + 3, -1.5)
+            cr.scale(6, 2.6)
+            cr.arc(0, 0, 1, 0, 2 * math.pi)
+            cr.restore()
+            cr.fill()
+
+        leg(-step)
+        # Coat tails behind, then the coat, its white cross-belts on top.
+        cr.set_source_rgb(*COAT_DARK_RGB)
+        cr.move_to(-10, -52)
+        cr.line_to(-17, -30)
+        cr.line_to(-6, -36)
+        cr.close_path()
+        cr.fill()
+        leg(step)
+        cr.set_source_rgb(*COAT_RGB)
+        cr.move_to(-12, -42)
+        cr.line_to(12, -42)
+        cr.line_to(10, -78)
+        cr.line_to(-10, -78)
+        cr.close_path()
+        cr.fill()
+        cr.set_source_rgb(*KIT_RGB)
+        cr.set_line_width(2.6)
+        cr.move_to(-9, -77)
+        cr.line_to(10, -45)
+        cr.move_to(9, -77)
+        cr.line_to(-10, -45)
+        cr.stroke()
+
+        cr.set_source_rgb(*SKIN_RGB)
+        cr.arc(1, -86, 7, 0, 2 * math.pi)
+        cr.fill()
+        # The tricorn.
+        cr.set_source_rgb(*HAT_RGB)
+        cr.move_to(-12, -88)
+        cr.line_to(14, -88)
+        cr.line_to(10, -94)
+        cr.line_to(1, -100)
+        cr.line_to(-9, -94)
+        cr.close_path()
+        cr.fill()
+
+        # Musket at the shoulder, bayonet fixed.
+        cr.set_source_rgb(*RIFLE_WOOD_RGB)
+        cr.set_line_width(5)
+        cr.move_to(7, -46)
+        cr.line_to(4, -72)
+        cr.stroke()
+        cr.set_source_rgb(*STEEL_RGB)
+        cr.set_line_width(2.2)
+        cr.move_to(4, -72)
+        cr.line_to(-3, -124)
+        cr.stroke()
+        cr.set_line_width(1.2)
+        cr.move_to(-2, -122)
+        cr.line_to(-4, -138)
+        cr.stroke()
+        cr.set_source_rgb(*COAT_RGB)
+        cr.set_line_width(6)
+        cr.move_to(3, -75)
+        cr.line_to(7, -50)
+        cr.stroke()
+        cr.set_source_rgb(*SKIN_RGB)
+        cr.arc(7, -48, 3, 0, 2 * math.pi)
+        cr.fill()
+
+        if fall > 0:
+            cr.pop_group_to_source()
+            cr.paint_with_alpha(max(0.0, 1.0 - fall))
         cr.restore()
 
     def _draw_fort(self, cr, x, y, w, h, t):
@@ -577,7 +955,167 @@ class CpuView(Gtk.DrawingArea):
         for tx in (X - tower_w * 0.35, X + W - tower_w * 0.65):
             self._blockhouse(cr, tx, floor, tower_w, tower_h + wall)
             towers.append(tx + tower_w / 2)
+        # Clickable: the stockade and towers, and the sentries above them.
+        self.fort_box = (X - tower_w * 0.35, floor - t * 1.1,
+                         X + W + tower_w * 0.35, Y + H)
         return towers, floor, (X + tower_w, X + W - tower_w), Y - wall * 0.9
+
+    DRILL_LEN = 4.6     # from kneeling to the last of the smoke
+    SHOT_AT = 2.0       # he fires this far into it
+
+    BUGLE_LEN = 2.0     # from raising the bugle to lowering it
+    BUGLE_HEARD = 1.2   # the tower sentry starts his drill this far in
+
+    @staticmethod
+    def _ramp(tau, a, b):
+        u = min(1.0, max(0.0, (tau - a) / (b - a)))
+        return u * u * (3 - 2 * u)
+
+    def _drill_t(self, i):
+        """Seconds into tower sentry i's drill; negative while he waits on
+        the bugle, DRILL_LEN or more once he is done."""
+        start = self.drill_start[i]
+        return self.DRILL_LEN if start is None else self.phase - start
+
+    def _busy(self, i):
+        return self._drill_t(i) < self.DRILL_LEN
+
+    def _drilling(self, i):
+        return 0 <= self._drill_t(i) < self.DRILL_LEN
+
+    def _drill(self, i):
+        """Tower sentry i kneels, takes aim and fires. Returns (kneel, aim,
+        seconds since the shot or -1)."""
+        tau = self._drill_t(i)
+        kneel = self._ramp(tau, 0.0, 0.6) - self._ramp(tau, 3.2, 3.8)
+        aim = self._ramp(tau, 0.4, 1.1) - self._ramp(tau, 2.8, 3.4)
+        shot = tau - self.SHOT_AT if self.SHOT_AT <= tau < self.DRILL_LEN \
+            else -1.0
+        return kneel, aim, shot
+
+    def _bugle_t(self):
+        if self.bugle_at is None:
+            return self.BUGLE_LEN
+        return self.phase - self.bugle_at
+
+    def _bugling(self):
+        return self._bugle_t() < self.BUGLE_LEN
+
+    def _bugle(self):
+        """The walker's call. Returns (how far the bugle is raised, seconds
+        since he began to blow or -1)."""
+        tau = self._bugle_t()
+        raised = self._ramp(tau, 0.0, 0.35) - self._ramp(tau, 1.6, 1.95)
+        toot = tau - 0.45 if 0.45 <= tau < 1.6 else -1.0
+        return raised, toot
+
+    @staticmethod
+    def _bezier(pts, p):
+        (x0, y0), (x1, y1), (x2, y2), (x3, y3) = pts
+        q = 1 - p
+        a, b, c, d = q * q * q, 3 * q * q * p, 3 * q * p * p, p * p * p
+        return (a * x0 + b * x1 + c * x2 + d * x3,
+                a * y0 + b * y1 + c * y2 + d * y3)
+
+    def _depth_scale(self, p):
+        """Size at screen position p on a trail, 1 at the near end."""
+        far = self.MARCH_NEAR / self.MARCH_FAR
+        return far + (1 - far) * p
+
+    def _redcoat_at(self, rc):
+        """Where a redcoat stands: (x, feet, size)."""
+        p = self._trail_p(rc["d"])
+        x, y = self._bezier(self.trails[rc["side"]], p)
+        return x, y, self.redcoat_s * self._depth_scale(p)
+
+    def _draw_trails(self, cr):
+        """Two dirt trails winding in from the far corners, narrowing with
+        distance."""
+        for pts in self.trails:
+            n = 48
+            edge_a, edge_b = [], []
+            for k in range(n + 1):
+                p = k / n
+                x, y = self._bezier(pts, p)
+                x2, y2 = self._bezier(pts, min(1.0, p + 0.01))
+                x1, y1 = self._bezier(pts, max(0.0, p - 0.01))
+                tx, ty = x2 - x1, y2 - y1
+                norm = math.hypot(tx, ty) or 1.0
+                half = self.redcoat_s * 0.5 * self._depth_scale(p)
+                nx, ny = -ty / norm * half, tx / norm * half
+                edge_a.append((x + nx, y + ny))
+                edge_b.append((x - nx, y - ny))
+            cr.move_to(*edge_a[0])
+            for pt in edge_a[1:] + edge_b[::-1]:
+                cr.line_to(*pt)
+            cr.close_path()
+            grad = cairo.LinearGradient(*pts[0], *pts[3])
+            grad.add_color_stop_rgba(0.0, *PATH_RGB, 0.35)
+            grad.add_color_stop_rgba(1.0, *PATH_RGB, 0.75)
+            cr.set_source(grad)
+            cr.fill()
+
+    def _draw_barracks(self, cr, i):
+        """A brick barracks with lit windows and a pennant, its door on the
+        far end of trail i; the door stands open while a redcoat comes
+        out."""
+        x, y = self.trails[i][0]
+        B = self.redcoat_s * 0.8
+        x0, top = x - B / 2, y - 0.42 * B
+        peak = top - 0.24 * B
+        cr.set_source_rgb(*BRICK_RGB)
+        cr.rectangle(x0, top, B, y - top)
+        cr.fill_preserve()
+        cr.set_source_rgb(*BRICK_DARK_RGB)
+        cr.set_line_width(max(0.6, B * 0.02))
+        cr.stroke()
+        cr.set_source_rgb(*ROOF_RGB)
+        cr.move_to(x0 - 0.06 * B, top)
+        cr.line_to(x, peak)
+        cr.line_to(x0 + B * 1.06, top)
+        cr.close_path()
+        cr.fill()
+        cr.set_source_rgba(*WINDOW_RGB, 0.85)
+        for fx in (0.1, 0.27, 0.61, 0.78):
+            cr.rectangle(x0 + fx * B, top + 0.1 * B, 0.11 * B, 0.12 * B)
+        cr.fill()
+        opening = any(rc["side"] == i
+                      and self.phase - rc["born"] < self.DOOR_OPEN_S
+                      for rc in self.redcoats)
+        cr.set_source_rgb(*((0.05, 0.03, 0.03) if opening else WOOD_RGB))
+        cr.rectangle(x - 0.08 * B, y - 0.27 * B, 0.16 * B, 0.27 * B)
+        cr.fill()
+        # The pennant on its pole, streaming out over the roof.
+        cr.set_source_rgb(*STEEL_RGB)
+        cr.set_line_width(max(0.6, B * 0.02))
+        cr.move_to(x, peak)
+        cr.line_to(x, peak - 0.36 * B)
+        cr.stroke()
+        wave = math.sin(self.phase * 3.0 + i) * 0.04 * B
+        cr.set_source_rgb(*COAT_RGB)
+        cr.move_to(x, peak - 0.36 * B)
+        cr.line_to(x + 0.24 * B, peak - 0.31 * B + wave)
+        cr.line_to(x, peak - 0.25 * B)
+        cr.close_path()
+        cr.fill()
+        self.barracks_box[i] = (x0 - 3, peak - 0.36 * B - 3, x0 + B + 3,
+                                y + 3)
+
+    def _draw_redcoats(self, cr):
+        for rc in sorted(self.redcoats, key=lambda rc: -rc["d"]):
+            x, feet, size = self._redcoat_at(rc)
+            p = self._trail_p(rc["d"])
+            pts = self.trails[rc["side"]]
+            ahead = self._bezier(pts, min(1.0, p + 0.02))[0] - x
+            facing = (1 if ahead > 0 else -1) if abs(ahead) > 0.3 \
+                else (1 if rc["side"] == 0 else -1)
+            if rc["hit"] is None:
+                step = math.sin(self.phase * 6.5 + rc["n"] * 1.7) * 0.35
+                fall = 0.0
+            else:
+                step = 0.0
+                fall = (self.phase - rc["hit"]) / self.FALL_S
+            self._redcoat(cr, x, feet, size, facing, step, fall)
 
     def _draw_sentries(self, cr, towers, floor, walk, walk_y, t):
         if not self.on:
@@ -585,6 +1123,18 @@ class CpuView(Gtk.DrawingArea):
         s = t * 0.85
         for i, tx in enumerate(towers):
             outward = -1 if i == 0 else 1
+            kneel, aim, shot = self._drill(i)
+            if self._drilling(i):
+                elev = 0.04
+                target = self.drill_target[i]
+                if target is not None and self.trails:
+                    rx, feet, size = self._redcoat_at(target)
+                    rise = (floor - s * 0.52) - (feet - size * 0.6)
+                    elev = min(1.3, max(-0.6, math.atan2(
+                        rise, max(1.0, abs(rx - tx)))))
+                self._mountain_man(cr, tx, floor, s, outward, kneel=kneel,
+                                   aim=aim, shot=shot, elev=elev)
+                continue
             # Each looks out, and now and then glances back into the yard.
             glance = int(self.phase / 3.1 + i * 1.7) % 4 == 0
             glint = max(0.0, math.sin(self.phase * 1.3 + i * 2.0)) ** 30
@@ -592,14 +1142,19 @@ class CpuView(Gtk.DrawingArea):
                                else outward, glint=glint)
         x0, x1 = walk
         if x1 - x0 > s * 0.6:
-            # One more walks the wall from tower to tower and back.
-            u = (self.phase / 9.0) % 2.0
+            # One more walks the wall from tower to tower and back, and
+            # stands still while he sounds his bugle.
+            walked = self.phase - self.walker_halted
+            u = (walked / 9.0) % 2.0
             pos = u if u < 1.0 else 2.0 - u
             ease = 0.5 - 0.5 * math.cos(pos * math.pi)
-            step = math.sin(self.phase * 7.0) * 0.38
+            self.walker_facing = 1 if u < 1.0 else -1
+            bugling = self._bugling()
+            raised, toot = self._bugle()
+            step = 0.0 if bugling else math.sin(walked * 7.0) * 0.38
             self._mountain_man(cr, x0 + (x1 - x0) * ease, walk_y, s * 0.92,
-                               1 if u < 1.0 else -1, step=step,
-                               shouldered=True)
+                               self.walker_facing, step=step,
+                               shouldered=True, bugle=raised, toot=toot)
 
     # -- the grove, where the fort stands when it is down ------------------
 
@@ -690,6 +1245,7 @@ class CpuView(Gtk.DrawingArea):
     # -- the picture ------------------------------------------------------
 
     def _draw(self, _area, cr, width, height):
+        self.fort_box = None
         if not self.cores:
             return
         fort = [c for c in self.cores
@@ -699,30 +1255,64 @@ class CpuView(Gtk.DrawingArea):
         label_h = max(16.0, height * 0.05)
         cols_f = max(1, min(self.COLS, len(fort)))
         rows_f = math.ceil(len(fort) / cols_f) if fort else 1
-        cols_o = max(1, min(self.COLS, len(rest)))
-        rows_o = math.ceil(len(rest) / cols_o) if rest else 0
+        cols_o = max(1, len(rest))
 
-        # Every size is a multiple of the tile width t, plus fixed gaps:
-        # towers and sentries above the wall take 1.6t, the wall 0.3t a
-        # side, and 0.5t of open ground lies between the fort and the rest.
-        t_by_w = min((width - (cols_f + 1) * gap) / (cols_f + 1.4),
-                     (width - (cols_o + 2.6) * gap) / cols_o)
-        a = 1.6 + 0.6 + 1.05 * rows_f + (0.5 + 1.05 * rows_o if rest else 0)
-        b = (rows_f * label_h + (rows_f - 1) * gap
-             + (rows_o * label_h + (rows_o - 1) * gap + 2.6 * gap
-                if rest else 0) + gap)
-        t = max(20.0, min(t_by_w, (height - b) / a))
+        # Every size is a multiple of a tile width, plus fixed gaps. Top to
+        # bottom: the rest of the chip in one row of tiles t_o wide, 0.2t of
+        # open ground, towers and sentries taking 1.6t above the fort's
+        # wall, and the wall 0.3t a side. The fort's tiles t are sized on
+        # their own, so a long row of the rest does not shrink the fort.
+        # The outer fifth of the width each side is left to the trails.
+        inner = width * 0.62
+        t_o_max = (inner - (cols_o + 1.6) * gap) / cols_o if rest else 0.0
+        die_h = 1.05 * t_o_max + label_h + 2.6 * gap if rest else 0.0
+        a = 1.6 + 0.6 + 1.05 * rows_f + (0.2 if rest else 0)
+        b = rows_f * label_h + (rows_f - 1) * gap + die_h + gap
+        t = max(20.0, min((inner - (cols_f + 1) * gap) / (cols_f + 1.4),
+                          (height - b) / a))
+        t_o = max(12.0, min(t, t_o_max))
+        die_h = 1.05 * t_o + label_h + 2.6 * gap if rest else 0.0
         tile_h = t * 1.05
-        y = (height - (a * t + b)) / 2 + gap / 2
+        spare = max(0.0, height - (a * t + b - (
+            1.05 * (t_o_max - t_o) if rest else 0)))
+        # Most of any height to spare goes to open ground between the chip
+        # and the fort, which lengthens the redcoats' march.
+        ground = spare * 0.6 if rest else 0.0
+        y = (spare - ground) / 2 + gap / 2
 
         fw = cols_f * t + (cols_f - 1) * gap
-        ow = cols_o * t + (cols_o - 1) * gap
+        ow = cols_o * t_o + (cols_o - 1) * gap
         # The yard is as wide as the land outside it, so the fort reads as
         # a fort and the wall has room for a man to walk.
         yw = max(fw, ow if rest else fw)
         fh = rows_f * (tile_h + label_h) + (rows_f - 1) * gap
         yx = (width - yw) / 2
-        fy = y + 1.6 * t + 0.3 * t
+        ox = (width - ow) / 2
+        oy = y + 1.3 * gap
+        fy = y + die_h + (0.2 * t + ground if rest else 0) + 1.6 * t + 0.3 * t
+
+        self.trails = None
+        self.barracks_box = [None, None]
+        if self.on:
+            # Each trail runs from a barracks in a top corner, clear of the
+            # chip, down to the foot of the fort's side wall.
+            self.redcoat_s = t * 0.9
+            near = (yx - 0.3 * t - 0.6 * t, fy + fh + 0.3 * t)
+            far = (width * 0.1, self.redcoat_s * 0.8 + 4)
+            bend = min(ox - 0.8 * gap - 0.2 * t, width * 0.19)
+            pts = (far, (bend, far[1] + (near[1] - far[1]) * 0.35),
+                   (width * 0.04, far[1] + (near[1] - far[1]) * 0.7), near)
+            self.trails = [pts, tuple((width - px, py) for px, py in pts)]
+            self._draw_trails(cr)
+            for i in (0, 1):
+                self._draw_barracks(cr, i)
+            self._draw_redcoats(cr)
+
+        if rest:
+            self._draw_die(cr, ox, oy, ow, t_o * 1.05 + label_h, gap)
+            self._tiles(cr, rest, ox, oy, cols_o, t_o, t_o * 1.05, label_h,
+                        gap, False)
+
         if self.on:
             towers, floor, walk, walk_y = self._draw_fort(cr, yx, fy, yw, fh,
                                                           t)
@@ -731,14 +1321,6 @@ class CpuView(Gtk.DrawingArea):
         # Orange only while the fort holds them; down, they are like any other.
         self._tiles(cr, fort, yx + (yw - fw) / 2, fy, cols_f, t, tile_h,
                     label_h, gap, self.on)
-
-        if rest:
-            ox = (width - ow) / 2
-            oy = fy + fh + 0.3 * t + 0.5 * t + 0.8 * gap
-            oh = rows_o * (tile_h + label_h) + (rows_o - 1) * gap
-            self._draw_die(cr, ox, oy, ow, oh, gap)
-            self._tiles(cr, rest, ox, oy, cols_o, t, tile_h, label_h, gap,
-                        False)
 
         # Last, so a pacing sentry passes in front of the tower roofs.
         if self.on:
@@ -1600,9 +2182,60 @@ def self_test():
                 win.app_list.set_cpu({})
                 assert win.hero.get_label()
                 win.view.shown = {c: (c % 7) / 6 for c in range(20)}
-                for win.view.phase in (0.0, 0.7, 3.3):
+                for win.view.phase in (0.0, 0.7, 3.3, 11.3, 13.05, 14.5):
                     win.view._draw(win.view, cr, 520, 260)
     win.view._draw(win.view, cr, 60, 40)  # drives every clamp
+
+    view = win.view
+    view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], True)
+    for facing, phase in ((1, 0.0), (-1, 10.0)):
+        view.bugle_at = None
+        view.phase = phase
+        view._draw(view, cr, 1024, 680)
+        assert view.walker_facing == facing, (facing, view.walker_facing)
+        view._on_click(None, 1, 0, 0)  # empty sky
+        assert not view._bugling()
+        x0, y0, x1, y1 = view.fort_box
+        view._on_click(None, 1, (x0 + x1) / 2, (y0 + y1) / 2)
+        assert view._bugling(), "a click on the fort sounds the bugle"
+        for view.phase in (phase + 0.2, phase + 0.9, phase + 1.8):
+            view._draw(view, cr, 1024, 680)
+        view.phase = phase + view.BUGLE_HEARD + 2.05
+        side = 1 if facing > 0 else 0
+        assert view._drill(side)[2] >= 0, "the sentry he faces fires"
+
+    # Two minutes of siege: redcoats come, the sentries shoot each one well
+    # before he reaches the fort, and nobody is left standing at its foot.
+    view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
+    view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], True)
+    view.bugle_at = None
+    view.phase, hits, closest = 0.0, set(), 0.0
+    for frame in range(120 * 30):
+        view.phase += 1 / 30
+        view._advance(1 / 30)
+        for rc in view.redcoats:
+            if rc["hit"] is None:
+                closest = max(closest, view._trail_p(rc["d"]))
+            else:
+                hits.add(rc["n"])
+        if frame % 15 == 0:
+            view._draw(view, cr, 1024, 680)
+    assert len(hits) >= 10, hits
+    assert closest < 0.9, f"a redcoat got to {closest:.2f} of the trail"
+
+    # A click on a barracks sends out a file, one at a time through the door.
+    x0, y0, x1, y1 = view.barracks_box[0]
+    before = view.spawned
+    view._on_click(None, 1, (x0 + x1) / 2, (y0 + y1) / 2)
+    assert view.called[0] == 3, view.called
+    for _ in range(12 * 30):
+        view.phase += 1 / 30
+        view._advance(1 / 30)
+    assert view.called[0] == 0 and view.spawned - before >= 3
+    view._draw(view, cr, 1024, 680)
+
+    view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
+    assert not view.redcoats, "standing down clears the field"
 
     win.apply_state(SAMPLE_STATE)
     assert win.banner.get_revealed() and win.banner_action is None
@@ -1672,7 +2305,10 @@ def snapshot(path):
     cr.paint()
     for i, on in enumerate((False, True)):
         view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], on)
-        view.phase = 1.3
+        view.phase = 0.0
+        while view.phase < 21.0:  # long enough for a siege to be under way
+            view.phase += 1 / 30
+            view._advance(1 / 30)
         cr.save()
         cr.translate(i * w, 0)
         view._draw(view, cr, w, h)
