@@ -116,6 +116,15 @@ systemctl --user daemon-reexec
 
 Without a package, `sudo make install` installs the same files under `/usr`.
 
+## Hacking on it
+
+`make dev-launcher` points the desktop launcher at this checkout, so the
+next launch runs your working tree. No build and no sudo are needed;
+`make undev-launcher` points it back. The root half (`fortctl --system`, the
+sudoers rule and the systemd units) is still the installed package. To change
+that, `make pkg` builds the package from your local commits and prints the
+`sudo pacman -U` that installs it.
+
 ## Checking it after a change
 
 ```bash

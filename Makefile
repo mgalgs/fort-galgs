@@ -7,7 +7,9 @@ DESTDIR ?=
 
 APP_ID = io.mgalgs.FortGalgs
 
-.PHONY: all check install
+USER_APPS = $(HOME)/.local/share/applications
+
+.PHONY: all check install dev-launcher undev-launcher pkg
 
 all:
 
@@ -38,3 +40,24 @@ install:
 	install -Dm644 watch.out \
 		$(DESTDIR)$(LIBDIR)/systemd/user/fort-galgs-watch.service
 	rm -f watch.out
+
+# A desktop entry in ~/.local/share/applications overrides the system one of
+# the same name, so the launcher runs this checkout's window and fortctl.
+# fortctl --system, its sudoers rule and the units stay the installed ones.
+dev-launcher:
+	install -Dm644 $(APP_ID).desktop $(USER_APPS)/$(APP_ID).desktop
+	sed -i 's|^Exec=.*|Exec=$(CURDIR)/fort-galgs|' \
+		$(USER_APPS)/$(APP_ID).desktop
+	-update-desktop-database $(USER_APPS)
+
+undev-launcher:
+	rm -f $(USER_APPS)/$(APP_ID).desktop
+	-update-desktop-database $(USER_APPS)
+
+# The package of this checkout's HEAD; makepkg clones, so uncommitted edits
+# are not in it.
+pkg:
+	@git diff --quiet HEAD || echo "note: uncommitted changes are left out"
+	cd packaging/arch && FORT_GALGS_GIT=git+file://$(CURDIR) makepkg -f
+	@echo "install: sudo pacman -U $(CURDIR)/packaging/arch/$$(cd \
+		packaging/arch && ls -t fort-galgs-git-*.pkg.tar.* | head -1)"
