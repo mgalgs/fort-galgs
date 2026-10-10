@@ -2450,12 +2450,14 @@ class FortWindow(Adw.ApplicationWindow):
         return page
 
     def _build_home(self):
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
-                      margin_top=2, margin_bottom=18,
-                      margin_start=24, margin_end=24)
-
+        # The picture runs edge to edge; everything under it is inset.
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                       margin_bottom=18)
         self.view = CpuView()
-        box.append(self.view)
+        page.append(self.view)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                      margin_start=24, margin_end=24)
+        page.append(box)
 
         self.hero = Gtk.Label(css_classes=["gm-hero"], wrap=True,
                               justify=Gtk.Justification.CENTER)
@@ -2515,7 +2517,7 @@ class FortWindow(Adw.ApplicationWindow):
 
         scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER,
                                       vexpand=True)
-        scroller.set_child(box)
+        scroller.set_child(page)
         return scroller
 
     def _build_error(self):
