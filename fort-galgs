@@ -13,6 +13,7 @@ Run with --self-test to build every page and draw every state once, or with
 import json
 import math
 import os
+import random
 import sys
 
 import cairo
@@ -303,6 +304,12 @@ class CpuView(Gtk.DrawingArea):
         self.fort_box = None              # (x0, y0, x1, y1) as last drawn
         self.river = None                 # its course, as last laid out
         self.fords = [None, None]         # p where each trail crosses it
+        self.rng = random.Random(7)       # the wilds' only source of chance
+        self.wild = None                  # the idle scene's layout, per size
+        self.sites = []                   # trap sites along the banks
+        self.trappers = []
+        self.pelts = [[0, 0], [0, 0]]     # per flank: pelts stacked, bales
+        self.horses = []
         self.set_draw_func(self._draw)
         self.add_tick_callback(self._on_tick)
         click = Gtk.GestureClick()
@@ -2182,6 +2189,167 @@ class CpuView(Gtk.DrawingArea):
                 bx = X + W / 2 + side * (path / 2 + s + j * (W - path) / 2 / k)
                 self._bush(cr, bx, Y + H, s)
 
+    # -- the wilds around the grove, while the fort is down ---------------
+
+    def _lay_wilds(self, key, width, height, t, die, grove):
+        """Lay out the woods and the trappers' ground once per size: each
+        trapper keeps to one flank of the grove, with a cache of pelts on
+        the near bank, traps along both banks, and stepping stones across.
+        A flank too small for any of it simply goes without."""
+        s = t * 0.5
+        mud = self.river["half"] * 0.35 + 2
+        gx0, gy0, gx1, gy1 = grove
+        floor = height * 0.94
+
+        def bank(x0, x1, side):
+            ys = [self._river_edge(x0 + (x1 - x0) * k / 16, side)
+                  for k in range(17)]
+            return max(ys) + mud if side > 0 else min(ys) - mud
+
+        flanks, sites, pastures = [], [], []
+        for f in (0, 1):
+            fl = {"near": None, "far": None, "ford": None, "cache": None}
+            flanks.append(fl)
+            x0, x1 = (0.0, gx0 - 0.1 * t) if f == 0 \
+                else (gx1 + 0.1 * t, float(width))
+            if x1 - x0 < 2 * s:
+                continue
+            top = bank(x0, x1, 1)
+            if floor - top >= 1.5 * s:
+                fl["near"] = (x0, top, x1, floor)
+            if die is not None:
+                cx0, cx1 = (x0, min(x1, die[0] - 0.1 * t)) if f == 0 \
+                    else (max(x0, die[2] + 0.1 * t), x1)
+                y0 = height * 0.03 + s
+                bottom = bank(cx0, cx1, -1)
+                if cx1 - cx0 >= 2 * s and bottom - y0 >= 0.2 * s:
+                    fl["far"] = (cx0, y0, cx1, bottom)
+            if fl["near"] is None:
+                continue
+            xf = width * (0.11 if f == 0 else 0.89)
+            if fl["far"] and x0 + 0.4 * s <= xf <= x1 - 0.4 * s:
+                fl["ford"] = ((xf, self._river_edge(xf, -1) - mud),
+                              (xf, self._river_edge(xf, 1) + mud))
+            nx0, ny0, nx1, ny1 = fl["near"]
+            fl["cache"] = ((nx0 + nx1) / 2, ny0 + (ny1 - ny0) * 0.5)
+            if ny1 - ny0 >= 2.6 * s:
+                pastures.append((nx0 + 0.3 * s, ny0 + (ny1 - ny0) * 0.72,
+                                 nx1 - 0.3 * s, ny1 - 0.1 * s))
+            xf = fl["ford"][0][0] if fl["ford"] else None
+            spots = []
+            for u in (0.0, 1.0, 0.5):
+                x = nx0 + 0.4 * s + (nx1 - nx0 - 0.8 * s) * u
+                if len(spots) < 2 and all(abs(x - o) >= 0.9 * s for o in
+                                          [o for o, _ in spots] + [xf]
+                                          if o is not None):
+                    spots.append((x, 1))
+            if fl["ford"]:
+                cx0, _, cx1, _ = fl["far"]
+                x = max((cx0 + 0.4 * s + (cx1 - cx0 - 0.8 * s) * u
+                         for u in (0.15, 0.5, 0.85)),
+                        key=lambda x: abs(x - xf))
+                spots.append((x, -1))
+            for k, (x, side) in enumerate(spots):
+                face = 1 if k % 2 == 0 else -1
+                y = self._river_edge(x, side) + side * mud * 0.6
+                stand = x - face * 0.42 * s
+                if not (x0 + 0.2 * s <= min(x, stand)
+                        and max(x, stand) <= x1 - 0.2 * s):
+                    face = -face
+                    stand = x - face * 0.42 * s
+                sites.append({"flank": f, "x": x, "y": y, "bank": side,
+                              "face": face, "stand": (stand, y + side
+                                                      * 0.12 * s),
+                              "state": "empty", "since": 0.0,
+                              "catch_in": 0.0})
+        if floor - gy1 >= 1.2 * s:
+            pastures.append((gx0 + 0.3 * s, gy1 + 0.6 * s, gx1 - 0.3 * s,
+                             floor - 0.1 * s))
+
+        # Points the woods must leave in plain view: (x, feet, half width,
+        # height) of whatever stands there.
+        keep = [(st["stand"][0], st["stand"][1], 0.5 * s, s) for st in sites]
+        keep += [(st["x"], st["y"], 0.4 * s, 0.6 * s) for st in sites]
+        keep += [(fl["cache"][0], fl["cache"][1], 0.9 * s, s)
+                 for fl in flanks if fl["cache"]]
+        for fl in flanks:
+            if fl["ford"]:
+                (xf, ya), (_, yb) = fl["ford"]
+                keep += [(xf, ya + (yb - ya) * k / 4, 0.6 * s, s)
+                         for k in range(5)]
+        for x0, y0, x1, y1 in pastures:
+            keep.append(((x0 + x1) / 2, y1, (x1 - x0) / 2 + 0.6 * s,
+                         y1 - y0 + 0.9 * s))
+
+        def overlaps(a, b):
+            return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+        trees = []
+        cap = int(min(90, width * height / (t * t * 0.8)))
+        grove_tall = (gx0 - 0.1 * t, gy0 - 1.5 * t, gx1 + 0.1 * t,
+                      gy1 + 0.2 * t)
+        for i in range(cap * 10):
+            if len(trees) >= cap:
+                break
+            x = (0.31 + i * 0.7548777) % 1.0 * width
+            base = (0.17 + i * 0.5698403) % 1.0 * height
+            kind = ("pine", "round", "pine", "bush")[i % 4]
+            h = t * (0.5 + 0.45 * ((i * 0.618) % 1.0))
+            if kind == "bush":
+                h *= 0.45
+            box = (x - 0.32 * h, base - h, x + 0.32 * h, base)
+            if base > floor or base < 0.5 * h:
+                continue
+            if overlaps(box, grove_tall) or (
+                    die is not None and overlaps(box, (
+                        die[0] - 0.15 * t, die[1] - 0.15 * t,
+                        die[2] + 0.15 * t, die[3] + 0.15 * t))):
+                continue
+            far = self._river_edge(x, -1) - mud
+            near = self._river_edge(x, 1) + mud
+            if not (base <= far or base >= near + 0.35 * h):
+                continue
+            if any(overlaps(box, (px - w, py - ht, px + w, py + 0.3 * s))
+                   or (base > py - 0.2 * s and abs(x - px) < w + 0.3 * h
+                       and base - h < py)
+                   for px, py, w, ht in keep):
+                continue
+            if any(math.hypot(x - o[0], base - o[1]) < 0.3 * (h + o[2])
+                   for o in trees):
+                continue
+            trees.append((x, base, h, kind, i))
+        trees.sort(key=lambda tr: tr[1])
+
+        self.wild = {"key": key, "s": s, "t": t, "mud": mud, "trees": trees,
+                     "flanks": flanks, "pastures": pastures, "grove": grove}
+        self.sites = sites
+        self.trappers = []
+        self.horses = []
+
+    def _draw_wilds(self, cr):
+        """The woods, the trappers and the horses, nearest last."""
+        items = [(tree[1], 0, self._draw_tree, tree)
+                 for tree in self.wild["trees"]]
+        items.sort(key=lambda it: it[:2])
+        for _, _, draw, arg in items:
+            draw(cr, arg)
+
+    def _draw_tree(self, cr, tree):
+        x, base, h, kind, i = tree
+        sway = math.sin(self.phase * 0.9 + i * 1.3) * h * 0.03
+        if kind == "pine":
+            self._pine(cr, x, base, h, sway)
+        elif kind == "round":
+            self._round_tree(cr, x, base, h, sway)
+        else:
+            self._bush(cr, x, base, h * 0.5)
+
+    def _draw_wild_fords(self, cr):
+        for f, fl in enumerate(self.wild["flanks"]):
+            if fl["ford"]:
+                self._draw_ford(cr, fl["ford"][0][0], self.wild["t"] * 0.22,
+                                f)
+
     # -- the picture ------------------------------------------------------
 
     def _draw(self, _area, cr, width, height):
@@ -2238,6 +2406,17 @@ class CpuView(Gtk.DrawingArea):
         self._lay_river(width, chip_foot, fy - 0.9 * t, t)
         self._draw_river(cr)
         self._draw_swimmer(cr)
+        if not self.on:
+            key = (width, height, len(fort), len(rest))
+            if self.wild is None or self.wild["key"] != key:
+                pad = gap * 0.8
+                die = (ox - pad, oy - pad * 1.55, ox + ow + pad,
+                       oy + t_o * 1.05 + label_h + pad * 1.55) \
+                    if rest else None
+                grove = (yx - 0.3 * t, fy - 0.3 * t, yx + yw + 0.3 * t,
+                         fy + fh + 0.3 * t + t * 0.1)
+                self._lay_wilds(key, width, height, t, die, grove)
+            self._draw_wild_fords(cr)
 
         self.trails = None
         self.fords = [None, None]
@@ -2276,6 +2455,8 @@ class CpuView(Gtk.DrawingArea):
         # Last, so a pacing sentry passes in front of the tower roofs.
         if self.on:
             self._draw_sentries(cr, towers, floor, walk, walk_y, t)
+        else:
+            self._draw_wilds(cr)
 
     def _tiles(self, cr, cores, x0, y0, cols, t, tile_h, label_h, gap, mine):
         for i, core in enumerate(cores):
@@ -3148,6 +3329,24 @@ def self_test():
         x, y, dive = view._swimmer()
         seen.add("under" if x is None else "dive" if dive >= 0 else "swim")
     assert seen == {"swim", "dive", "under"}, seen
+
+    # The woods stand still from frame to frame, clear of the grove and
+    # out of the water, and every size lays out, down to none at all.
+    every = [cpu for core in SAMPLE_STATE["cores"] for cpu in core["cpus"]]
+    for reserved in (SAMPLE_STATE["reserved"], every):
+        view.set_state(SAMPLE_STATE["cores"], reserved, False)
+        for size in ((60, 40), (300, 220), (1, 1)):
+            view._draw(view, cr, *size)
+            assert view.wild is not None, size
+    view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
+    view._draw(view, cr, 1024, 680)
+    trees = list(view.wild["trees"])
+    view.phase += 1.0
+    view._draw(view, cr, 1024, 680)
+    assert trees and view.wild["trees"] == trees, "the woods hold still"
+    for x, base, h, kind, i in trees:
+        assert not view._in_box(view.wild["grove"], x, base), (x, base)
+        assert abs(base - view._river_y(x)) > view._river_half(x), (x, base)
 
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], True)
     for facing, phase in ((1, 0.0), (-1, 10.0)):
