@@ -1579,7 +1579,7 @@ class CpuView(Gtk.DrawingArea):
         if rt is not None:
             side = self.relief["side"]
             nx, ny = self.trails[side][3]
-            land = (nx + gf * self.redcoat_s * 0.25, ny)
+            land = (nx + gf * self.redcoat_s * 0.4, ny)
             # A high lob, steep enough that coming down it still clears the
             # tower sentry's head and his rifle with room to spare.
             reach = abs(land[0] - pivot[0])
@@ -1587,7 +1587,7 @@ class CpuView(Gtk.DrawingArea):
             # Over his middle, and again past his outward side, where the
             # ball has least room left to fall.
             outward = -1 if side == 0 else 1
-            for dx, above in ((0.0, 2.6), (0.55, 1.4)):
+            for dx, above in ((0.0, 2.0), (0.55, 1.1)):
                 over = abs(towers[side] + outward * dx * s - pivot[0]) \
                     / max(1.0, reach)
                 if 0 < over < 1:
@@ -1595,6 +1595,7 @@ class CpuView(Gtk.DrawingArea):
                     clear = floor - s * above
                     lift = max(lift,
                                (line - clear) / (4 * over * (1 - over)))
+            lift = min(lift, 3.0 * reach)
             aim = math.atan2(4 * lift - (land[1] - pivot[1]), reach)
             cranked = self._ramp(rt, self.HEARD_AT + self.RUN_S, self.FIRE_AT)
             lowered = self._ramp(rt, self.RELIEF_LEN - 0.8, self.RELIEF_LEN)
