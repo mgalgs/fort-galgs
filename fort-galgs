@@ -1036,13 +1036,25 @@ class AppRow(Gtk.Box):
 
 
 class AppList(Gtk.Box):
-    """Desktop apps first; terminals and other scopes under an expander."""
+    """Desktop apps first; terminals and other scopes under an expander.
+
+    Apps in the fort lead each list, and within that the busiest come
+    first. A row passes the one above it only once its smoothed load leads
+    by CPU_SORT_MARGIN, and nothing moves while the pointer is over the
+    list, so a row never slides out from under a click.
+    """
+
+    CPU_SORT_MARGIN = 0.3   # CPUs
+    CPU_EASE = 0.25         # per sample
 
     def __init__(self, on_flip, on_pin):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         self.on_flip = on_flip
         self.on_pin = on_pin
         self.rows = {}
+        self.cpu = {}       # group key -> smoothed CPUs in use
+        self.motion = Gtk.EventControllerMotion()
+        self.add_controller(self.motion)
         self.main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         self.others = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
                               spacing=10, margin_top=10)
@@ -1053,12 +1065,26 @@ class AppList(Gtk.Box):
         self.append(self.empty)
         self.append(self.expander)
 
+    def _shown(self, box):
+        child, out = box.get_first_child(), []
+        while child is not None:
+            out.append(child)
+            child = child.get_next_sibling()
+        return out
+
     def update(self, groups, mode):
+        # Rebuild in the order already on screen, so a status read does not
+        # undo the CPU sort; new rows start at the end of their section.
+        place = {row.group["key"]: i for i, row in enumerate(
+            self._shown(self.main) + self._shown(self.others))}
+        groups = sorted(groups, key=lambda g: (
+            not any(g["inside"]), place.get(g["key"], len(place))))
         keys = {g["key"] for g in groups}
         for key in list(self.rows):
             if key not in keys:
                 row = self.rows.pop(key)
                 row.get_parent().remove(row)
+                self.cpu.pop(key, None)
         for box in (self.main, self.others):
             while (child := box.get_first_child()) is not None:
                 box.remove(child)
@@ -1073,16 +1099,44 @@ class AppList(Gtk.Box):
         self.empty.set_visible(not any(not g["other"] for g in groups))
         self.expander.set_label(f"Terminals and other scopes ({n_other})")
         self.expander.set_visible(n_other > 0)
+        self._sort()
 
     def sample_paths(self):
         return {cg: cg for row in self.rows.values() if row.group
                 for cg in row.group["cgroups"]}
 
     def set_cpu(self, used):
-        for row in self.rows.values():
+        for key, row in self.rows.items():
             if row.group:
-                row.set_cpu(sum(used.get(cg, 0.0)
-                                for cg in row.group["cgroups"]))
+                now = sum(used.get(cg, 0.0) for cg in row.group["cgroups"])
+                row.set_cpu(now)
+                was = self.cpu.get(key, now)
+                self.cpu[key] = was + (now - was) * self.CPU_EASE
+        self._sort()
+
+    def _ahead(self, a, b):
+        a_in, b_in = any(a.group["inside"]), any(b.group["inside"])
+        if a_in != b_in:
+            return a_in
+        return (self.cpu.get(a.group["key"], 0.0)
+                > self.cpu.get(b.group["key"], 0.0) + self.CPU_SORT_MARGIN)
+
+    def _sort(self):
+        if self.motion.get_property("contains-pointer"):
+            return
+        for box in (self.main, self.others):
+            shown = self._shown(box)
+            order = []
+            for row in shown:
+                i = len(order)
+                while i > 0 and self._ahead(row, order[i - 1]):
+                    i -= 1
+                order.insert(i, row)
+            if order != shown:
+                prev = None
+                for row in order:
+                    box.reorder_child_after(row, prev)
+                    prev = row
 
 
 # --------------------------------------------------------------------------
@@ -1569,6 +1623,23 @@ def self_test():
     for row in rows.values():
         assert row.pin.get_sensitive(), row.group["title"]
         assert row.pin.get_active() == row.group["always"]
+
+    lst = win.app_list
+    for box in (lst.main, lst.others):
+        shown = lst._shown(box)
+        if not shown:
+            continue  # no .desktop entry for the sample apps on this machine
+        busy = shown[-1]
+        lst.cpu = {key: 0.0 for key in lst.rows}
+        lst.cpu[busy.group["key"]] = 9.0
+        lst._sort()
+        after = lst._shown(box)
+        inside = [any(r.group["inside"]) for r in after]
+        assert inside == sorted(inside, reverse=True), "the fort's apps lead"
+        assert [r for r in after if any(r.group["inside"])
+                == any(busy.group["inside"])][0] is busy, "busiest first"
+        win.apply_state(SAMPLE_STATE)
+        assert lst._shown(box) == after, "a status read keeps the order"
 
     loads = win.cpus.sample()
     loads = win.cpus.sample()
