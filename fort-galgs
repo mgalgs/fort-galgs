@@ -74,6 +74,10 @@ ROOF_RGB = (0.24, 0.22, 0.25)
 WINDOW_RGB = (0.98, 0.80, 0.45)
 HORSE_RGB = (0.40, 0.25, 0.15)
 HORSE_DARK_RGB = (0.26, 0.15, 0.09)
+HORSE_GREY_RGB = (0.68, 0.67, 0.64)
+HORSE_GREY_DARK_RGB = (0.42, 0.41, 0.40)
+HORSE_CHESTNUT_RGB = (0.62, 0.34, 0.16)
+HORSE_CHESTNUT_DARK_RGB = (0.38, 0.19, 0.09)
 IRON_RGB = (0.22, 0.22, 0.25)
 BALL_RGB = (0.62, 0.63, 0.68)
 BLOOD_RGB = (0.62, 0.04, 0.05)
@@ -1175,9 +1179,13 @@ class CpuView(Gtk.DrawingArea):
 
     @staticmethod
     def _cavalry(cr, x, feet, s, facing, gallop, fall, pound=-1.0,
-                 seed=0.0, rider=True):
+                 seed=0.0, rider=True, coat=(HORSE_RGB, HORSE_DARK_RGB),
+                 graze=0.0, swish=0.0, walk=True):
         """A redcoat on horseback, saber out, in the same 100-unit model;
-        gallop is the phase of the stride, and pound as for a redcoat."""
+        gallop is the phase of the stride, and pound as for a redcoat.
+        Without a rider, coat is the horse's (colour, shade); graze runs
+        0..1 as it puts its head down to the grass, swish flicks its tail,
+        and walk False stands it still."""
         if s < 1.5:
             return
         cr.save()
@@ -1188,11 +1196,12 @@ class CpuView(Gtk.DrawingArea):
             cr.push_group()
         cr.set_line_cap(cairo.LINE_CAP_ROUND)
         cr.set_line_join(cairo.LINE_JOIN_ROUND)
-        moving = pound < 0 and fall <= 0
+        moving = pound < 0 and fall <= 0 and walk
         bob = math.sin(gallop * 2) * 2.5 if moving else 0.0
+        hide, shade = coat
 
         def legs(far):
-            cr.set_source_rgb(*(HORSE_DARK_RGB if far else HORSE_RGB))
+            cr.set_source_rgb(*(shade if far else hide))
             cr.set_line_width(5)
             for hx in ((-24, 14) if far else (-18, 20)):
                 ph = gallop + (0.0 if hx < 0 else 2.0) + (0.5 if far else 0)
@@ -1208,30 +1217,35 @@ class CpuView(Gtk.DrawingArea):
         cr.save()
         cr.scale(1.35, 1.35)
         legs(True)
-        cr.set_source_rgb(*HORSE_DARK_RGB)
+        cr.set_source_rgb(*shade)
         cr.set_line_width(5)
         cr.move_to(-30, -52 + bob)
-        cr.curve_to(-40, -50, -44, -40, -42 - bob, -28)
+        cr.curve_to(-40, -50, -44 + swish * 5, -40, -42 - bob + swish * 10,
+                    -28)
         cr.stroke()
-        cr.set_source_rgb(*HORSE_RGB)
+        cr.set_source_rgb(*hide)
         cr.save()
         cr.translate(0, -48 + bob)
         cr.scale(30, 12)
         cr.arc(0, 0, 1, 0, 2 * math.pi)
         cr.restore()
         cr.fill()
-        cr.move_to(18, -54 + bob)
-        cr.line_to(30, -80 + bob)
-        cr.line_to(48, -68 + bob)
-        cr.line_to(45, -62 + bob)
-        cr.line_to(34, -66 + bob)
-        cr.line_to(30, -44 + bob)
+        # Neck and head, from up and alert to down at the grass.
+        up = ((18, -54), (30, -80), (48, -68), (45, -62), (34, -66),
+              (30, -44), (19, -58), (29, -80))
+        down = ((16, -56), (38, -36), (47, -12), (40, -8), (33, -24),
+                (27, -42), (17, -58), (37, -38))
+        pts = [(ux + (dx - ux) * graze, uy + (dy - uy) * graze + bob)
+               for (ux, uy), (dx, dy) in zip(up, down)]
+        cr.move_to(*pts[0])
+        for pt in pts[1:6]:
+            cr.line_to(*pt)
         cr.close_path()
         cr.fill()
-        cr.set_source_rgb(*HORSE_DARK_RGB)
+        cr.set_source_rgb(*shade)
         cr.set_line_width(3)
-        cr.move_to(19, -58 + bob)
-        cr.line_to(29, -80 + bob)
+        cr.move_to(*pts[6])
+        cr.line_to(*pts[7])
         cr.stroke()
         legs(False)
         cr.restore()
@@ -2263,8 +2277,8 @@ class CpuView(Gtk.DrawingArea):
             nx0, ny0, nx1, ny1 = fl["near"]
             fl["cache"] = ((nx0 + nx1) / 2, ny0 + (ny1 - ny0) * 0.5)
             if ny1 - ny0 >= 2.6 * s:
-                pastures.append((nx0 + 0.3 * s, ny0 + (ny1 - ny0) * 0.72,
-                                 nx1 - 0.3 * s, ny1 - 0.1 * s))
+                pastures.append((nx0 + 0.3 * s, ny0 + (ny1 - ny0) * 0.7,
+                                 nx1 - 0.3 * s, ny1 - 0.4 * s))
             xf = fl["ford"][0][0] if fl["ford"] else None
             spots = []
             for u in (0.0, 1.0, 0.5):
@@ -2363,6 +2377,21 @@ class CpuView(Gtk.DrawingArea):
                     "until": self.phase + 1.0 + f, "carry": False,
                     "site": None})
         self.horses = []
+        if not pastures:
+            return
+        # The roomiest pasture gets two of the three.
+        order = sorted(range(len(pastures)), key=lambda k: pastures[k][0]
+                       - pastures[k][2])
+        for i in range(3):
+            k = order[0] if i == 2 else order[i % len(order)]
+            x0, y0, x1, y1 = pastures[k]
+            n = 2 if k == order[0] else 1
+            j = 1 if i == 2 else 0
+            self.horses.append({
+                "pasture": k, "coat": i, "x": x0 + (x1 - x0) * (j + 0.5) / n,
+                "y": self.rng.uniform(y0, y1), "facing": 1 if i % 2 else -1,
+                "graze": 1, "graze_k": 1.0, "dest": None,
+                "next_at": self.phase + self.rng.uniform(1.0, 6.0)})
 
     # The trap line: how long each piece of work takes him, kneeling.
     JOB_S = {"set": 3.0, "collect": 2.5, "stash": 2.0}
@@ -2471,6 +2500,7 @@ class CpuView(Gtk.DrawingArea):
             if st["state"] == "set" and \
                     self.phase - st["since"] >= st["catch_in"]:
                 st["state"], st["since"] = "caught", self.phase
+        self._advance_horses(dt)
         speed = self.wild["t"] * 0.55
         for tr in self.trappers:
             if tr["route"]:
@@ -2491,6 +2521,66 @@ class CpuView(Gtk.DrawingArea):
                 self._finish(tr)
                 self._trapper_next(tr)
 
+    HORSE_COATS = ((HORSE_RGB, HORSE_DARK_RGB),
+                   (HORSE_GREY_RGB, HORSE_GREY_DARK_RGB),
+                   (HORSE_CHESTNUT_RGB, HORSE_CHESTNUT_DARK_RGB))
+
+    def _horse_s(self):
+        return self.wild["s"] * 0.9
+
+    def _advance_horses(self, dt):
+        """Loose horses grazing: mostly head down, now and then looking
+        up, and once in a while ambling a few steps across the pasture."""
+        hs_s = self._horse_s()
+        for hs in self.horses:
+            x0, y0, x1, y1 = self.wild["pastures"][hs["pasture"]]
+            if hs["dest"] is not None:
+                tx, ty = hs["dest"]
+                dx, dy = tx - hs["x"], ty - hs["y"]
+                dist = math.hypot(dx, dy)
+                step = self.wild["t"] * 0.25 * dt
+                if abs(dx) > 0.5:
+                    hs["facing"] = 1 if dx > 0 else -1
+                if dist <= step:
+                    hs["x"], hs["y"], hs["dest"] = tx, ty, None
+                else:
+                    hs["x"] += dx / dist * step
+                    hs["y"] += dy / dist * step
+            elif self.phase >= hs["next_at"]:
+                roll = self.rng.random()
+                if roll < 0.6:
+                    hs["graze"] = 1 - hs["graze"]
+                elif roll < 0.85:
+                    lo, hi = x0 + 0.6 * hs_s, max(x0 + 0.6 * hs_s,
+                                                  x1 - 0.6 * hs_s)
+                    dest = (min(hi, max(lo, hs["x"] + self.rng.uniform(
+                                -2, 2) * hs_s)),
+                            min(y1, max(y0, hs["y"] + self.rng.uniform(
+                                -0.5, 0.5) * hs_s)))
+                    # Not into another horse, standing or on its way.
+                    if not any(abs(dest[0] - ox) < 1.3 * hs_s
+                               and abs(dest[1] - oy) < 0.6 * hs_s
+                               for o in self.horses if o is not hs
+                               for ox, oy in (o["dest"] or (o["x"], o["y"]),
+                                              (o["x"], o["y"]))):
+                        hs["dest"] = dest
+                hs["next_at"] = self.phase + (
+                    self.rng.uniform(6.0, 12.0) if hs["graze"]
+                    else self.rng.uniform(2.5, 5.0))
+            want = 0.0 if hs["dest"] is not None else hs["graze"]
+            hs["graze_k"] += (want - hs["graze_k"]) * min(1.0, 3.0 * dt)
+
+    def _draw_horse(self, cr, hs):
+        i = hs["coat"]
+        # Head down, it nibbles: small dips as it crops the grass.
+        nibble = 0.06 * max(0.0, math.sin(self.phase * 2.6 + i * 2)) ** 2
+        self._cavalry(cr, hs["x"], hs["y"], self._horse_s(), hs["facing"],
+                      self.phase * 5 + i, 0.0, rider=False,
+                      coat=self.HORSE_COATS[i],
+                      graze=hs["graze_k"] * (1 - nibble),
+                      swish=math.sin(self.phase * 1.7 + i * 2) ** 3,
+                      walk=hs["dest"] is not None)
+
     def _draw_wilds(self, cr):
         """The woods, the trappers and the horses, nearest last."""
         items = [(tree[1], 0, self._draw_tree, tree)
@@ -2500,6 +2590,7 @@ class CpuView(Gtk.DrawingArea):
                   for f, fl in enumerate(self.wild["flanks"]) if fl["cache"]]
         items += [(tr["y"], 2, self._draw_trapper, tr)
                   for tr in self.trappers]
+        items += [(hs["y"], 2, self._draw_horse, hs) for hs in self.horses]
         items.sort(key=lambda it: it[:2])
         for _, _, draw, arg in items:
             draw(cr, arg)
@@ -3661,15 +3752,24 @@ def self_test():
 
     # Four idle minutes: the trappers set traps, collect what they catch,
     # and stash the pelts, keeping out of the grove and off the water but
-    # for their stepping stones.
+    # for their stepping stones. The horses graze, look up, and amble
+    # about their pastures.
     seen, carried = set(), False
     s = view.wild["s"]
+    assert view.horses, "horses at pasture"
+    start = [(hs["x"], hs["y"]) for hs in view.horses]
+    grazed, roamed = set(), 0.0
     for frame in range(240 * 30):
         view.phase += 1 / 30
         view._advance(1 / 30)
         if frame % 30 == 0:
             view._draw(view, cr, 1024, 680)
         seen |= {st["state"] for st in view.sites}
+        for hs, (x, y) in zip(view.horses, start):
+            grazed.add(hs["graze"])
+            roamed = max(roamed, abs(hs["x"] - x))
+            x0, y0, x1, y1 = view.wild["pastures"][hs["pasture"]]
+            assert x0 <= hs["x"] <= x1 and y0 <= hs["y"] <= y1, hs
         for tr in view.trappers:
             carried |= tr["carry"]
             x, y = tr["x"], tr["y"]
@@ -3679,6 +3779,7 @@ def self_test():
                 assert ford and abs(x - ford[0][0]) < s, (x, y)
     assert {"set", "caught"} <= seen and carried, (seen, carried)
     assert sum(sum(p) for p in view.pelts) >= 1, view.pelts
+    assert grazed == {0, 1} and roamed > 0.25 * s, (grazed, roamed)
     pelts = [list(p) for p in view.pelts]
     where = [(tr["x"], tr["y"]) for tr in view.trappers]
 
