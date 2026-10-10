@@ -101,6 +101,7 @@ WATER_HI_RGB = (0.55, 0.75, 0.90)
 MUD_RGB = (0.27, 0.21, 0.14)
 STONE_RGB = (0.50, 0.50, 0.52)
 STONE_DARK_RGB = (0.33, 0.33, 0.36)
+ROCK_HI_RGB = (0.66, 0.66, 0.66)
 
 # What lives along the river.
 BEAVER_RGB = (0.45, 0.29, 0.17)
@@ -311,6 +312,7 @@ class CpuView(Gtk.DrawingArea):
         self.fort_box = None              # (x0, y0, x1, y1) as last drawn
         self.river = None                 # its course, as last laid out
         self.fords = [None, None]         # p where each trail crosses it
+        self.rocks = [None, None]         # each trail's cover, as last laid
         self.rng = random.Random(7)       # the wilds' only source of chance
         self.wild = None                  # the idle scene's layout, per size
         self.sites = []                   # trap sites along the banks
@@ -425,6 +427,9 @@ class CpuView(Gtk.DrawingArea):
     PACE = {"foot": 1.0, "horse": 2.6, "cannon": 0.45}
     HP = {"foot": 1, "horse": 1, "cannon": 5}
     WAVE_EVERY = (75.0, 105.0, 90.0)
+    COVER_P = 0.64      # where on the trail a boulder offers cover
+    HIDE_S = 9.5        # how long a man crouches behind it, at least...
+    LULL_S = 5.0        # ...and until he has not been shot at for this long
     AT_WALL = 2         # how many beat on the wall at once
     QUEUE_P = 0.08      # trail between each in the queue behind them
 
@@ -444,6 +449,12 @@ class CpuView(Gtk.DrawingArea):
         so a steady march seems to speed up as he comes closer."""
         far = 1 / cls.MARCH_FAR
         return (1 / d - far) / (1 / cls.MARCH_NEAR - far)
+
+    @classmethod
+    def _trail_d(cls, p):
+        """The distance at which a redcoat stands at screen position p."""
+        far = 1 / cls.MARCH_FAR
+        return 1 / (far + p * (1 / cls.MARCH_NEAR - far))
 
     # The call for relief, in seconds from the tower sentry's first note:
     # the walker hears it, runs to the gun, cranks it up and fires, then
@@ -532,9 +543,34 @@ class CpuView(Gtk.DrawingArea):
                              if rc["side"] == side and rc["hit"] is None
                              and rc["at_wall"] is None),
                             key=lambda rc: rc["d"])
+            rock = self.rocks[side]
+            nearest = min((rc for rc in self.redcoats if rc["side"] == side
+                           and rc["hit"] is None), key=lambda rc: rc["d"],
+                          default=None)
             for rc in moving:
+                if rc.get("hid") is not None:
+                    # Not until the fire on him slackens: under steady fire
+                    # he stays down until the third shot finds him.
+                    if self.phase - rc["hid"] < self.HIDE_S or \
+                            self.phase - rc["shot_at"] < self.LULL_S:
+                        continue
+                    rc["hid"], rc["rose"] = None, self.phase
+                was = self._trail_p(rc["d"])
                 rc["d"] = max(self.MARCH_NEAR,
                               rc["d"] - speed * self.PACE[rc["kind"]] * dt)
+                # A man on foot who reaches the boulder with a rifle on him
+                # drops behind it, once.
+                if rock and rc["kind"] == "foot" and "rock" not in rc \
+                        and was < self.COVER_P <= self._trail_p(rc["d"]) \
+                        and (self.drill_target[side] is rc
+                             or rc is nearest) \
+                        and not any(o.get("hid") is not None
+                                    and o["side"] == side
+                                    and o["hit"] is None
+                                    for o in self.redcoats):
+                    rc.update(d=rock["d"], hid=self.phase, rock=side,
+                              ducked=0, shot_at=self.phase)
+                    continue
                 k = len(halted)
                 stop = 1.0 if k < self.AT_WALL \
                     else 1.0 - self.QUEUE_P * (k - self.AT_WALL + 1)
@@ -595,9 +631,15 @@ class CpuView(Gtk.DrawingArea):
                 self.drill_target[i] = None
                 if self._calling(i):
                     continue  # his hands are on the horn
-                if nearest and self._trail_p(nearest["d"]) >= self.ENGAGE_P:
+                # He fires on men in the open before one behind a rock.
+                near = [rc for rc in targets
+                        if self._trail_p(rc["d"]) >= self.ENGAGE_P]
+                open_ = [rc for rc in near if rc.get("hid") is None]
+                pick = min(open_ or near, key=lambda rc: rc["d"],
+                           default=None)
+                if pick:
                     self.drill_start[i] = self.phase
-                    self.drill_target[i] = nearest
+                    self.drill_target[i] = pick
                     self.drill_fired[i] = False
                 continue
             tau = self._drill_t(i)
@@ -607,6 +649,16 @@ class CpuView(Gtk.DrawingArea):
                 self.drill_target[i] = target = nearest
             if tau >= self.SHOT_AT and not self.drill_fired[i]:
                 self.drill_fired[i] = True
+                if target is not None and target["hit"] is None \
+                        and target.get("hid") is not None:
+                    # Behind the boulder, only every third shot finds him.
+                    target["ducked"] += 1
+                    target["shot_at"] = self.phase
+                    if target["ducked"] % 3:
+                        rock = self.rocks[target["rock"]]
+                        if rock:
+                            rock["chip"] = self.phase
+                        continue
                 if target is not None and target["hit"] is None:
                     target["hp"] -= 1
                     target["struck"] = self.phase
@@ -1098,11 +1150,13 @@ class CpuView(Gtk.DrawingArea):
                 cr.fill()
 
     @staticmethod
-    def _redcoat(cr, x, feet, s, facing, step, fall, pound=-1.0, seed=0.0):
+    def _redcoat(cr, x, feet, s, facing, step, fall, pound=-1.0, seed=0.0,
+                 crouch=0.0):
         """A redcoat on the march, musket at the shoulder, in the same
         100-unit model as the mountain man. fall runs 0..1 as he topples
         backward and fades once he is shot; pound is the seconds he has
-        been beating on the fort's wall, or negative on the march."""
+        been beating on the fort's wall, or negative on the march. crouch
+        runs 0..1 as he drops to one knee."""
         if s < 1.5:
             return
         cr.save()
@@ -1114,30 +1168,42 @@ class CpuView(Gtk.DrawingArea):
         cr.set_line_cap(cairo.LINE_CAP_ROUND)
         cr.set_line_join(cairo.LINE_JOIN_ROUND)
 
-        def leg(swing):
+        drop = 26 * crouch
+
+        def lerp(a, b):
+            return (a[0] + (b[0] - a[0]) * crouch,
+                    a[1] + (b[1] - a[1]) * crouch)
+
+        def leg(swing, front):
             fx = math.sin(swing) * 36
+            knee = lerp((fx / 2, -24), (18, -24) if front else (-4, -5))
+            foot = lerp((fx, -2), (20, -2) if front else (-26, -3))
             cr.set_source_rgb(*KIT_RGB)
             cr.set_line_width(8)
-            cr.move_to(0, -46)
-            cr.line_to(fx, -2)
+            cr.move_to(0, -46 + drop)
+            cr.line_to(*knee)
+            cr.line_to(*foot)
             cr.stroke()
             cr.set_source_rgb(*HAT_RGB)
             cr.save()
-            cr.translate(fx + 3, -1.5)
+            cr.translate(foot[0] + 3, foot[1] + 0.5)
             cr.scale(6, 2.6)
             cr.arc(0, 0, 1, 0, 2 * math.pi)
             cr.restore()
             cr.fill()
 
-        leg(-step)
+        leg(-step, False)
         # Coat tails behind, then the coat, its white cross-belts on top.
+        cr.translate(0, drop)
         cr.set_source_rgb(*COAT_DARK_RGB)
         cr.move_to(-10, -52)
         cr.line_to(-17, -30)
         cr.line_to(-6, -36)
         cr.close_path()
         cr.fill()
-        leg(step)
+        cr.translate(0, -drop)
+        leg(step, True)
+        cr.translate(0, drop)
         CpuView._rc_upper(cr)
 
         if pound >= 0:
@@ -1495,11 +1561,24 @@ class CpuView(Gtk.DrawingArea):
         """At the wall itself, rather than waiting in the queue behind."""
         return rc["at_wall"] is not None and rc["slot"] < self.AT_WALL
 
+    def _cover(self, rc):
+        """How far a redcoat has stepped off the trail behind his boulder,
+        0..1: he ducks in quickly and steps out again more slowly."""
+        if "rock" not in rc or not self.rocks[rc["rock"]]:
+            return 0.0
+        if rc["hid"] is not None:
+            return self._ramp(self.phase - rc["hid"], 0.0, 0.35)
+        return 1.0 - self._ramp(self.phase - rc["rose"], 0.0, 0.6)
+
     def _redcoat_at(self, rc):
         """Where a redcoat stands: (x, feet, size)."""
         p = self._trail_p(rc["d"])
         x, y = self._bezier(self.trails[rc["side"]], p)
         size = self.redcoat_s * self._depth_scale(p)
+        cover = self._cover(rc)
+        if cover > 0:
+            rock = self.rocks[rc["rock"]]
+            x += (rock["x"] + rock["inward"] * rock["w"] * 0.08 - x) * cover
         if self._at_wall(rc):
             outward = -1 if rc["side"] == 0 else 1
             x += outward * size * (self.STANDOFF[rc["kind"]]
@@ -1612,9 +1691,112 @@ class CpuView(Gtk.DrawingArea):
             cr.arc(px, py, max(0.6, size * 0.035), 0, 2 * math.pi)
             cr.fill()
 
+    def _lay_rocks(self):
+        """A boulder at the outer edge of each trail at COVER_P, unless
+        the trail is in the river there. Between the fort's wall and the
+        trail there is no room for one."""
+        old = self.rocks
+        self.rocks = [None, None]
+        mud = self.river["half"] * 0.35 + 1
+        for side, pts in enumerate(self.trails):
+            x, y = self._bezier(pts, self.COVER_P)
+            size = self.redcoat_s * self._depth_scale(self.COVER_P)
+            inward = 1 if side == 0 else -1
+            x -= inward * size * 0.75
+            base, h = y + 0.12 * size, 0.55 * size
+            if abs(base - self._river_y(x)) < self._river_half(x) + mud + h:
+                continue
+            self.rocks[side] = {
+                "x": x, "base": base, "w": 1.1 * size, "h": h,
+                "inward": inward, "d": self._trail_d(self.COVER_P),
+                "chip": old[side]["chip"] if old[side] else None}
+
+    @staticmethod
+    def _rock(cr, x, base, w, h, seed):
+        """A lumpy boulder sitting on the ground at base, w wide, h high,
+        lit from the upper left. seed shapes its lumps, the same each
+        frame."""
+        n = 7
+        pts = []
+        for k in range(n + 1):
+            a = math.pi * k / n
+            lump = 0.85 + 0.25 * ((seed * 0.37 + k * 0.618) % 1.0)
+            r = 1.0 if k in (0, n) else lump
+            pts.append((x - math.cos(a) * w / 2 * r,
+                        base - math.sin(a) * h * r))
+        cr.move_to(*pts[0])
+        for pt in pts[1:]:
+            cr.line_to(*pt)
+        cr.close_path()
+        cr.set_source_rgb(*STONE_RGB)
+        cr.fill_preserve()
+        cr.save()
+        cr.clip()
+        cr.set_source_rgb(*STONE_DARK_RGB)
+        cr.move_to(x - w * 0.1, base + 1)
+        cr.curve_to(x + w * 0.1, base - h * 0.45, x + w * 0.3,
+                    base - h * 0.7, x + w * 0.6, base - h * 0.9)
+        cr.line_to(x + w * 0.6, base + 1)
+        cr.close_path()
+        cr.fill()
+        cr.set_source_rgba(*ROCK_HI_RGB, 0.8)
+        cr.save()
+        cr.translate(x - w * 0.18, base - h * 0.78)
+        cr.scale(w * 0.18, h * 0.12)
+        cr.arc(0, 0, 1, 0, 2 * math.pi)
+        cr.restore()
+        cr.fill()
+        cr.restore()
+        cr.set_source_rgba(0, 0, 0, 0.3)
+        cr.set_line_width(max(0.6, h * 0.04))
+        cr.move_to(x - w * 0.55, base + 0.5)
+        cr.line_to(x + w * 0.55, base + 0.5)
+        cr.stroke()
+
+    @staticmethod
+    def _chips(cr, x, y, size, e):
+        """A ball striking stone at (x, y), e seconds on: a puff of dust
+        and chips of rock flying."""
+        if not 0 <= e < 0.6:
+            return
+        u = e / 0.6
+        cr.set_source_rgba(*SMOKE_RGB, 0.55 * (1 - u))
+        for k in range(3):
+            cr.arc(x + (k - 1) * size * 0.12 * (0.5 + u),
+                   y - size * (0.05 + 0.2 * u) - k % 2 * size * 0.06,
+                   size * (0.1 + 0.18 * u), 0, 2 * math.pi)
+            cr.fill()
+        cr.set_source_rgba(*FLASH_RGB, max(0.0, 1 - u * 6))
+        cr.arc(x, y, size * 0.05, 0, 2 * math.pi)
+        cr.fill()
+        cr.set_source_rgba(*ROCK_HI_RGB, 1 - u)
+        for k in range(5):
+            a = -math.pi * (0.15 + 0.17 * k)
+            v = size * (0.9 + 0.3 * (k % 2))
+            cr.rectangle(x + math.cos(a) * v * e - size * 0.025,
+                         y + math.sin(a) * v * e + size * 2.5 * e * e,
+                         size * 0.05, size * 0.05)
+            cr.fill()
+
+    def _draw_rock(self, cr, rock):
+        self._rock(cr, rock["x"], rock["base"], rock["w"], rock["h"],
+                   rock["inward"])
+        if rock["chip"] is not None:
+            # The ball comes in from the fort's side of the boulder.
+            self._chips(cr, rock["x"] + rock["inward"] * rock["w"] * 0.15,
+                        rock["base"] - rock["h"] * 0.85, rock["h"] * 1.6,
+                        self.phase - rock["chip"])
+
     def _draw_redcoats(self, cr):
         self._draw_stains(cr)
-        for rc in sorted(self.redcoats, key=lambda rc: -rc["d"]):
+        # Each boulder is drawn just after anyone crouched behind it, and
+        # before anyone nearer the fort.
+        items = [(-rc["d"], 0, rc) for rc in self.redcoats]
+        items += [(-rock["d"], 1, rock) for rock in self.rocks if rock]
+        for _, is_rock, rc in sorted(items, key=lambda it: it[:2]):
+            if is_rock:
+                self._draw_rock(cr, rc)
+                continue
             x, feet, size = self._redcoat_at(rc)
             p = self._trail_p(rc["d"])
             pts = self.trails[rc["side"]]
@@ -1656,10 +1838,13 @@ class CpuView(Gtk.DrawingArea):
                              (self.MARCH_FAR - rc["d"]) * 9, fall, struck,
                              boom)
             else:
+                cover = self._cover(rc)
                 step = math.sin(self.phase * 6.5 + rc["n"] * 1.7) * 0.35 \
-                    if marching else 0.0
+                    if marching and rc.get("hid") is None else 0.0
+                if cover > 0:
+                    facing = toward  # he keeps his eyes on the fort
                 self._redcoat(cr, x, feet, size, facing, step, fall, pound,
-                              rc["n"] * 1.3)
+                              rc["n"] * 1.3, crouch=cover)
             if not alive:
                 # The man bleeds, whether rider, gunner or foot.
                 bx = x - facing * size * 0.55 if kind == "cannon" else x
@@ -2835,6 +3020,7 @@ class CpuView(Gtk.DrawingArea):
             self.trails = [pts, tuple((width - px, py) for px, py in pts)]
             self._draw_trails(cr)
             self._find_fords()
+            self._lay_rocks()
             self._draw_fords(cr)
             for i in (0, 1):
                 self._draw_barracks(cr, i)
@@ -3821,7 +4007,7 @@ def self_test():
         side = 1 if facing > 0 else 0
         assert view._drill(side)[2] >= 0, "the sentry he faces fires"
 
-    # Two minutes of siege: redcoats come, the sentries shoot each one well
+    # Some minutes of siege: redcoats come, the sentries shoot each one well
     # before he reaches the fort, and nobody is left standing at its foot.
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], True)
@@ -3835,15 +4021,17 @@ def self_test():
             if frame % every == 0:
                 view._draw(view, cr, 1024, 680)
 
-    view.phase, hits, closest = 0.0, set(), 0.0
-    for frame in range(120 * 30):
+    view.phase, hits, closest, hid = 0.0, set(), 0.0, False
+    for frame in range(150 * 30):
         run(1 / 30, 1 if frame % 15 == 0 else 2)
         for rc in view.redcoats:
+            hid |= rc.get("hid") is not None
             if rc["hit"] is None:
                 closest = max(closest, view._trail_p(rc["d"]))
             else:
                 hits.add(rc["n"])
     assert len(hits) >= 10, hits
+    assert hid, "a redcoat under fire takes cover"
     assert closest < 0.9, f"a redcoat got to {closest:.2f} of the trail"
 
     # A click on a barracks sends out a file, once a double click could no
@@ -3862,7 +4050,9 @@ def self_test():
     for _ in range(150):
         run(1, 10)
         cannons += [rc for rc in view.redcoats
-                    if rc["kind"] == "cannon" and rc not in cannons]
+                    if rc["kind"] != "foot" and rc not in cannons]
+    assert not any("rock" in rc for rc in cannons), "only foot take cover"
+    cannons = [rc for rc in cannons if rc["kind"] == "cannon"]
     assert not view.called[0] and len(cannons) == 1, cannons
     assert cannons[0]["hp"] == 0, "the cannon takes five hits"
     assert not any(rc["kind"] != "foot" for rc in view.redcoats
@@ -3895,6 +4085,51 @@ def self_test():
                    if rc["hit"] is None), "the gun clears the wall"
     assert view.gun_at == view.GUN_POST[0], "the gun stays where wheeled"
     assert view.stains, "the fallen leave blood"
+
+    # A boulder beside each trail; a man on foot under fire ducks behind
+    # it, and of the shots at him there, the first two of every three
+    # strike the rock instead.
+    view._draw(view, cr, 1024, 680)
+    for side, rock in enumerate(view.rocks):
+        assert rock and rock["d"] == view._trail_d(view.COVER_P), rock
+        x = view._bezier(view.trails[side], view.COVER_P)[0]
+        assert (rock["x"] - x) * rock["inward"] < 0, "beside the trail"
+    view.relief = None
+    view.spawn_in = view.wave_in = 1e9
+
+    def foot(n):
+        view.redcoats.append({"side": 0, "d": view._trail_d(0.6),
+                              "hit": None, "n": n, "born": view.phase,
+                              "kind": "foot", "hp": 1, "struck": None,
+                              "at_wall": None, "slot": 0})
+        return view.redcoats[-1]
+
+    view.redcoats = []
+    view.drill_start = [None, None]
+    rc = foot(7)
+    run(1.5, 3)
+    assert rc["hid"] is not None and rc["d"] == view.rocks[0]["d"], rc
+    shots = []
+    for _ in range(int((3 * view.DRILL_LEN + 3) * 30)):
+        fired = view.drill_fired[0]
+        run(1 / 30, 1)
+        if view.drill_fired[0] and not fired:
+            shots.append((rc["hp"], view.rocks[0]["chip"], view.phase))
+        if len(shots) == 3:
+            break
+    assert [hp for hp, _, _ in shots] == [1, 1, 0], shots
+    assert all(abs(chip - at) < 0.1 for _, chip, at in shots[:2]), shots
+    assert rc["hit"] is not None and rc["hid"] is not None, "shot in cover"
+
+    # Left alone there, he moves on in a while.
+    view.redcoats = []
+    view.drill_start = [view.phase + 1e9, None]  # holding his fire
+    rc = foot(8)
+    run(1.5, 3)
+    assert rc["hid"] is not None, "he ducks"
+    run(view.HIDE_S + 0.5, 5)
+    assert rc["hid"] is None and view._trail_p(rc["d"]) > view.COVER_P, rc
+    view.drill_start = [None, None]
 
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
     assert not view.redcoats and not view.called[0], "standing down clears"
