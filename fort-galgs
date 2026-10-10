@@ -74,6 +74,7 @@ WINDOW_RGB = (0.98, 0.80, 0.45)
 HORSE_RGB = (0.40, 0.25, 0.15)
 HORSE_DARK_RGB = (0.26, 0.15, 0.09)
 IRON_RGB = (0.22, 0.22, 0.25)
+BALL_RGB = (0.62, 0.63, 0.68)
 
 # The grove that grows there while the fort is down.
 PINE_RGB = (0.12, 0.34, 0.22)
@@ -270,6 +271,9 @@ class CpuView(Gtk.DrawingArea):
         self.spawn_in = 1.0
         self.called = [[], []]            # kinds waiting at each barracks
         self.pending_call = None          # (side, phase) of a lone click
+        self.relief = None                # a tower's call for the gun
+        self.has_walker = False           # room on the wall for him to walk
+        self.gun_facing = 1
         self.wave_in = 45.0
         self.waves = 0
         self.barracks_box = [None, None]  # (x0, y0, x1, y1) as last drawn
@@ -296,6 +300,7 @@ class CpuView(Gtk.DrawingArea):
             self.redcoats = []
             self.called = [[], []]
             self.pending_call = None
+            self.relief = None
             self.drill_start = [None, None]
             self.drill_target = [None, None]
         self.on = on
@@ -358,7 +363,8 @@ class CpuView(Gtk.DrawingArea):
                 # double click does not also send the file.
                 self.pending_call = (i, self.phase)
             return
-        if not self._on_fort(x, y) or self._bugling():
+        if not self._on_fort(x, y) or self._bugling() \
+                or self.relief is not None:
             return
         self.bugle_at = self.phase
         i = 1 if self.walker_facing > 0 else 0
@@ -402,13 +408,61 @@ class CpuView(Gtk.DrawingArea):
         far = 1 / cls.MARCH_FAR
         return (1 / d - far) / (1 / cls.MARCH_NEAR - far)
 
+    # The call for relief, in seconds from the tower sentry's first note:
+    # the walker hears it, runs to the gun, cranks it up and fires, then
+    # runs back while the ball flies.
+    HEARD_AT = 0.6
+    RUN_S = 1.0
+    FIRE_AT = 3.1
+    FLIGHT_S = 1.7
+    RELIEF_LEN = FIRE_AT + FLIGHT_S + 1.0
+    BLAST_P = 0.85      # the blast takes queued redcoats this near the wall
+
+    def _relief_t(self):
+        r = self.relief
+        return None if r is None else self.phase - r["t0"]
+
+    def _calling(self, i):
+        """Tower sentry i is blowing his horn for the gun."""
+        t = self._relief_t()
+        return t is not None and self.relief["side"] == i \
+            and t < self.BUGLE_LEN
+
+    def _advance_relief(self):
+        """A tower sentry with redcoats at the foot of his wall calls for
+        the gun; when the ball lands, it takes them all."""
+        r = self.relief
+        if r is None:
+            if not self.has_walker or self._bugling():
+                return
+            for i in (0, 1):
+                if not self._busy(i) and any(
+                        rc["side"] == i and rc["hit"] is None
+                        and self._at_wall(rc) for rc in self.redcoats):
+                    self.relief = {"side": i, "t0": self.phase,
+                                   "landed": False}
+                    return
+            return
+        t = self.phase - r["t0"]
+        if not r["landed"] and t >= self.FIRE_AT + self.FLIGHT_S:
+            r["landed"] = True
+            for rc in self.redcoats:
+                if rc["side"] == r["side"] and rc["hit"] is None and (
+                        self._at_wall(rc)
+                        or self._trail_p(rc["d"]) >= self.BLAST_P):
+                    rc["hp"] = 0
+                    rc["hit"] = self.phase
+        if t >= self.RELIEF_LEN:
+            self.relief = None
+
     def _advance(self, dt):
         """Step the scene: the walker's halts, the redcoats' march, and the
         sentries choosing whom to shoot."""
-        if self._bugling():
+        if self._bugling() or self.relief is not None:
             self.walker_halted += dt
         if not self.on:
             return
+        self._advance_relief()
         speed = (self.MARCH_FAR - self.MARCH_NEAR) / self.MARCH_S
         for side in (0, 1):
             # Two at a time beat on the wall; the rest wait in a queue back
@@ -485,6 +539,8 @@ class CpuView(Gtk.DrawingArea):
             nearest = min(targets, key=lambda rc: rc["d"], default=None)
             if not self._busy(i):
                 self.drill_target[i] = None
+                if self._calling(i):
+                    continue  # his hands are on the horn
                 if nearest and self._trail_p(nearest["d"]) >= self.ENGAGE_P:
                     self.drill_start[i] = self.phase
                     self.drill_target[i] = nearest
@@ -1138,10 +1194,13 @@ class CpuView(Gtk.DrawingArea):
         cr.restore()
 
     @staticmethod
-    def _cannon(cr, x, feet, s, facing, roll, fall, struck, boom):
+    def _cannon(cr, x, feet, s, facing, roll, fall, struck, boom, elev=0.12,
+                crank=None):
         """A field gun on its carriage, in the same 100-unit model. roll
         turns the wheel; struck and boom are the seconds since it was hit
-        and since it fired, or negative."""
+        and since it fired, or negative. elev is the barrel's angle above
+        level; crank, if given, is the angle of the handle on its elevating
+        gear. Returns the muzzle in the model's units."""
         if s < 1.5:
             return
         cr.save()
@@ -1163,7 +1222,7 @@ class CpuView(Gtk.DrawingArea):
         cr.fill()
         cr.save()
         cr.translate(-2, -27)
-        cr.rotate(-0.12)
+        cr.rotate(-elev)
         cr.set_source_rgb(*IRON_RGB)
         cr.move_to(-12, -6)
         cr.line_to(36, -4)
@@ -1176,7 +1235,19 @@ class CpuView(Gtk.DrawingArea):
         cr.arc(-14, 0, 3.5, 0, 2 * math.pi)
         cr.fill()
         cr.restore()
-        muzzle = (-2 + 38 * math.cos(-0.12), -27 + 38 * math.sin(-0.12))
+        muzzle = (-2 + 38 * math.cos(elev), -27 - 38 * math.sin(elev))
+        if crank is not None:
+            # The elevating gear on the carriage cheek, and its handle.
+            cr.set_source_rgb(*STEEL_RGB)
+            cr.set_line_width(2)
+            cr.arc(-10, -34, 6, 0, 2 * math.pi)
+            cr.stroke()
+            hx, hy = -10 + math.cos(crank) * 9, -34 + math.sin(crank) * 9
+            cr.move_to(-10, -34)
+            cr.line_to(hx, hy)
+            cr.stroke()
+            cr.arc(hx, hy, 2, 0, 2 * math.pi)
+            cr.fill()
 
         cr.set_source_rgb(*SEAM_RGB)
         cr.set_line_width(3.5)
@@ -1204,21 +1275,23 @@ class CpuView(Gtk.DrawingArea):
             cr.stroke()
         if 0 <= boom < 2.0:
             mx, my = muzzle
+            dx, dy = math.cos(elev), -math.sin(elev)
             u = boom / 2.0
             for j in range(3):
+                reach = 8 + 30 * math.sqrt(u) + 8 * j
                 cr.set_source_rgba(*SMOKE_RGB, 0.6 * (1 - u))
-                cr.arc(mx + 8 + 30 * math.sqrt(u) + 8 * j,
-                       my - 10 * u - 4 * j, 6 + 14 * math.sqrt(u) + 3 * j,
-                       0, 2 * math.pi)
+                cr.arc(mx + dx * reach, my + dy * reach - 10 * u - 4 * j,
+                       6 + 14 * math.sqrt(u) + 3 * j, 0, 2 * math.pi)
                 cr.fill()
             if boom < 0.15:
-                CpuView._glow(cr, mx + 6, my, 34, FLASH_RGB,
+                CpuView._glow(cr, mx + 6 * dx, my + 6 * dy, 34, FLASH_RGB,
                               1 - boom / 0.15)
 
         if fall > 0:
             cr.pop_group_to_source()
             cr.paint_with_alpha(max(0.0, 1.0 - fall))
         cr.restore()
+        return muzzle
 
     def _draw_fort(self, cr, x, y, w, h, t):
         """The stockade around the yard (x, y, w, h), its gate and towers;
@@ -1297,13 +1370,16 @@ class CpuView(Gtk.DrawingArea):
     def _bugling(self):
         return self._bugle_t() < self.BUGLE_LEN
 
-    def _bugle(self):
-        """The walker's call. Returns (how far the bugle is raised, seconds
-        since he began to blow or -1)."""
-        tau = self._bugle_t()
+    def _horn(self, tau):
+        """A call tau seconds in. Returns (how far the horn is raised,
+        seconds since he began to blow or -1)."""
         raised = self._ramp(tau, 0.0, 0.35) - self._ramp(tau, 1.6, 1.95)
         toot = tau - 0.45 if 0.45 <= tau < 1.6 else -1.0
         return raised, toot
+
+    def _bugle(self):
+        """The walker's call."""
+        return self._horn(self._bugle_t())
 
     @staticmethod
     def _bezier(pts, p):
@@ -1455,6 +1531,12 @@ class CpuView(Gtk.DrawingArea):
         s = t * 0.85
         for i, tx in enumerate(towers):
             outward = -1 if i == 0 else 1
+            if self._calling(i):
+                # Turned toward the middle, blowing for the gun.
+                raised, toot = self._horn(self._relief_t())
+                self._mountain_man(cr, tx, floor, s, -outward, bugle=raised,
+                                   toot=toot)
+                continue
             kneel, aim, shot = self._drill(i)
             if self._drilling(i):
                 elev = 0.04
@@ -1474,20 +1556,135 @@ class CpuView(Gtk.DrawingArea):
             self._mountain_man(cr, tx, floor, s, -outward if glance
                                else outward, glint=glint)
         x0, x1 = walk
-        if x1 - x0 > s * 0.6:
-            # One more walks the wall from tower to tower and back, and
-            # stands still while he sounds his bugle.
-            walked = self.phase - self.walker_halted
-            u = (walked / 9.0) % 2.0
-            pos = u if u < 1.0 else 2.0 - u
-            ease = 0.5 - 0.5 * math.cos(pos * math.pi)
-            self.walker_facing = 1 if u < 1.0 else -1
-            bugling = self._bugling()
+        self.has_walker = x1 - x0 > s * 0.6
+        if not self.has_walker:
+            return
+        # One more walks the wall from tower to tower and back, and stands
+        # still while he sounds his bugle or works the gun.
+        walked = self.phase - self.walker_halted
+        u = (walked / 9.0) % 2.0
+        pos = u if u < 1.0 else 2.0 - u
+        patrol = x0 + (x1 - x0) * (0.5 - 0.5 * math.cos(pos * math.pi))
+        self.walker_facing = 1 if u < 1.0 else -1
+        ws = s * 0.92
+
+        # The fort's gun stands in the middle of the wall walk.
+        gun_x, gs = (x0 + x1) / 2, s * 1.25
+        rt = self._relief_t()
+        if rt is not None:
+            self.gun_facing = -1 if self.relief["side"] == 0 else 1
+        gf = self.gun_facing
+        pivot = (gun_x - gf * 2 * gs / 100, walk_y - 27 * gs / 100)
+        elev, crank, boom, ball = 0.12, None, -1.0, None
+        if rt is not None:
+            side = self.relief["side"]
+            nx, ny = self.trails[side][3]
+            land = (nx + gf * self.redcoat_s * 0.25, ny)
+            # A high lob, so the ball clears the tower sentry's head.
+            reach = abs(land[0] - pivot[0])
+            lift = 1.4 * reach
+            aim = math.atan2(4 * lift - (land[1] - pivot[1]), reach)
+            cranked = self._ramp(rt, self.HEARD_AT + self.RUN_S, self.FIRE_AT)
+            lowered = self._ramp(rt, self.RELIEF_LEN - 0.8, self.RELIEF_LEN)
+            elev = 0.12 + (aim - 0.12) * (cranked - lowered)
+            if self.HEARD_AT + self.RUN_S <= rt < self.FIRE_AT:
+                crank = rt * 9.0
+            boom = rt - self.FIRE_AT
+            fly = (rt - self.FIRE_AT) / self.FLIGHT_S
+            if 0 <= fly < 1:
+                ball = (pivot[0] + (land[0] - pivot[0]) * fly,
+                        pivot[1] + (land[1] - pivot[1]) * fly
+                        - 4 * lift * fly * (1 - fly))
+        handle = None
+        if crank is not None:
+            handle = (gun_x + gf * (-10 + math.cos(crank) * 9) * gs / 100,
+                      walk_y + (-34 + math.sin(crank) * 9) * gs / 100)
+        self._cannon(cr, gun_x, walk_y, gs, gf, 0.0, 0.0, -1.0, boom, elev,
+                     crank if crank is not None else 0.0)
+
+        if rt is None:
             raised, toot = self._bugle()
-            step = 0.0 if bugling else math.sin(walked * 7.0) * 0.38
-            self._mountain_man(cr, x0 + (x1 - x0) * ease, walk_y, s * 0.92,
-                               self.walker_facing, step=step,
-                               shouldered=True, bugle=raised, toot=toot)
+            step = 0.0 if self._bugling() \
+                else math.sin(walked * 7.0) * 0.38
+            self._mountain_man(cr, patrol, walk_y, ws, self.walker_facing,
+                               step=step, shouldered=True, bugle=raised,
+                               toot=toot)
+        else:
+            # He runs to his place behind the gun, kneels to crank it up,
+            # and once it has fired runs back to where he left off.
+            station = gun_x - gf * gs * 0.3
+            there = self.HEARD_AT + self.RUN_S
+            back = self.FIRE_AT + 0.5
+            if rt < self.HEARD_AT or rt >= back + self.RUN_S:
+                wx, facing, run = patrol, self.walker_facing, False
+            elif rt < there:
+                k = self._ramp(rt, self.HEARD_AT, there)
+                wx, run = patrol + (station - patrol) * k, True
+                facing = 1 if station >= patrol else -1
+            elif rt < back:
+                wx, facing, run = station, gf, False
+            else:
+                k = self._ramp(rt, back, back + self.RUN_S)
+                wx, run = station + (patrol - station) * k, True
+                facing = 1 if patrol >= station else -1
+            kneel = self._ramp(rt, there, there + 0.3) \
+                - self._ramp(rt, back - 0.3, back)
+            step = math.sin(self.phase * 14.0) * 0.55 if run else 0.0
+            self._mountain_man(cr, wx, walk_y, ws, facing, step=step,
+                               shouldered=kneel == 0 and not handle,
+                               kneel=kneel)
+            if handle is not None:
+                # His near arm on the crank handle.
+                sx = wx + facing * 6 * ws / 100
+                sy = walk_y + (-75 + 20 * kneel) * ws / 100
+                cr.set_source_rgb(*BUCK_RGB)
+                cr.set_line_width(6 * ws / 100)
+                cr.set_line_cap(cairo.LINE_CAP_ROUND)
+                cr.move_to(sx, sy)
+                cr.line_to(*handle)
+                cr.stroke()
+                cr.set_source_rgb(*SKIN_RGB)
+                cr.arc(*handle, 3 * ws / 100, 0, 2 * math.pi)
+                cr.fill()
+
+        if ball is not None:
+            r = max(2.5, gs * 0.045)
+            for j in range(4):
+                back_u = max(0.0, fly - 0.03 * (j + 1))
+                tx_ = pivot[0] + (land[0] - pivot[0]) * back_u
+                ty_ = pivot[1] + (land[1] - pivot[1]) * back_u \
+                    - 4 * lift * back_u * (1 - back_u)
+                cr.set_source_rgba(*SMOKE_RGB, 0.25 - 0.05 * j)
+                cr.arc(tx_, ty_, r * (0.9 - 0.15 * j), 0, 2 * math.pi)
+                cr.fill()
+            # Light enough to see against the night sky.
+            cr.arc(*ball, r, 0, 2 * math.pi)
+            cr.set_source_rgb(*BALL_RGB)
+            cr.fill_preserve()
+            cr.set_source_rgb(*HAT_RGB)
+            cr.set_line_width(max(0.8, r * 0.3))
+            cr.stroke()
+        if rt is not None and 0 <= rt - self.FIRE_AT - self.FLIGHT_S < 1.0:
+            self._blast(cr, land, rt - self.FIRE_AT - self.FLIGHT_S)
+
+    def _blast(self, cr, at, e):
+        """The ball landing at the foot of the wall, e seconds on."""
+        x, y = at
+        size = self.redcoat_s
+        self._glow(cr, x, y - size * 0.2, size * (0.6 + 0.8 * e), FLASH_RGB,
+                   max(0.0, 1.0 - e * 1.4))
+        for k in range(9):
+            a = -math.pi * (0.1 + 0.8 * k / 8)
+            v = size * (1.1 + 0.3 * (k % 3))
+            px = x + math.cos(a) * v * e
+            py = y + math.sin(a) * v * e + size * 2.2 * e * e
+            cr.set_source_rgba(*PATH_RGB, max(0.0, 1.0 - e))
+            cr.arc(px, py, size * 0.05, 0, 2 * math.pi)
+            cr.fill()
+        cr.set_source_rgba(*SMOKE_RGB, 0.5 * max(0.0, 1.0 - e))
+        cr.arc(x, y - size * (0.3 + 0.4 * e), size * (0.25 + 0.4 * e), 0,
+               2 * math.pi)
+        cr.fill()
 
     # -- the grove, where the fort stands when it is down ------------------
 
@@ -2595,6 +2792,20 @@ def self_test():
                if rc["n"] == 99), "they reach the wall"
     slots = sorted(rc["slot"] for rc in view.redcoats if rc["n"] == 99)
     assert slots == sorted(set(slots)), f"one place each: {slots}"
+
+    # With redcoats at his wall, the tower sentry calls for the gun, and
+    # its ball clears them off.
+    view.redcoats = [rc for rc in view.redcoats if rc["n"] == 99]
+    view.called = [[], []]
+    view.spawn_in = view.wave_in = 1e9
+    view.drill_start = [None, None]
+    view.relief = None
+    run(0.2, 1)
+    assert view.relief and view.relief["side"] == 0 and view._calling(0)
+    run(view.RELIEF_LEN, 3)
+    assert view.relief is None
+    assert not any(view._at_wall(rc) for rc in view.redcoats
+                   if rc["hit"] is None), "the gun clears the wall"
 
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
     assert not view.redcoats and not view.called[0], "standing down clears"
