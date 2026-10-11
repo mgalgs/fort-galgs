@@ -275,8 +275,9 @@ class CpuView(Gtk.DrawingArea):
     men watch from its towers and walk its wall, redcoats march on it down
     trails from barracks in the far corners or come down the river in
     boats, take cover behind boulders, and the sentries and the fort's gun
-    see them off. Most boats row on by; now and then one puts its men
-    ashore at a ford. While it is down, a grove grows there instead and those
+    see them off. Most boats row on by, and the one walking the wall takes
+    shots at them as they pass; now and then one puts its men ashore at a
+    ford. While it is down, a grove grows there instead and those
     cores look like every other; woods fill the land, two trappers work a
     trap line along the banks and stack their pelts, and loose horses
     graze. Which state it is in never depends on telling orange from blue.
@@ -315,6 +316,11 @@ class CpuView(Gtk.DrawingArea):
         self.bugle_at = None              # phase the walker last sounded
         self.walker_halted = 0.0          # seconds he has stood still
         self.walker_facing = 1            # as last drawn
+        self.walker_at = None             # (x, feet) as last drawn
+        self.sentries_at = None           # (towers, floor, size) as drawn
+        self.potshot = None               # his shot at a boat, if taking one
+        self.potshot_after = 0.0          # phase he may next shoot at one
+        self.overboard = []               # men shot out of the boats
         self.fort_box = None              # (x0, y0, x1, y1) as last drawn
         self.river = None                 # its course, as last laid out
         self.fords = [None, None]         # p where each trail crosses it
@@ -345,6 +351,8 @@ class CpuView(Gtk.DrawingArea):
             # Standing down sends everyone home; the next siege starts fresh.
             self.redcoats = []
             self.boats = []
+            self.potshot = None
+            self.overboard = []
             self.called = [[], []]
             self.pending_call = None
             self.relief = None
@@ -423,7 +431,8 @@ class CpuView(Gtk.DrawingArea):
             if self.on and self._on_river(x, y):
                 self._launch_boat(0 if x < self.river["w"] / 2 else 1)
             return
-        if self._bugling() or self.relief is not None:
+        if self._bugling() or self.relief is not None \
+                or self.potshot is not None:
             return
         self.bugle_at = self.phase
         i = 1 if self.walker_facing > 0 else 0
@@ -506,7 +515,9 @@ class CpuView(Gtk.DrawingArea):
         the gun; when the ball lands, it takes them all."""
         r = self.relief
         if r is None:
-            if not self.has_walker or self._bugling():
+            # Called while the walker shoots at a boat, it waits for him.
+            if not self.has_walker or self._bugling() \
+                    or self.potshot is not None:
                 return
             for i in (0, 1):
                 if not self._busy(i) and any(
@@ -541,12 +552,14 @@ class CpuView(Gtk.DrawingArea):
     def _advance(self, dt):
         """Step the scene: the walker's halts, the redcoats' march, and the
         sentries choosing whom to shoot."""
-        if self._bugling() or self.relief is not None:
+        if self._bugling() or self.relief is not None \
+                or self.potshot is not None:
             self.walker_halted += dt
         if not self.on:
             self._advance_wilds(dt)
             return
         self._advance_relief()
+        self._advance_potshot()
         speed = (self.MARCH_FAR - self.MARCH_NEAR) / self.MARCH_S
         for side in (0, 1):
             # Two at a time beat on the wall; the rest wait in a queue back
@@ -698,6 +711,7 @@ class CpuView(Gtk.DrawingArea):
     LAND_GAP_S = 1.4    # between one man stepping ashore and the next
     ASHORE_S = 0.6      # a man takes this long to step from the bow
     LAND_EVERY = 5      # one boat in this many puts in; the rest row by
+    CREW_X = (-64, 45, 8, -28)  # the steersman, then the oars, in the model
 
     def _launch_boat(self, side):
         """Put a boat in at the upstream edge, bound for side's ford, or
@@ -711,7 +725,7 @@ class CpuView(Gtk.DrawingArea):
         lands = self.boats_sent % self.LAND_EVERY == self.LAND_EVERY - 1
         self.boats.append({"side": side, "x": -self._boat_m(side) * 0.9,
                            "men": self.BOAT_MEN, "landed": None,
-                           "next_at": 0.0, "left": None,
+                           "next_at": 0.0, "left": None, "adrift": None,
                            "lands": lands, "n": self.boats_sent})
         self.boats_sent += 1
         return True
@@ -726,7 +740,8 @@ class CpuView(Gtk.DrawingArea):
         """Where the boat's middle comes to rest, its bow just short of
         the ford's stones; None if it is not putting in at a ford."""
         p = self.fords[b["side"]]
-        if p is None or self.trails is None or not b["lands"]:
+        if p is None or self.trails is None or not b["lands"] \
+                or b["men"] == 0:
             return None
         x = self._bezier(self.trails[b["side"]], p)[0]
         stones = self.redcoat_s * 0.5 * self._depth_scale(p) * 0.9
@@ -753,6 +768,9 @@ class CpuView(Gtk.DrawingArea):
         stop = self._boat_stop(b)
         if b["left"] is not None:
             pull = 1.0 - self._ramp(self.phase - b["left"], 0.0, 2.5)
+        elif b["adrift"] is not None:
+            t, pull = b["adrift"]
+            pull *= 1.0 - self._ramp(self.phase - t, 0.0, 2.5)
         elif stop is None:
             pull = 0.0
         else:
@@ -766,11 +784,16 @@ class CpuView(Gtk.DrawingArea):
         x, y, _ = self._boat_at(b)
         return x + self._boat_m(b["side"]) * 0.75, y
 
+    def _aboard(self, b, k):
+        """Where the k-th of the boat's crew sits: (x, waterline)."""
+        x, y, _ = self._boat_at(b)
+        return x + self.CREW_X[k] * self._boat_m(b["side"]) / 100, y
+
     def _advance_boats(self, dt):
         """Boats come down the river now and then, alternating fords. Most
         row on past both and away; one in a few pulls in at its ford, its
         men step ashore onto the trail one by one, and the empty boat
-        drifts on downstream."""
+        drifts on downstream. One whose crew is shot drifts off too."""
         if self.trails is None or self.river is None:
             return
         self.boat_in -= dt
@@ -803,10 +826,89 @@ class CpuView(Gtk.DrawingArea):
                 if b["left"] is not None:
                     v *= 0.3 + 0.7 * self._ramp(self.phase - b["left"],
                                                 0.0, 3.0)
+                elif b["adrift"] is not None:
+                    v *= 0.6
                 b["x"] += v * dt
         self.boats = [b for b in self.boats
                       if b["x"] < self.river["w"] + 2 * self._boat_m(
                           b["side"])]
+        for f in self.overboard:
+            if f["at"] is None and self.phase - f["t0"] >= self.SLUMP_S:
+                f["at"] = self._aboard(f["boat"], f["slot"])
+        self.overboard = [f for f in self.overboard
+                          if self.phase - f["t0"] < self.STAIN_S]
+
+    # -- the walker's shots at the boats ----------------------------------
+
+    POTSHOT_REST = 6.0  # seconds he patrols, at least, between his shots
+    SLUMP_S = 0.4       # a man shot in a boat slumps this long...
+    OVER_S = 0.5        # ...then goes over the side and under
+
+    def _advance_potshot(self):
+        """On patrol, the walker now and then halts to shoot at the nearest
+        boat still carrying redcoats down the river; his every shot takes
+        a man out of it."""
+        ps = self.potshot
+        if ps is None:
+            if not self.has_walker or self.walker_at is None \
+                    or self._bugling() or self.relief is not None \
+                    or self.phase < self.potshot_after:
+                return
+            wx, wy = self.walker_at
+            # Only a boat whose man to be hit will still be in sight when
+            # he fires and goes over: no boat rows faster than full speed.
+            ahead = self.redcoat_s * 0.45 * (self.SHOT_AT + self.SLUMP_S)
+            afloat = [b for b in self.boats if b["men"] > 0
+                      and b["landed"] is None and 0 <= b["x"]
+                      and self._aboard(b, b["men"] - 1)[0] + ahead
+                      <= self.river["w"]]
+            afloat = [b for b in afloat if self._clear_shot(b)]
+            b = min(afloat, key=lambda b: math.hypot(
+                b["x"] - wx, self._boat_at(b)[1] - wy), default=None)
+            if b is not None:
+                self.potshot = {"t0": self.phase, "boat": b, "fired": False}
+            return
+        tau = self.phase - ps["t0"]
+        if tau >= self.SHOT_AT and not ps["fired"]:
+            ps["fired"] = True
+            self._shoot_aboard(ps["boat"])
+        if tau >= self.DRILL_LEN or tau < 0:
+            self.potshot = None
+            self.potshot_after = self.phase + self.POTSHOT_REST
+
+    def _clear_shot(self, b):
+        """Whether the walker's line of fire at b, as he draws it, passes
+        over both tower sentries, their rifles and all, rather than
+        through one of them."""
+        if self.sentries_at is None:
+            return True
+        towers, floor, s = self.sentries_at
+        wx, wy = self.walker_at
+        mx, my = wx, wy - s * 0.92 * 0.52
+        bx, by, _ = self._boat_at(b)
+        by -= self._boat_m(b["side"]) * 0.3
+        for tx in towers:
+            for x in (tx - s * 0.5, tx + s * 0.5):
+                if min(mx, bx) <= x <= max(mx, bx) and bx != mx:
+                    y = my + (by - my) * (x - mx) / (bx - mx)
+                    if y > floor - s * 1.4:
+                        return False
+        return True
+
+    def _shoot_aboard(self, b):
+        """One of the boat's crew is hit and goes over the side."""
+        if b["men"] <= 0 or not any(o is b for o in self.boats):
+            return
+        pull = self._boat_at(b)[2]
+        b["men"] -= 1
+        self.overboard.append({"boat": b, "slot": b["men"], "s":
+                               self._boat_m(b["side"]), "t0": self.phase,
+                               "at": None, "n": b["n"] * 4 + b["men"]})
+        if b["men"] == 0:
+            if b["landed"] is None:
+                b["adrift"] = (self.phase, pull)
+            else:
+                b["left"] = self.phase
 
     @staticmethod
     def _bateau(cr, x, y, s, men, stroke, tilt, flag):
@@ -822,8 +924,8 @@ class CpuView(Gtk.DrawingArea):
         cr.rotate(tilt - (0.04 if men == 0 else 0.0))
         cr.set_line_cap(cairo.LINE_CAP_ROUND)
         cr.set_line_join(cairo.LINE_JOIN_ROUND)
-        rowers = [(45, -1), (8, -1), (-28, -1)][:max(0, men - 1)]
-        crew = ([(-64, 1)] if men > 0 else []) + rowers
+        rowers = [(px, -1) for px in CpuView.CREW_X[1:]][:max(0, men - 1)]
+        crew = ([(CpuView.CREW_X[0], 1)] if men > 0 else []) + rowers
         # The ensign at the stern.
         cr.set_source_rgb(*STEEL_RGB)
         cr.set_line_width(1.6)
@@ -924,6 +1026,8 @@ class CpuView(Gtk.DrawingArea):
         cr.restore()
 
     def _draw_boats(self, cr):
+        for f in self.overboard:
+            self._draw_splash(cr, f)
         for b in self.boats:
             x, y, pull = self._boat_at(b)
             m = self._boat_m(b["side"])
@@ -940,6 +1044,79 @@ class CpuView(Gtk.DrawingArea):
                 cr.stroke()
             self._bateau(cr, x, y, m, b["men"], stroke,
                          math.atan2(slope, 12), self.phase * 4 + b["n"])
+        for f in self.overboard:
+            self._draw_overboard(cr, f)
+
+    def _overboard_at(self, f):
+        """Where the shot man sits, or sat: (x, waterline)."""
+        return f["at"] or self._aboard(f["boat"], f["slot"])
+
+    def _draw_overboard(self, cr, f):
+        """The man slumps where he sat, then tips forward over the near
+        gunwale, in front of the hull, and down into the water."""
+        e = self.phase - f["t0"]
+        over = self._ramp(e, self.SLUMP_S, self.SLUMP_S + self.OVER_S)
+        if over >= 1.0:
+            return
+        x, y = self._overboard_at(f)
+        face = 1 if f["slot"] == 0 else -1
+        cr.save()
+        cr.translate(x, y)
+        cr.scale(f["s"] / 100.0, f["s"] / 100.0)
+        # Below the gunwale while he sits, below the water once over it.
+        cr.rectangle(-300, -300, 600, 288 + 30 * over)
+        cr.clip()
+        cr.translate(face * 14 * over, 32 + 62 * over * over)
+        cr.translate(0, -42)
+        cr.rotate(face * (0.45 * self._ramp(e, 0.0, self.SLUMP_S)
+                          + 1.1 * over))
+        cr.translate(0, 42)
+        cr.scale(face, 1)
+        self._rc_upper(cr)
+        cr.restore()
+
+    def _draw_splash(self, cr, f):
+        """Where he went in: a splash, rings and a little blood spreading
+        on the water and drifting downstream."""
+        if f["at"] is None:
+            return
+        e = self.phase - f["t0"] - self.SLUMP_S - self.OVER_S * 0.6
+        if e < 0:
+            return
+        x, y = f["at"]
+        m = f["s"]
+        face = 1 if f["slot"] == 0 else -1
+        x += face * m * 0.14 + m * 0.12 * e
+        y += m * 0.3
+        fade = 1.0 - max(0.0, e - self.STAIN_S * 0.5) / (self.STAIN_S * 0.4)
+        if fade > 0:
+            cr.save()
+            cr.translate(x, y)
+            cr.scale(1.0, 0.3)
+            cr.arc(0, 0, m * 0.3 * min(1.0, 0.3 + e * 0.6), 0, 2 * math.pi)
+            cr.restore()
+            cr.set_source_rgba(*BLOOD_RGB, 0.55 * fade)
+            cr.fill()
+        if e < 1.5:
+            cr.set_source_rgba(*WATER_HI_RGB, 0.7 * (1 - e / 1.5))
+            cr.set_line_width(max(0.6, m * 0.02))
+            for k in range(2):
+                r = m * (0.15 + 0.35 * e) * (1 - 0.35 * k)
+                cr.save()
+                cr.translate(x, y)
+                cr.scale(1.0, 0.3)
+                cr.arc(0, 0, r, 0, 2 * math.pi)
+                cr.restore()
+                cr.stroke()
+        if e < 0.8:
+            cr.set_source_rgba(*WATER_HI_RGB, 0.85 * (1 - e / 0.8))
+            for k in range(7):
+                a = -math.pi * (0.15 + 0.7 * k / 6)
+                v = m * (0.5 + 0.2 * ((k + f["n"]) % 3))
+                cr.arc(x + math.cos(a) * v * e,
+                       y + math.sin(a) * v * e + m * 2.0 * e * e,
+                       max(0.6, m * 0.035), 0, 2 * math.pi)
+                cr.fill()
 
     # -- helpers ----------------------------------------------------------
 
@@ -1788,10 +1965,14 @@ class CpuView(Gtk.DrawingArea):
     def _drill(self, i):
         """Tower sentry i kneels, takes aim and fires. Returns (kneel, aim,
         seconds since the shot or -1)."""
-        tau = self._drill_t(i)
-        kneel = self._ramp(tau, 0.0, 0.6) - self._ramp(tau, 3.2, 3.8)
-        aim = self._ramp(tau, 0.4, 1.1) - self._ramp(tau, 2.8, 3.4)
-        shot = tau - self.SHOT_AT if self.SHOT_AT <= tau < self.DRILL_LEN \
+        return self._drill_pose(self._drill_t(i))
+
+    @classmethod
+    def _drill_pose(cls, tau):
+        """The same, tau seconds into a drill."""
+        kneel = cls._ramp(tau, 0.0, 0.6) - cls._ramp(tau, 3.2, 3.8)
+        aim = cls._ramp(tau, 0.4, 1.1) - cls._ramp(tau, 2.8, 3.4)
+        shot = tau - cls.SHOT_AT if cls.SHOT_AT <= tau < cls.DRILL_LEN \
             else -1.0
         return kneel, aim, shot
 
@@ -2147,6 +2328,7 @@ class CpuView(Gtk.DrawingArea):
         if not self.on:
             return  # Nobody on the walls while the fort stands down.
         s = t * 0.85
+        self.sentries_at = (towers, floor, s)
         for i, tx in enumerate(towers):
             outward = -1 if i == 0 else 1
             if self._calling(i):
@@ -2176,6 +2358,7 @@ class CpuView(Gtk.DrawingArea):
         x0, x1 = walk
         self.has_walker = x1 - x0 > s * 0.6
         if not self.has_walker:
+            self.walker_at = None
             return
         # One more walks the wall from tower to tower and back, and stands
         # still while he sounds his bugle or works the gun.
@@ -2185,6 +2368,7 @@ class CpuView(Gtk.DrawingArea):
         patrol = x0 + (x1 - x0) * (0.5 - 0.5 * math.cos(pos * math.pi))
         self.walker_facing = 1 if u < 1.0 else -1
         ws = s * 0.92
+        self.walker_at = (patrol, walk_y)
 
         # The fort's gun stands on the wall walk where it was last wheeled.
         gun_x, gs = x0 + (x1 - x0) * self._gun_frac(), s * 1.25
@@ -2252,7 +2436,19 @@ class CpuView(Gtk.DrawingArea):
                      0.0, -1.0, boom, elev,
                      crank if crank is not None else 0.0)
 
-        if rt is None:
+        if rt is None and self.potshot is not None:
+            # Halted, he kneels and fires up at the boat.
+            ps = self.potshot
+            kneel, aim, shot = self._drill_pose(self.phase - ps["t0"])
+            bx, by, _ = self._boat_at(ps["boat"])
+            by -= self._boat_m(ps["boat"]["side"]) * 0.3
+            rise = (walk_y - ws * 0.52) - by
+            elev = min(1.3, max(-0.6, math.atan2(
+                rise, max(1.0, abs(bx - patrol)))))
+            self._mountain_man(cr, patrol, walk_y, ws,
+                               1 if bx >= patrol else -1, kneel=kneel,
+                               aim=aim, shot=shot, elev=elev)
+        elif rt is None:
             raised, toot = self._bugle()
             step = 0.0 if self._bugling() \
                 else math.sin(walked * 7.0) * 0.38
@@ -4394,6 +4590,7 @@ def self_test():
     assert view.pelts == pelts, (view.pelts, pelts)
 
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], True)
+    view.boats, view.potshot, view.walker_halted = [], None, 0.0
     for facing, phase in ((1, 0.0), (-1, 10.0)):
         view.bugle_at = None
         view.phase = phase
@@ -4551,6 +4748,7 @@ def self_test():
     # other; one in five pulls in at its ford and its men step ashore one
     # by one, never sooner, as ordinary foot, and it drifts away empty.
     view.redcoats, view.boats, view.boats_sent = [], [], 0
+    view.potshot, view.potshot_after = None, 1e9  # the walker holds fire
     view.boat_in = 0.01
     run(0.1, 1)
     assert [b["side"] for b in view.boats] == [0], view.boats
@@ -4587,10 +4785,17 @@ def self_test():
         assert view.fords[0] - 0.1 < p <= view.fords[0], (p, view.fords)
 
     def afloat(side, lands, men=view.BOAT_MEN):
-        view.redcoats, view.boats = [], []
+        view.redcoats, view.boats, view.overboard = [], [], []
         view._launch_boat(side)
         view.boats[0].update(lands=lands, men=men)
         return view.boats[0]
+
+    def until(cond, seconds):
+        for _ in range(int(seconds * 30)):
+            if cond():
+                return True
+            run(1 / 30, 3)
+        return cond()
 
     def ashore(b, seconds=120):
         """Who steps out of boat b before it is gone downstream."""
@@ -4606,6 +4811,88 @@ def self_test():
     boat = afloat(0, False)
     assert ashore(boat) == 0 and boat["men"] == view.BOAT_MEN, boat
     assert boat["landed"] is None, boat
+
+    # On patrol, the walker shoots at a boat in sight: he halts, and his
+    # shot takes one man out of it, who goes over the side; the boat
+    # lands one fewer. He patrols a while before shooting again.
+    view.potshot_after = 0.0
+    boat = afloat(1, True)
+    assert until(lambda: view.potshot is not None, 30), "he shoots"
+    assert view.potshot["boat"] is boat and view._clear_shot(boat)
+    halted = view.walker_halted
+    assert until(lambda: view.potshot["fired"], view.SHOT_AT + 0.5)
+    assert boat["men"] == view.BOAT_MEN - 1, boat
+    assert len(view.overboard) == 1, view.overboard
+    assert until(lambda: view.potshot is None, view.DRILL_LEN)
+    assert view.walker_halted - halted > view.DRILL_LEN - 0.5, "he halts"
+    view.potshot_after = 1e9
+    assert ashore(boat) == view.BOAT_MEN - 1
+    view.potshot_after = 0.0
+    boat = afloat(1, True)
+    assert until(lambda: view.potshot is not None, 30)
+    run(view.DRILL_LEN + 0.1, 3)
+    assert view.potshot is None and boat["men"] == view.BOAT_MEN - 1
+    run(view.POTSHOT_REST - 0.5, 3)
+    assert view.potshot is None, "he patrols between shots"
+
+    # A boat whose crew is all shot lands no one, and drifts off.
+    boat = afloat(1, True, men=1)
+    assert until(lambda: boat["men"] == 0, 30), boat
+    assert boat["adrift"] is not None and ashore(boat) == 0, boat
+
+    # He does not take aim at a boat that will be out of sight before he
+    # fires; the man he hits goes over in the picture.
+    boat = afloat(1, False)
+    boat["x"] = view.river["w"] - view.redcoat_s * 0.45 * view.SHOT_AT
+    view.potshot, view.potshot_after = None, 0.0
+    run(1 / 30, 1)
+    assert view.potshot is None, "not at a boat about to leave"
+    boat = afloat(1, False)
+    assert until(lambda: view.overboard and view.overboard[0]["at"], 30)
+    assert 0 <= view.overboard[0]["at"][0] <= view.river["w"], \
+        view.overboard
+
+    # Not while he sounds his bugle; and a call for the gun raised while
+    # he is at it waits for his shot, then is answered.
+    boat = afloat(1, False)
+    view.potshot_after = 0.0
+    run(2, 3)
+    assert view.potshot is not None
+    view.potshot = None
+    x0, y0, x1, y1 = view.fort_box
+    view._on_click(None, 1, (x0 + x1) / 2, (y0 + y1) / 2)
+    assert view._bugling()
+    while view._bugling():
+        run(1 / 30, 3)
+        assert view.potshot is None or view.potshot["t0"] \
+            >= view.bugle_at + view.BUGLE_LEN, "not during the bugle"
+    assert until(lambda: view.potshot is not None, 20)
+    view._on_click(None, 1, (x0 + x1) / 2, (y0 + y1) / 2)
+    assert not view._bugling(), "nor the bugle during his shot"
+    view.redcoats = [{"side": 0, "d": view.MARCH_NEAR, "hit": None, "n": 98,
+                      "born": view.phase, "kind": "cannon", "hp": 99,
+                      "struck": None, "at_wall": view.phase, "slot": 0}]
+    while view.potshot is not None:
+        run(1 / 30, 3)
+        assert view.relief is None, "the gun waits on his shot"
+    assert until(lambda: view.relief, 5), "then the gun"
+    assert view.relief["side"] == 0, view.relief
+    view.potshot_after = 0.0
+    while view.relief is not None:
+        run(1 / 30, 3)
+        assert view.potshot is None or view.relief is None, \
+            "not while he works the gun"
+    assert view.redcoats[0]["hit"] is not None, "the gun fired"
+
+    # With no room on the wall for him, nobody shoots at the boats.
+    boat = afloat(1, False)
+    view.potshot, view.potshot_after = None, 0.0
+    view.has_walker = False
+    for _ in range(10 * 30):
+        view.phase += 1 / 30
+        view._advance(1 / 30)
+        assert view.potshot is None
+    assert boat["men"] == view.BOAT_MEN
 
     # A click on the river sends a boat, while the fort is up; the pointer
     # shows there.
