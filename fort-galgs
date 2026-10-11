@@ -269,13 +269,16 @@ class GroupSampler:
 class CpuView(Gtk.DrawingArea):
     """Every physical core as a tile, each of its threads a live load bar.
 
-    While the fort is up, the reserved cores stand inside a log stockade,
-    mountain men watch from its towers and walk its wall, redcoats march
-    on it down trails from the far corners and the sentries shoot them,
-    and embers rise
-    in the orange tiles. While it is down, a grove of trees and bushes grows
-    there instead and those cores look like every other. Which state it is
-    in never depends on telling orange from blue.
+    The chip sits in open country with a river running across it, where a
+    beaver swims and dives. While the fort is up, the reserved cores stand
+    inside a log stockade, embers rising in their orange tiles; mountain
+    men watch from its towers and walk its wall, redcoats march on it down
+    trails from barracks in the far corners or come down the river in
+    boats, take cover behind boulders, and the sentries and the fort's gun
+    see them off. While it is down, a grove grows there instead and those
+    cores look like every other; woods fill the land, two trappers work a
+    trap line along the banks and stack their pelts, and loose horses
+    graze. Which state it is in never depends on telling orange from blue.
     """
 
     COLS = 5
