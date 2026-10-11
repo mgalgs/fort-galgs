@@ -275,7 +275,8 @@ class CpuView(Gtk.DrawingArea):
     men watch from its towers and walk its wall, redcoats march on it down
     trails from barracks in the far corners or come down the river in
     boats, take cover behind boulders, and the sentries and the fort's gun
-    see them off. While it is down, a grove grows there instead and those
+    see them off. Most boats row on by; now and then one puts its men
+    ashore at a ford. While it is down, a grove grows there instead and those
     cores look like every other; woods fill the land, two trappers work a
     trap line along the banks and stack their pelts, and loose horses
     graze. Which state it is in never depends on telling orange from blue.
@@ -696,6 +697,7 @@ class CpuView(Gtk.DrawingArea):
     BOATS_MAX = 2       # most afloat at once
     LAND_GAP_S = 1.4    # between one man stepping ashore and the next
     ASHORE_S = 0.6      # a man takes this long to step from the bow
+    LAND_EVERY = 5      # one boat in this many puts in; the rest row by
 
     def _launch_boat(self, side):
         """Put a boat in at the upstream edge, bound for side's ford, or
@@ -706,10 +708,11 @@ class CpuView(Gtk.DrawingArea):
             side = 1 - side
             if self.fords[side] is None:
                 return False
+        lands = self.boats_sent % self.LAND_EVERY == self.LAND_EVERY - 1
         self.boats.append({"side": side, "x": -self._boat_m(side) * 0.9,
                            "men": self.BOAT_MEN, "landed": None,
                            "next_at": 0.0, "left": None,
-                           "n": self.boats_sent})
+                           "lands": lands, "n": self.boats_sent})
         self.boats_sent += 1
         return True
 
@@ -721,9 +724,9 @@ class CpuView(Gtk.DrawingArea):
 
     def _boat_stop(self, b):
         """Where the boat's middle comes to rest, its bow just short of
-        the ford's stones; None if it has no ford to land at."""
+        the ford's stones; None if it is not putting in at a ford."""
         p = self.fords[b["side"]]
-        if p is None or self.trails is None:
+        if p is None or self.trails is None or not b["lands"]:
             return None
         x = self._bezier(self.trails[b["side"]], p)[0]
         stones = self.redcoat_s * 0.5 * self._depth_scale(p) * 0.9
@@ -764,9 +767,10 @@ class CpuView(Gtk.DrawingArea):
         return x + self._boat_m(b["side"]) * 0.75, y
 
     def _advance_boats(self, dt):
-        """Boats come down the river now and then, alternating fords; each
-        pulls in at its ford, its men step ashore onto the trail one by
-        one, and the empty boat drifts on downstream and away."""
+        """Boats come down the river now and then, alternating fords. Most
+        row on past both and away; one in a few pulls in at its ford, its
+        men step ashore onto the trail one by one, and the empty boat
+        drifts on downstream."""
         if self.trails is None or self.river is None:
             return
         self.boat_in -= dt
@@ -4544,8 +4548,8 @@ def self_test():
                 assert math.hypot(x - px, base - py) > half, (x, base, p)
 
     # Boats come down the river on their own, to one ford and then the
-    # other; one pulls in at its ford and its men step ashore one by one,
-    # never sooner, as ordinary foot, and it drifts away empty.
+    # other; one in five pulls in at its ford and its men step ashore one
+    # by one, never sooner, as ordinary foot, and it drifts away empty.
     view.redcoats, view.boats, view.boats_sent = [], [], 0
     view.boat_in = 0.01
     run(0.1, 1)
@@ -4554,9 +4558,16 @@ def self_test():
     run(0.1, 1)
     assert [b["side"] for b in view.boats] == [0, 1], view.boats
     assert view.boats_sent == 2 and view.boat_in > 60
+    lands = []
+    for k in range(2 * view.LAND_EVERY):
+        view.boats = []
+        view._launch_boat(k % 2)
+        lands.append(view.boats[0]["lands"])
+    assert sum(lands) == 2, lands
     view.boats, view.boat_in = [], 1e9
     view._launch_boat(0)
     boat, landed, aboard = view.boats[0], [], True
+    boat["lands"] = True
     for _ in range(360):
         before = {rc["n"] for rc in view.redcoats}
         run(1 / 3, 5)
@@ -4574,6 +4585,27 @@ def self_test():
     for rc, p in landed:
         assert rc["kind"] == "foot" and rc["side"] == 0, rc
         assert view.fords[0] - 0.1 < p <= view.fords[0], (p, view.fords)
+
+    def afloat(side, lands, men=view.BOAT_MEN):
+        view.redcoats, view.boats = [], []
+        view._launch_boat(side)
+        view.boats[0].update(lands=lands, men=men)
+        return view.boats[0]
+
+    def ashore(b, seconds=120):
+        """Who steps out of boat b before it is gone downstream."""
+        out = set()
+        for _ in range(int(seconds * 3)):
+            run(1 / 3, 5)
+            out |= {rc["n"] for rc in view.redcoats if rc.get("boat")}
+            if not any(o is b for o in view.boats):
+                return len(out)
+        assert False, "the boat never left"
+
+    # The rest row on past both fords with their crews aboard.
+    boat = afloat(0, False)
+    assert ashore(boat) == 0 and boat["men"] == view.BOAT_MEN, boat
+    assert boat["landed"] is None, boat
 
     # A click on the river sends a boat, while the fort is up; the pointer
     # shows there.
