@@ -81,6 +81,8 @@ HORSE_CHESTNUT_DARK_RGB = (0.38, 0.19, 0.09)
 IRON_RGB = (0.22, 0.22, 0.25)
 BALL_RGB = (0.62, 0.63, 0.68)
 BLOOD_RGB = (0.62, 0.04, 0.05)
+HULL_RGB = (0.38, 0.27, 0.17)
+HULL_HI_RGB = (0.56, 0.42, 0.27)
 
 # The grove that grows there while the fort is down.
 PINE_RGB = (0.12, 0.34, 0.22)
@@ -313,6 +315,9 @@ class CpuView(Gtk.DrawingArea):
         self.river = None                 # its course, as last laid out
         self.fords = [None, None]         # p where each trail crosses it
         self.rocks = [None, None]         # each trail's cover, as last laid
+        self.boats = []                   # bateaux of redcoats on the river
+        self.boat_in = 30.0
+        self.boats_sent = 0
         self.rng = random.Random(7)       # the wilds' only source of chance
         self.wild = None                  # the idle scene's layout, per size
         self.sites = []                   # trap sites along the banks
@@ -334,6 +339,7 @@ class CpuView(Gtk.DrawingArea):
         if not on:
             # Standing down sends everyone home; the next siege starts fresh.
             self.redcoats = []
+            self.boats = []
             self.called = [[], []]
             self.pending_call = None
             self.relief = None
@@ -382,15 +388,22 @@ class CpuView(Gtk.DrawingArea):
                 return i
         return None
 
+    def _on_river(self, x, y):
+        r = self.river
+        return r is not None and abs(y - self._river_y(x)) <= \
+            self._river_half(x) + r["half"] * 0.35 + 1
+
     def _on_motion(self, _ctl, x, y):
-        hot = self._on_fort(x, y) or self._barracks_at(x, y) is not None
+        hot = self._on_fort(x, y) or self._barracks_at(x, y) is not None \
+            or (self.on and self._on_river(x, y))
         self.set_cursor_from_name("pointer" if hot else None)
 
     def _on_click(self, _gesture, n, x, y):
         """A click on a barracks sends out a file of redcoats, a double
         click a wave of cavalry and a cannon. One on the fort has the walker
         sound his bugle the way he faces, and the tower sentry on that side
-        kneels and fires, at a redcoat if one is in sight."""
+        kneels and fires, at a redcoat if one is in sight. One on the river
+        sends a boatload of redcoats down it, to the nearer ford."""
         i = self._barracks_at(x, y)
         if i is not None:
             if n >= 2:
@@ -401,8 +414,11 @@ class CpuView(Gtk.DrawingArea):
                 # double click does not also send the file.
                 self.pending_call = (i, self.phase)
             return
-        if not self._on_fort(x, y) or self._bugling() \
-                or self.relief is not None:
+        if not self._on_fort(x, y):
+            if self.on and self._on_river(x, y):
+                self._launch_boat(0 if x < self.river["w"] / 2 else 1)
+            return
+        if self._bugling() or self.relief is not None:
             return
         self.bugle_at = self.phase
         i = 1 if self.walker_facing > 0 else 0
@@ -599,18 +615,12 @@ class CpuView(Gtk.DrawingArea):
             return all(rc["d"] < self.MARCH_FAR - self.DOOR_GAP
                        for rc in self.redcoats if rc["side"] == side)
 
-        def send(side, kind):
-            self.redcoats.append({"side": side, "d": self.MARCH_FAR,
-                                  "hit": None, "n": self.spawned,
-                                  "born": self.phase, "kind": kind,
-                                  "hp": self.HP[kind], "struck": None,
-                                  "at_wall": None, "slot": 0})
-            self.spawned += 1
-
+        send = self._send
         for side in (0, 1):
             if self.called[side] and door_clear(side):
                 send(side, self.called[side].pop(0))
 
+        self._advance_boats(dt)
         self.spawn_in -= dt
         if self.spawn_in <= 0:
             n = self.spawned
@@ -664,6 +674,264 @@ class CpuView(Gtk.DrawingArea):
                     target["struck"] = self.phase
                     if target["hp"] <= 0:
                         target["hit"] = self.phase
+
+    def _send(self, side, kind, d=None, boat=None):
+        """A redcoat sets out from the barracks on trail side, or, given d
+        and the boat's bow, steps ashore from it there."""
+        self.redcoats.append({"side": side, "d": d or self.MARCH_FAR,
+                              "hit": None, "n": self.spawned,
+                              "born": self.phase, "kind": kind,
+                              "hp": self.HP[kind], "struck": None,
+                              "at_wall": None, "slot": 0, "boat": boat})
+        self.spawned += 1
+
+    # -- the boats --------------------------------------------------------
+
+    BOAT_MEN = 4        # a steersman and three at the oars
+    BOAT_EVERY = (110.0, 140.0)
+    BOATS_MAX = 2       # most afloat at once
+    LAND_GAP_S = 1.4    # between one man stepping ashore and the next
+    ASHORE_S = 0.6      # a man takes this long to step from the bow
+
+    def _launch_boat(self, side):
+        """Put a boat in at the upstream edge, bound for side's ford, or
+        the other if side's trail does not cross the river."""
+        if len(self.boats) >= self.BOATS_MAX:
+            return False
+        if self.fords[side] is None:
+            side = 1 - side
+            if self.fords[side] is None:
+                return False
+        self.boats.append({"side": side, "x": -self._boat_m(side) * 0.9,
+                           "men": self.BOAT_MEN, "landed": None,
+                           "next_at": 0.0, "left": None,
+                           "n": self.boats_sent})
+        self.boats_sent += 1
+        return True
+
+    def _boat_m(self, side):
+        """The size of a man in a boat bound for side's ford: as big as he
+        will be stepping ashore there."""
+        p = self.fords[side] if self.fords[side] is not None else 0.5
+        return self.redcoat_s * self._depth_scale(p)
+
+    def _boat_stop(self, b):
+        """Where the boat's middle comes to rest, its bow just short of
+        the ford's stones; None if it has no ford to land at."""
+        p = self.fords[b["side"]]
+        if p is None or self.trails is None:
+            return None
+        x = self._bezier(self.trails[b["side"]], p)[0]
+        stones = self.redcoat_s * 0.5 * self._depth_scale(p) * 0.9
+        return x - stones - self._boat_m(b["side"]) * 0.9
+
+    def _landing_p(self, side):
+        """Where on the trail a man from the boat steps ashore: the far
+        bank, just up the trail from the ford's stones."""
+        p = self.fords[side]
+        if p is None:
+            return 0.0
+        mud = self.river["half"] * 0.35 + 1
+        for k in range(60):
+            q = max(0.0, p - k * 0.005)
+            x, y = self._bezier(self.trails[side], q)
+            if y <= self._river_edge(x, -1) - mud or q == 0.0:
+                return q
+        return q
+
+    def _boat_at(self, b):
+        """The boat's waterline (x, y) and how far it has pulled in toward
+        the far bank, 0..1."""
+        m = self._boat_m(b["side"])
+        stop = self._boat_stop(b)
+        if b["left"] is not None:
+            pull = 1.0 - self._ramp(self.phase - b["left"], 0.0, 2.5)
+        elif stop is None:
+            pull = 0.0
+        else:
+            pull = 1.0 - min(1.0, max(0.0, (stop - b["x"]) / (2.5 * m)))
+            pull = pull * pull * (3 - 2 * pull)
+        x = b["x"]
+        y = self._river_y(x) + self._river_half(x) * (0.1 - 0.55 * pull)
+        return x, y, pull
+
+    def _bow(self, b):
+        x, y, _ = self._boat_at(b)
+        return x + self._boat_m(b["side"]) * 0.75, y
+
+    def _advance_boats(self, dt):
+        """Boats come down the river now and then, alternating fords; each
+        pulls in at its ford, its men step ashore onto the trail one by
+        one, and the empty boat drifts on downstream and away."""
+        if self.trails is None or self.river is None:
+            return
+        self.boat_in -= dt
+        if self.boat_in <= 0:
+            if self._launch_boat(self.boats_sent % 2):
+                self.boat_in = self.BOAT_EVERY[self.boats_sent % 2]
+            else:
+                self.boat_in = 5.0
+        for b in self.boats:
+            m = self._boat_m(b["side"])
+            v = self.redcoat_s * 0.45
+            stop = self._boat_stop(b)
+            if b["landed"] is None and stop is not None:
+                # Easing in to the bank as it nears the ford.
+                v *= max(0.2, min(1.0, (stop - b["x"]) / m))
+                b["x"] = min(stop, b["x"] + v * dt)
+                if b["x"] >= stop - 0.5:
+                    b["landed"] = self.phase
+                    b["next_at"] = self.phase + 0.5
+            elif b["landed"] is not None and b["men"] > 0:
+                if self.phase >= b["next_at"]:
+                    self._send(b["side"], "foot",
+                               self._trail_d(self._landing_p(b["side"])),
+                               self._bow(b))
+                    b["men"] -= 1
+                    b["next_at"] += self.LAND_GAP_S
+                    if b["men"] == 0:
+                        b["left"] = self.phase
+            else:
+                if b["left"] is not None:
+                    v *= 0.3 + 0.7 * self._ramp(self.phase - b["left"],
+                                                0.0, 3.0)
+                b["x"] += v * dt
+        self.boats = [b for b in self.boats
+                      if b["x"] < self.river["w"] + 2 * self._boat_m(
+                          b["side"])]
+
+    @staticmethod
+    def _bateau(cr, x, y, s, men, stroke, tilt, flag):
+        """A flat-bottomed bateau, bow to the right, sitting on the water at
+        (x, y), in the 100-unit model of the men aboard: a steersman at the
+        stern and up to three at the oars, who face him as they row. stroke
+        is the phase of their stroke; with nobody aboard the oars lie
+        shipped and the bow rides a little high. flag is the phase of the
+        ensign's flutter."""
+        cr.save()
+        cr.translate(x, y)
+        cr.scale(s / 100.0, s / 100.0)
+        cr.rotate(tilt - (0.04 if men == 0 else 0.0))
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_line_join(cairo.LINE_JOIN_ROUND)
+        rowers = [(45, -1), (8, -1), (-28, -1)][:max(0, men - 1)]
+        crew = ([(-64, 1)] if men > 0 else []) + rowers
+        # The ensign at the stern.
+        cr.set_source_rgb(*STEEL_RGB)
+        cr.set_line_width(1.6)
+        cr.move_to(-84, -20)
+        cr.line_to(-88, -58)
+        cr.stroke()
+        wave = math.sin(flag) * 3
+        cr.set_source_rgb(*COAT_RGB)
+        cr.move_to(-88, -58)
+        cr.curve_to(-96, -60 + wave, -104, -54 - wave, -110, -56 + wave)
+        cr.line_to(-108, -44 + wave)
+        cr.curve_to(-102, -42 - wave, -96, -48 + wave, -87, -46)
+        cr.close_path()
+        cr.fill()
+        cr.set_source_rgb(*KIT_RGB)
+        cr.set_line_width(1.4)
+        cr.move_to(-88, -52)
+        cr.line_to(-109, -50 + wave)
+        cr.stroke()
+        # Men from the waist up, seated below the gunwale.
+        for px, face in crew:
+            cr.save()
+            cr.translate(px, 32)
+            cr.scale(face, 1)
+            CpuView._rc_upper(cr)
+            cr.restore()
+        # The hull: raked bow and stern, a pale strake under the gunwale.
+        cr.move_to(-92, -24)
+        cr.curve_to(-80, -14, -60, -12, 0, -12)
+        cr.curve_to(60, -12, 80, -14, 94, -26)
+        cr.line_to(72, 5)
+        cr.line_to(-70, 5)
+        cr.close_path()
+        cr.set_source_rgb(*HULL_RGB)
+        cr.fill_preserve()
+        cr.set_source_rgb(*SEAM_RGB)
+        cr.set_line_width(1.5)
+        cr.stroke()
+        cr.set_source_rgb(*HULL_HI_RGB)
+        cr.set_line_width(2.5)
+        cr.move_to(-86, -18)
+        cr.curve_to(-70, -9, -50, -8, 0, -8)
+        cr.curve_to(50, -8, 72, -9, 88, -20)
+        cr.stroke()
+        cr.set_source_rgba(*WATER_HI_RGB, 0.6)
+        cr.set_line_width(1.6)
+        cr.move_to(-74, 4)
+        cr.line_to(76, 4)
+        cr.stroke()
+        if men == 0:
+            cr.set_source_rgb(*RIFLE_WOOD_RGB)
+            cr.set_line_width(3)
+            for k in range(3):
+                cr.move_to(-50 + k * 6, -15 - k * 2)
+                cr.line_to(56 + k * 4, -15 - k * 2)
+            cr.stroke()
+        for k, (px, face) in enumerate(crew):
+            if face > 0:
+                # The steersman's long oar, trailing astern.
+                cr.set_source_rgb(*RIFLE_WOOD_RGB)
+                cr.set_line_width(3)
+                cr.move_to(px + 8, -20)
+                cr.line_to(-112, 6)
+                cr.stroke()
+                hand = (px + 8, -20)
+            else:
+                # Feathered back above the water, then pulled through it.
+                ang = stroke + k * 0.15
+                blade = (px + 34 + 22 * math.cos(ang),
+                         4 if math.sin(ang) > 0 else -8)
+                pivot = (px + 12, -13)
+                hand = (pivot[0] - (blade[0] - pivot[0]) * 0.35,
+                        pivot[1] - (blade[1] - pivot[1]) * 0.35 - 8)
+                cr.set_source_rgb(*RIFLE_WOOD_RGB)
+                cr.set_line_width(3)
+                cr.move_to(*hand)
+                cr.line_to(*blade)
+                cr.stroke()
+                cr.save()
+                cr.translate(*blade)
+                cr.rotate(math.atan2(blade[1] - hand[1], blade[0] - hand[0]))
+                cr.scale(9, 3)
+                cr.arc(0, 0, 1, 0, 2 * math.pi)
+                cr.restore()
+                cr.fill()
+                if blade[1] > 0:
+                    cr.set_source_rgba(1, 1, 1, 0.6)
+                    cr.arc(blade[0] - 8, 1, 3, 0, 2 * math.pi)
+                    cr.fill()
+            cr.set_source_rgb(*COAT_RGB)
+            cr.set_line_width(6)
+            cr.move_to(px + face * 3, -2)
+            cr.line_to(*hand)
+            cr.stroke()
+            cr.set_source_rgb(*SKIN_RGB)
+            cr.arc(*hand, 3, 0, 2 * math.pi)
+            cr.fill()
+        cr.restore()
+
+    def _draw_boats(self, cr):
+        for b in self.boats:
+            x, y, pull = self._boat_at(b)
+            m = self._boat_m(b["side"])
+            slope = self._river_y(x + 6) - self._river_y(x - 6)
+            rowing = b["landed"] is None and pull < 0.9
+            stroke = self.phase * 3.2 + b["n"] if rowing else 1.6
+            if b["landed"] is None or b["men"] == 0:
+                # A wake spreading behind.
+                cr.set_source_rgba(*WATER_HI_RGB, 0.35)
+                cr.set_line_width(1.2)
+                for side in (-1, 1):
+                    cr.move_to(x - m * 0.8, y + m * 0.02)
+                    cr.line_to(x - m * 1.8, y + side * m * 0.12)
+                cr.stroke()
+            self._bateau(cr, x, y, m, b["men"], stroke,
+                         math.atan2(slope, 12), self.phase * 4 + b["n"])
 
     # -- helpers ----------------------------------------------------------
 
@@ -1575,6 +1843,13 @@ class CpuView(Gtk.DrawingArea):
         p = self._trail_p(rc["d"])
         x, y = self._bezier(self.trails[rc["side"]], p)
         size = self.redcoat_s * self._depth_scale(p)
+        ashore = self.phase - rc["born"]
+        if rc.get("boat") and ashore < self.ASHORE_S:
+            # A hop from the bow up onto the bank.
+            u = self._ramp(ashore, 0.0, self.ASHORE_S)
+            bx, by = rc["boat"]
+            x, y = bx + (x - bx) * u, by + (y - by) * u \
+                - math.sin(u * math.pi) * size * 0.25
         cover = self._cover(rc)
         if cover > 0:
             rock = self.rocks[rc["rock"]]
@@ -1636,9 +1911,7 @@ class CpuView(Gtk.DrawingArea):
         for fx in (0.1, 0.27, 0.61, 0.78):
             cr.rectangle(x0 + fx * B, top + 0.1 * B, 0.11 * B, 0.12 * B)
         cr.fill()
-        opening = any(rc["side"] == i
-                      and self.phase - rc["born"] < self.DOOR_OPEN_S
-                      for rc in self.redcoats)
+        opening = self._door_open(i)
         cr.set_source_rgb(*((0.05, 0.03, 0.03) if opening else WOOD_RGB))
         cr.rectangle(x - 0.08 * B, y - 0.27 * B, 0.16 * B, 0.27 * B)
         cr.fill()
@@ -1657,6 +1930,12 @@ class CpuView(Gtk.DrawingArea):
         cr.fill()
         self.barracks_box[i] = (x0 - 3, peak - 0.36 * B - 3, x0 + B + 3,
                                 y + 3)
+
+    def _door_open(self, i):
+        """Someone has just come out of barracks i (not off a boat)."""
+        return any(rc["side"] == i and not rc.get("boat")
+                   and self.phase - rc["born"] < self.DOOR_OPEN_S
+                   for rc in self.redcoats)
 
     STAIN_S = 8.0       # a pool of blood fades out over this long
 
@@ -3021,6 +3300,7 @@ class CpuView(Gtk.DrawingArea):
             self._draw_trails(cr)
             self._find_fords()
             self._lay_rocks()
+            self._draw_boats(cr)
             self._draw_fords(cr)
             for i in (0, 1):
                 self._draw_barracks(cr, i)
@@ -4012,7 +4292,7 @@ def self_test():
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], True)
     view.bugle_at = None
-    view.wave_in = 1e9  # foot alone; the waves are tried below
+    view.wave_in = view.boat_in = 1e9  # foot alone; the rest come below
 
     def run(seconds, every=15):
         for frame in range(int(seconds * 30)):
@@ -4131,8 +4411,62 @@ def self_test():
     assert rc["hid"] is None and view._trail_p(rc["d"]) > view.COVER_P, rc
     view.drill_start = [None, None]
 
+    # Boats come down the river on their own, to one ford and then the
+    # other; one pulls in at its ford and its men step ashore one by one,
+    # never sooner, as ordinary foot, and it drifts away empty.
+    view.redcoats, view.boats, view.boats_sent = [], [], 0
+    view.boat_in = 0.01
+    run(0.1, 1)
+    assert [b["side"] for b in view.boats] == [0], view.boats
+    view.boat_in = 0.01
+    run(0.1, 1)
+    assert [b["side"] for b in view.boats] == [0, 1], view.boats
+    assert view.boats_sent == 2 and view.boat_in > 60
+    view.boats, view.boat_in = [], 1e9
+    view._launch_boat(0)
+    boat, landed, aboard = view.boats[0], [], True
+    for _ in range(360):
+        before = {rc["n"] for rc in view.redcoats}
+        run(1 / 3, 5)
+        fresh = [rc for rc in view.redcoats
+                 if rc.get("boat") and rc["n"] not in before]
+        if boat["landed"] is None:
+            assert not fresh, "nobody leaves the boat afloat"
+        elif fresh and not landed:
+            assert not view._door_open(0), "not out of the barracks"
+        landed += [(rc, view._trail_p(rc["d"])) for rc in fresh]
+        if not view.boats:
+            break
+    assert not view.boats, "the empty boat drifts off"
+    assert len(landed) == view.BOAT_MEN, landed
+    for rc, p in landed:
+        assert rc["kind"] == "foot" and rc["side"] == 0, rc
+        assert view.fords[0] - 0.1 < p <= view.fords[0], (p, view.fords)
+
+    # A click on the river sends a boat, while the fort is up; the pointer
+    # shows there.
+    view.redcoats, view.boats = [], []
+    view.bugle_at, view.pending_call = None, None
+    view._draw(view, cr, 1024, 680)
+    spot = None
+    for x in range(8, 1024, 8):
+        y = view._river_y(x)
+        if not view._on_fort(x, y) and view._barracks_at(x, y) is None:
+            spot = (x, y)
+            break
+    assert spot and view._on_river(*spot), "some river to click"
+    assert not view._on_river(spot[0], spot[1]
+                              + 3 * view._river_half(spot[0]) + 10)
+    view._on_click(None, 1, *spot)
+    assert len(view.boats) == 1 and not view._bugling() \
+        and view.pending_call is None, view.boats
+
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
     assert not view.redcoats and not view.called[0], "standing down clears"
+    assert not view.boats, "and sinks the boats"
+    view._draw(view, cr, 1024, 680)
+    view._on_click(None, 1, *spot)
+    assert not view.boats, "no boats while the fort is down"
 
     win.apply_state(SAMPLE_STATE)
     assert win.banner.get_revealed() and win.banner_action is None
