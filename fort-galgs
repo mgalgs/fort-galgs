@@ -315,6 +315,7 @@ class CpuView(Gtk.DrawingArea):
         self.river = None                 # its course, as last laid out
         self.fords = [None, None]         # p where each trail crosses it
         self.rocks = [None, None]         # each trail's cover, as last laid
+        self.scenery = None               # the siege's woods, per size
         self.boats = []                   # bateaux of redcoats on the river
         self.boat_in = 30.0
         self.boats_sent = 0
@@ -2789,44 +2790,23 @@ class CpuView(Gtk.DrawingArea):
             keep.append(((x0 + x1) / 2, y1, (x1 - x0) / 2 + 0.6 * s,
                          y1 - y0 + 0.9 * s))
 
-        def overlaps(a, b):
-            return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
-
-        trees = []
-        cap = int(min(90, width * height / (t * t * 0.8)))
+        overlaps = self._overlaps
         grove_tall = (gx0 - 0.1 * t, gy0 - 1.5 * t, gx1 + 0.1 * t,
                       gy1 + 0.2 * t)
-        for i in range(cap * 10):
-            if len(trees) >= cap:
-                break
-            x = (0.31 + i * 0.7548777) % 1.0 * width
-            base = (0.17 + i * 0.5698403) % 1.0 * height
-            kind = ("pine", "round", "pine", "bush")[i % 4]
-            h = t * (0.5 + 0.45 * ((i * 0.618) % 1.0))
-            if kind == "bush":
-                h *= 0.45
-            box = (x - 0.32 * h, base - h, x + 0.32 * h, base)
-            if base > floor or base < 0.5 * h:
-                continue
-            if overlaps(box, grove_tall) or (
-                    die is not None and overlaps(box, (
-                        die[0] - 0.15 * t, die[1] - 0.15 * t,
-                        die[2] + 0.15 * t, die[3] + 0.15 * t))):
-                continue
-            far = self._river_edge(x, -1) - mud
-            near = self._river_edge(x, 1) + mud
-            if not (base <= far or base >= near + 0.35 * h):
-                continue
-            if any(overlaps(box, (px - w, py - ht, px + w, py + 0.3 * s))
-                   or (base > py - 0.2 * s and abs(x - px) < w + 0.3 * h
-                       and base - h < py)
-                   for px, py, w, ht in keep):
-                continue
-            if any(math.hypot(x - o[0], base - o[1]) < 0.3 * (h + o[2])
-                   for o in trees):
-                continue
-            trees.append((x, base, h, kind, i))
-        trees.sort(key=lambda tr: tr[1])
+        chip = die and (die[0] - 0.15 * t, die[1] - 0.15 * t,
+                        die[2] + 0.15 * t, die[3] + 0.15 * t)
+
+        def clear(x, base, h, box):
+            if overlaps(box, grove_tall) or (chip and overlaps(box, chip)):
+                return False
+            return not any(
+                overlaps(box, (px - w, py - ht, px + w, py + 0.3 * s))
+                or (base > py - 0.2 * s and abs(x - px) < w + 0.3 * h
+                    and base - h < py)
+                for px, py, w, ht in keep)
+
+        trees = self._scatter_trees(width, height, t, mud,
+                                    ("pine", "round", "pine", "bush"), clear)
 
         self.wild = {"key": key, "s": s, "t": t, "mud": mud, "trees": trees,
                      "flanks": flanks, "pastures": pastures, "grove": grove}
@@ -3045,6 +3025,41 @@ class CpuView(Gtk.DrawingArea):
                       swish=math.sin(self.phase * 1.7 + i * 2) ** 3,
                       walk=hs["dest"] is not None)
 
+    @staticmethod
+    def _overlaps(a, b):
+        return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+    def _scatter_trees(self, width, height, t, mud, kinds, clear):
+        """Trees spread evenly (an R2 sequence) over the picture, each
+        (x, base, h, kind, i), nearest last: on dry land, not crowding
+        one another, and wherever clear(x, base, h, box) allows."""
+        trees = []
+        cap = int(min(90, width * height / (t * t * 0.8)))
+        for i in range(cap * 10):
+            if len(trees) >= cap:
+                break
+            x = (0.31 + i * 0.7548777) % 1.0 * width
+            base = (0.17 + i * 0.5698403) % 1.0 * height
+            kind = kinds[i % len(kinds)]
+            h = t * (0.5 + 0.45 * ((i * 0.618) % 1.0))
+            if kind in ("bush", "stump"):
+                h *= 0.45 if kind == "bush" else 0.3
+            box = (x - 0.32 * h, base - h, x + 0.32 * h, base)
+            if base > height * 0.94 or base < 0.5 * h:
+                continue
+            far = self._river_edge(x, -1) - mud
+            near = self._river_edge(x, 1) + mud
+            if not (base <= far or base >= near + 0.35 * h):
+                continue
+            if not clear(x, base, h, box):
+                continue
+            if any(math.hypot(x - o[0], base - o[1]) < 0.3 * (h + o[2])
+                   for o in trees):
+                continue
+            trees.append((x, base, h, kind, i))
+        trees.sort(key=lambda tr: tr[1])
+        return trees
+
     def _draw_wilds(self, cr):
         """The woods, the trappers and the horses, nearest last."""
         items = [(tree[1], 0, self._draw_tree, tree)
@@ -3207,6 +3222,8 @@ class CpuView(Gtk.DrawingArea):
             self._pine(cr, x, base, h, sway)
         elif kind == "round":
             self._round_tree(cr, x, base, h, sway)
+        elif kind == "stump":
+            self._stump(cr, x, base, h)
         else:
             self._bush(cr, x, base, h * 0.5)
 
@@ -3215,6 +3232,93 @@ class CpuView(Gtk.DrawingArea):
             if fl["ford"]:
                 self._draw_ford(cr, fl["ford"][0][0], self.wild["t"] * 0.22,
                                 f)
+
+    # -- the siege's landscape --------------------------------------------
+
+    def _lay_scenery(self, key, width, height, t, die, fort_box):
+        """Woods, stumps and boulders over the siege's open ground, once
+        per size: kept off the trails (and anyone on them), the barracks,
+        the chip, the fort and its sentries, and out of the river."""
+        mud = self.river["half"] * 0.35 + 2
+        overlaps = self._overlaps
+        grow = [(fort_box, 0.2 * t), (die, 0.15 * t)] + [
+            (box, 0.3 * t) for box in self.barracks_box]
+        avoid = [(b[0] - m, b[1] - m, b[2] + m, b[3] + m)
+                 for b, m in grow if b is not None]
+        avoid += [(r["x"] - r["w"] * 0.7, r["base"] - r["h"] - 0.4 * t,
+                   r["x"] + r["w"] * 0.7, r["base"] + 0.1 * t)
+                  for r in self.rocks if r]
+        path = []
+        for pts in self.trails:
+            for k in range(49):
+                p = k / 48
+                x, y = self._bezier(pts, p)
+                size = self.redcoat_s * self._depth_scale(p)
+                path.append((x, y, size))
+
+        def clear(x, base, h, box):
+            if any(overlaps(box, a) for a in avoid):
+                return False
+            # Neither hiding a man on the trail nor standing in his way.
+            return not any(
+                abs(x - px) < 0.32 * h + size * 0.75
+                and base - h - size * 0.3 < py < base + size * 0.5
+                for px, py, size in path)
+
+        trees = self._scatter_trees(
+            width, height, t, mud,
+            ("pine", "round", "stump", "pine", "bush", "round"), clear)
+        rocks = []
+        for i in range(60):
+            if len(rocks) >= 5:
+                break
+            x = (0.62 + i * 0.7548777) % 1.0 * width
+            base = (0.41 + i * 0.5698403) % 1.0 * height * 0.94
+            w = t * (0.25 + 0.15 * ((i * 0.618) % 1.0))
+            box = (x - w * 0.6, base - w * 0.6, x + w * 0.6, base + 2)
+            far = self._river_edge(x, -1) - mud
+            near = self._river_edge(x, 1) + mud
+            if (far < base < near + w * 0.6) or not clear(
+                    x, base, w * 0.6, box) or any(
+                    overlaps(box, (tx - 0.32 * h, tb - h, tx + 0.32 * h,
+                                   tb + 0.1 * h))
+                    for tx, tb, h, _, _ in trees):
+                continue
+            rocks.append((x, base, w, i))
+        self.scenery = {"key": key, "trees": trees, "rocks": rocks}
+
+    @staticmethod
+    def _stump(cr, x, base, h):
+        """A stump left where a log was cut for the stockade."""
+        w = h * 0.55
+        cr.set_source_rgb(*TRUNK_RGB)
+        cr.move_to(x - w * 0.6, base)
+        cr.line_to(x - w * 0.42, base - h * 0.7)
+        cr.line_to(x + w * 0.42, base - h * 0.8)
+        cr.line_to(x + w * 0.6, base)
+        cr.close_path()
+        cr.fill()
+        cr.set_source_rgb(*WOOD_HI_RGB)
+        cr.save()
+        cr.translate(x, base - h * 0.75)
+        cr.rotate(-0.12)
+        cr.scale(w * 0.42, h * 0.14)
+        cr.arc(0, 0, 1, 0, 2 * math.pi)
+        cr.restore()
+        cr.fill()
+
+    def _draw_scenery(self, cr):
+        items = [(tree[1], self._draw_tree, tree)
+                 for tree in self.scenery["trees"]]
+        items += [(rock[1], self._draw_boulder, rock)
+                  for rock in self.scenery["rocks"]]
+        items.sort(key=lambda it: it[0])
+        for _, draw, arg in items:
+            draw(cr, arg)
+
+    def _draw_boulder(self, cr, rock):
+        x, base, w, i = rock
+        self._rock(cr, x, base, w, w * 0.6, i)
 
     # -- the picture ------------------------------------------------------
 
@@ -3272,13 +3376,12 @@ class CpuView(Gtk.DrawingArea):
         self._lay_river(width, chip_foot, fy - 0.9 * t, t)
         self._draw_river(cr)
         self._draw_swimmer(cr)
+        key = (width, height, len(fort), len(rest))
+        pad = gap * 0.8
+        die = (ox - pad, oy - pad * 1.55, ox + ow + pad,
+               oy + t_o * 1.05 + label_h + pad * 1.55) if rest else None
         if not self.on:
-            key = (width, height, len(fort), len(rest))
             if self.wild is None or self.wild["key"] != key:
-                pad = gap * 0.8
-                die = (ox - pad, oy - pad * 1.55, ox + ow + pad,
-                       oy + t_o * 1.05 + label_h + pad * 1.55) \
-                    if rest else None
                 grove = (yx - 0.3 * t, fy - 0.3 * t, yx + yw + 0.3 * t,
                          fy + fh + 0.3 * t + t * 0.1)
                 self._lay_wilds(key, width, height, t, die, grove)
@@ -3304,6 +3407,13 @@ class CpuView(Gtk.DrawingArea):
             self._draw_fords(cr)
             for i in (0, 1):
                 self._draw_barracks(cr, i)
+            if self.scenery is None or self.scenery["key"] != key:
+                # The fort's box as _draw_fort will make it.
+                wall = 0.3 * t
+                fort_box = (yx - wall * 1.84, fy - wall - 1.6 * t,
+                            yx + yw + wall * 1.84, fy + fh + wall)
+                self._lay_scenery(key, width, height, t, die, fort_box)
+            self._draw_scenery(cr)
             self._draw_redcoats(cr)
 
         if rest:
@@ -4201,11 +4311,17 @@ def self_test():
     # The woods stand still from frame to frame, clear of the grove and
     # out of the water, and every size lays out, down to none at all.
     every = [cpu for core in SAMPLE_STATE["cores"] for cpu in core["cpus"]]
-    for reserved in (SAMPLE_STATE["reserved"], every):
-        view.set_state(SAMPLE_STATE["cores"], reserved, False)
+    for reserved, on in ((SAMPLE_STATE["reserved"], True), (every, True),
+                         (SAMPLE_STATE["reserved"], False), (every, False)):
+        view.set_state(SAMPLE_STATE["cores"], reserved, on)
         for size in ((60, 40), (300, 220), (1, 1)):
             view._draw(view, cr, *size)
-            assert view.wild is not None, size
+            for _ in range(5 * 30):
+                view.phase += 1 / 30
+                view._advance(1 / 30)
+            view._launch_boat(0)
+            view._draw(view, cr, *size)
+            assert (view.scenery if on else view.wild) is not None, size
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
     view._draw(view, cr, 1024, 680)
     trees = list(view.wild["trees"])
@@ -4410,6 +4526,19 @@ def self_test():
     run(view.HIDE_S + 0.5, 5)
     assert rc["hid"] is None and view._trail_p(rc["d"]) > view.COVER_P, rc
     view.drill_start = [None, None]
+
+    # The siege's woods keep off the trails, the fort, the barracks and
+    # the river.
+    for x, base, h, kind, i in view.scenery["trees"]:
+        for box in [view.fort_box] + view.barracks_box:
+            assert not view._in_box(box, x, base), (x, base, kind)
+        assert abs(base - view._river_y(x)) > view._river_half(x), (x, base)
+        for pts in view.trails:
+            for k in range(49):
+                p = k / 48
+                px, py = view._bezier(pts, p)
+                half = view.redcoat_s * 0.5 * view._depth_scale(p)
+                assert math.hypot(x - px, base - py) > half, (x, base, p)
 
     # Boats come down the river on their own, to one ford and then the
     # other; one pulls in at its ford and its men step ashore one by one,
