@@ -382,12 +382,46 @@ class World:
       better chance the more are out;
     - steal: take a beaver from a trap that has caught one;
     - raid: rob a cache of meals, only while its owner is well away;
+    - stalk a man: worth more the hungrier it is, less the further it
+      has to charge, and against it is its dread of him, which hunger
+      wears away and each other man within NEAR_D of him multiplies, so
+      a lone man is the one it goes for, and only a hungry bear goes
+      for any, and none hurt past the point where it would break off
+      a fight (below);
     - wander.
     Its belly is the cap on all of these: a full bear does not eat, it
     wanders. Winter it sleeps in a den on its flank, from the first cold
     to the thaw, so it wakes hungry in spring; one with little left and
     nothing on its flank worth staying for walks out the way it came.
     Rails: never more than BEARS_MAX.
+    A stalked man may see it coming, the likelier the closer
+    it is; he is watchful (VIGILANCE) when he is fed and not bent over
+    his work, and once he has seen it he stands his ground. If he moves
+    off before it reaches him, it lets him go.
+    The fight. If he saw it coming he gets one shot as it closes, better
+    aimed (likelier to hit, and harder) the longer he had from raising
+    his rifle (REACT_S) to the moment it reached him, full aim taking
+    AIM_S; there is no reloading. Then it is claws against his knife,
+    an exchange every EXCHANGE_S: the bear swipes the man in front of
+    it and every man at it stabs, each blow's chance scaled by the
+    striker's health and fed-ness or energy. The shot carries HEAR_D
+    (the struggle alone a third of that): every other man of the flank
+    within it runs to help, fires once as he arrives, and joins in. A
+    man at no health dies of the bear. A bear hurt below FLEE_AT breaks
+    off and runs for its den; the hungrier, the longer it presses on. A
+    bear that leaves no man standing eats the one it killed. Nobody
+    pins the outcome: it falls out of noticing, aim, help and the
+    exchanges.
+    After. A slain bear is skinned where it fell: its hide, worth
+    HIDE_PELTS pelts, goes to the man who did it most harm (it hangs
+    stretched at his cabin for a season), and its meat is shared among
+    the men there. A man the bear kills leaves his goods and cabin like
+    any other, so the fewer men there are the more each one has; and
+    the men of his flank stay watchful (ALERT_VIG) for ALERT_S, idling
+    at a neighbour's cabin rather than their own, which puts them in
+    company. Wounds heal only as the rest of him does, fed and warm, so
+    a man mauled in autumn goes into the winter with less to lose. A
+    bear that got away heals slowly while it is well fed.
     """
 
     # -- the world's rates --
@@ -436,7 +470,7 @@ class World:
     WINTER_LOGS = 10        # logs he wants in hand to burn
     HEARTH_S = 90.0         # sheltering burns a log this often...
     COLD_HEARTH = 0.7       # ...and keeps out this much less without one
-    THAW_LOGS = 6           # the spring thaw rots this much of any cabin
+    THAW_LOGS = 5           # the spring thaw rots this much of any cabin
     FED_DRAIN = 1 / 1200    # fed-ness lost a second
     HUNGER_K = 1 / 1800     # health lost a second with nothing in him
     COLD_K = 1 / 600        # ...and out in the full cold of winter
@@ -460,7 +494,7 @@ class World:
     GRAVE_S = 2 * YEAR_S
 
     BEARS_MAX = 2           # rail: never more in the valley
-    BEAR_ARRIVE_K = 0.6     # bears a season per unit a flank offers
+    BEAR_ARRIVE_K = 0.15    # bears a season per unit a flank offers
     BEAR_DRAIN = 1 / 2400   # energy lost a second afoot...
     DEN_DRAIN = 1 / 6000    # ...and asleep in the den
     DEN_U = 0.06            # the den, across its flank from the edge
@@ -478,6 +512,35 @@ class World:
     MEAT_GAIN = 0.06        # a meal
     LEAVE_E = 0.15          # energy below which, with nothing near, it goes
     WANDER_PULL = 0.02
+    CHARGE_S = 5.0          # seconds to charge a unit of distance
+    MAN_GAIN = 0.7          # a man, to a starving bear; less to a fed one
+    EFFORT_S = 60.0         # the struggle it reckons a man will cost
+    NEAR_D = 0.35           # men this close to a man are his company...
+    COMPANY_K = 2.5         # ...each multiplying its dread by this more
+    RISK_K = 1.5            # its dread of a man, at no hunger
+    NOTICE_K = 0.22         # a man's chance a tick to see a bear coming,
+    NOTICE_S = 10.0         # ...times exp(-seconds until it reaches him/this)
+    VIGILANCE = (0.5, 0.6)  # his watch with nothing in him, and at work
+    REACT_S = 1.5           # from seeing it to the rifle at his shoulder
+    AIM_S = 5.0             # ...and from there to a fully aimed shot
+    HIT_P = (0.3, 0.6)      # a shot's chance to hit unaimed, and full aim's
+    SHOT_DMG = 0.55         # of a bear's health, fully aimed; 0.6 unaimed
+    HELP_AIM = 0.4          # a helper's aim, arriving at a run
+    HEAR_D = 1.2            # a shot carries this far; a struggle a third
+    RUN_K = 0.6             # running, as a share of WALK_S
+    EXCHANGE_S = 2.0        # between blows in the close fight
+    CLAW_P, CLAW_DMG = 0.4, 0.2
+    KNIFE_P, KNIFE_DMG = 0.5, 0.2
+    FLEE_AT = 0.35          # health below which a bear breaks off...
+    FLEE_HUNGER = 0.6       # ...lowered by this times its hunger
+    EAT_S = 120.0
+    CARCASS_S = 120.0
+    BEAR_HEAL_K = 1 / 3000  # health won back a second with energy > 0.5
+    HIDE_PELTS = 4
+    BEAR_MEAT = 12
+    HIDE_S = SEASON_S       # the hide hangs at his cabin this long
+    ALERT_S = SEASON_S / 2  # a killing keeps his flank watchful this long
+    ALERT_VIG = 1.6
 
     def __init__(self, seed=1):
         self.seed = seed
@@ -542,7 +605,8 @@ class World:
               "t1": self.time, "t2": self.time, "site": None,
               "tree": None, "carry": None, "fuel": False, "hearth": 0.0,
               "effort": {},
-              "effort_prev": {}, "winter": None}
+              "effort_prev": {}, "winter": None, "fight": None,
+              "alert": None, "hide": None}
         self.next_id += 1
         self.plots[f][k]["owner"] = tr["id"]
         self.trappers.append(tr)
@@ -737,13 +801,33 @@ class World:
             b["energy"] -= (self.DEN_DRAIN if asleep else self.BEAR_DRAIN) \
                 * self.TICK_S
             if b["energy"] <= 0:
+                self._unhook(b)
                 self.predators.remove(b)
                 tally["starved"] += 1
                 continue
+            if b["energy"] > 0.5 and job != "fight":
+                b["health"] = min(1.0, b["health"]
+                                  + self.BEAR_HEAL_K * self.TICK_S)
             if job == "leave" and arrived:
                 self.predators.remove(b)
                 tally["left"] += 1
                 continue
+            if job == "stalk":
+                self._stalk_tick(b, cold)
+                continue
+            if job == "fight":
+                self._fight_tick(b, cold)
+                continue
+            if job == "eat" and arrived:
+                tr = next((tr for tr in self.trappers if tr["to"] == b["to"]
+                           and tr["fight"] is None
+                           and self.time >= tr["t1"]), None)
+                if tr is not None:
+                    # He walks up on it over its kill: he sees it, and
+                    # it does not let him go.
+                    self._stalk(b, tr)
+                    self._fight_start(b, tr, self.HELP_AIM)
+                    continue
             if job == "hunt" and arrived and self.time < b["t2"]:
                 self._bear_hunt(b)
             if cold >= 0.5 and job != "den" or asleep and cold < 0.5 \
@@ -798,6 +882,8 @@ class World:
                 site.update(state="empty", by=None, since=self.time)
                 self.tally["bears"]["eaten"] += 1
                 self._feed(b, self.BEAVER_GAIN)
+        elif job == "eat":
+            self._feed(b, self.MAN_GAIN)
         elif job == "raid":
             owner = self._owner(to)
             if owner is not None and owner["meat"] > 0 \
@@ -817,6 +903,243 @@ class World:
 
     def _far(self, tr, place):
         return self.distance(self._where(tr), place) >= self.RAID_FAR
+
+    def _man(self, mid):
+        return next((tr for tr in self.trappers if tr["id"] == mid), None)
+
+    def _company(self, f, place, but):
+        """The other men of flank f about place."""
+        return sum(tr["f"] == f and tr is not but
+                   and self.distance(tr["to"], place) <= self.NEAR_D
+                   for tr in self.trappers)
+
+    def _vigilance(self, tr):
+        """How watchful he is, 1 fed and idle."""
+        none, busy = self.VIGILANCE
+        v = none + (1 - none) * tr["fed"]
+        if self.time >= tr["t1"] and tr["job"] not in ("rest", "fight"):
+            v *= busy
+        if self._alert(tr):
+            v *= self.ALERT_VIG
+        return v
+
+    def _alert(self, tr):
+        return tr["alert"] is not None and \
+            self.time - tr["alert"] < self.ALERT_S
+
+    def _sheltered(self, tr):
+        plot = self.plots[tr["f"]][tr["plot"]]
+        return tr["job"] == "shelter" and self.time >= tr["t1"] \
+            and plot["logs"] >= self.CABIN_LOGS / 2
+
+    def _stalk(self, b, tr):
+        b["target"] = tr["id"]
+        b["fight"] = {"target": tr["id"], "t0": self.time,
+                      "company": self._company(b["f"], tr["to"], tr),
+                      "wary": self._alert(tr),
+                      "saw": None, "contact": None, "shot": None,
+                      "hit": False, "help": 0, "next": None, "dmg": {},
+                      "dead": []}
+        self._send(b, tr["to"], "stalk", 0.0, self.CHARGE_S)
+
+    def _stalk_tick(self, b, cold):
+        """Closing on its man: he may see it coming."""
+        tr = self._man(b["target"])
+        if tr is None or cold >= 0.5 or tr["fight"] is None \
+                and tr["to"] != b["to"]:
+            self._call_off(b, cold)
+            return
+        contact = max(b["t1"], tr["t1"])
+        if self.time >= contact:
+            self._fight_start(b, tr)
+            return
+        if tr["fight"] is None:
+            p = self.NOTICE_K * self._vigilance(tr) * math.exp(
+                -(contact - self.time) / self.NOTICE_S)
+            if self.rng.random() < p:
+                b["fight"]["saw"] = self.time
+                tr["fight"] = {"bear": b["id"], "saw": self.time,
+                               "shot": None, "help": False}
+
+    def _fighters(self, b):
+        return [tr for tr in self.trappers if tr["fight"] is not None
+                and tr["fight"]["bear"] == b["id"]]
+
+    def _unhook(self, b):
+        """Its men go back to what they were about, or, if they were
+        fighting it, home."""
+        for tr in self._fighters(b):
+            tr["fight"] = None
+            if tr["job"] == "fight":
+                self._go(tr, ["plot", tr["f"], tr["plot"]], "rest",
+                         self.rng.uniform(3.0, 8.0))
+        b["target"], b["fight"] = None, None
+
+    def _drop_errand(self, tr):
+        """He leaves what he was about; a trap he meant to set is free."""
+        if tr["job"] == "set" and tr["site"] is not None:
+            st = self.sites[tr["f"]][tr["site"]]
+            if st["by"] == tr["id"] and st["state"] == "empty":
+                st["by"] = None
+        tr["site"], tr["tree"], tr["fuel"] = None, None, False
+
+    def _fight_start(self, b, tr, aim=None):
+        """It reaches its man: his shot, if he has one, then the close
+        fight."""
+        fight = b["fight"]
+        fight["contact"] = self.time
+        fight["next"] = self.time + self.EXCHANGE_S
+        b["job"] = "fight"
+        if tr["fight"] is None:
+            tr["fight"] = {"bear": b["id"], "saw": None, "shot": None,
+                           "help": False}
+        self._drop_errand(tr)
+        tr["job"] = "fight"
+        saw = tr["fight"]["saw"]
+        if aim is None and saw is not None:
+            aim = min(1.0, max(0.0, (self.time - saw - self.REACT_S)
+                               / self.AIM_S))
+        if aim is not None:
+            fight["shot"] = self.time
+            fight["hit"] = self._shoot(tr, b, aim)
+        self._call_help(b)
+        self._fight_over(b)
+
+    def _shoot(self, tr, b, aim):
+        tr["fight"]["shot"] = self.time
+        if self.rng.random() >= self.HIT_P[0] + self.HIT_P[1] * aim:
+            return False
+        self._hurt_bear(b, tr, self.SHOT_DMG * (0.6 + 0.4 * aim)
+                        * self.rng.uniform(0.7, 1.3))
+        return True
+
+    def _hurt_bear(self, b, tr, dmg):
+        b["health"] -= dmg
+        hurt = b["fight"]["dmg"]
+        hurt[str(tr["id"])] = hurt.get(str(tr["id"]), 0.0) + dmg
+        b["blow"] = {"t": self.time, "on": "bear", "id": b["id"]}
+
+    def _call_help(self, b):
+        """The men of its flank in earshot come running."""
+        fight = b["fight"]
+        hear = self.HEAR_D if fight["shot"] is not None else self.HEAR_D / 3
+        for tr in self.trappers:
+            if tr["f"] != b["f"] or tr["fight"] is not None or \
+                    self.distance(self._where(tr), b["to"]) > hear:
+                continue
+            self._drop_errand(tr)
+            tr["to"] = self._where(tr)
+            tr["fight"] = {"bear": b["id"], "saw": None, "shot": None,
+                           "help": True}
+            self._send(tr, b["to"], "fight", 0.0, self.WALK_S * self.RUN_K)
+            fight["help"] += 1
+
+    def _fight_tick(self, b, cold):
+        """An exchange of blows every EXCHANGE_S, helpers firing as they
+        come up."""
+        fight = b["fight"]
+        if cold >= 0.5:
+            self._fight_end(b, "fled")
+            return
+        men = self._fighters(b)
+        here = [tr for tr in men if self.time >= tr["t1"]]
+        for tr in here:
+            if tr["fight"]["shot"] is None and tr["fight"]["help"]:
+                self._shoot(tr, b, self.HELP_AIM)
+                if self._fight_over(b):
+                    return
+        if self._fight_over(b):
+            return
+        self._call_help(b)
+        if not here or self.time < fight["next"]:
+            return
+        fight["next"] = self.time + self.EXCHANGE_S
+        tid = fight["target"]
+        man = min(here, key=lambda tr: tr["id"] != tid)
+        if self.rng.random() < self.CLAW_P * b["health"] * (
+                0.6 + 0.4 * b["energy"]):
+            man["health"] -= self.CLAW_DMG * self.rng.uniform(0.7, 1.3)
+            b["blow"] = {"t": self.time, "on": "man", "id": man["id"]}
+            if man["health"] <= 0:
+                fight["dead"].append(man["id"])
+                self.tally["bears"]["mauled"] += 1
+                here.remove(man)
+                self.die(man, "bear")
+        for tr in here:
+            if self.rng.random() < self.KNIFE_P * tr["health"] * (
+                    0.5 + 0.5 * tr["fed"]):
+                self._hurt_bear(b, tr, self.KNIFE_DMG
+                                * self.rng.uniform(0.7, 1.3))
+        self._fight_over(b)
+
+    def _beaten(self, b):
+        """Too hurt to fight on; the hungrier, the more it takes."""
+        hunger = 1 - b["energy"]
+        return b["health"] < self.FLEE_AT * (1 - self.FLEE_HUNGER * hunger)
+
+    def _fight_over(self, b):
+        """Ends the fight if the bear is dead or has had enough, or no
+        man is left at it or coming."""
+        if b["health"] <= 0:
+            self._fight_end(b, "slain")
+            return True
+        if not self._fighters(b):
+            self._fight_end(b, "over")
+            return True
+        if self._beaten(b):
+            self._fight_end(b, "fled")
+            return True
+        return False
+
+    def _fight_end(self, b, how):
+        fight = b["fight"]
+        if how == "slain":
+            self._spoils(b)
+        self.tally["events"].append({
+            "kind": "fight", "bear": b["id"], "f": b["f"],
+            "target": fight["target"], "company": fight["company"],
+            "wary": fight["wary"],
+            "saw": fight["saw"] is not None,
+            "shot": fight["shot"] is not None, "hit": fight["hit"],
+            "help": fight["help"], "won": not fight["dead"],
+            "slain": how == "slain", "fled": how == "fled",
+            "dead": len(fight["dead"]), "t0": fight["t0"], "t": self.time})
+        tally = self.tally["bears"]
+        tally["fights"] += 1
+        tally["slain"] += how == "slain"
+        self._unhook(b)
+        if how == "slain":
+            b.update(job="dead", t1=self.time, t2=self.time + self.CARCASS_S)
+        elif how == "fled":
+            self._send(b, ["den", b["f"]], "flee", 60.0, self.CHARGE_S)
+        elif fight["dead"]:
+            self._send(b, b["to"], "eat", self.EAT_S, self.BEAR_WALK_S)
+        else:
+            b["t2"] = self.time
+            self._bear_next(b, self.cold())
+
+    def _spoils(self, b):
+        """The hide to whoever hurt it most, the meat shared out."""
+        here = [tr for tr in self._fighters(b) if self.time >= tr["t1"]]
+        if not here:
+            return
+        hurt = b["fight"]["dmg"]
+        ids = list(hurt)
+        victor = max(here, key=lambda tr: (
+            hurt.get(str(tr["id"]), 0.0),
+            -ids.index(str(tr["id"])) if str(tr["id"]) in ids else -99))
+        victor["pelts"] += self.HIDE_PELTS
+        victor["hide"] = self.time
+        share = self.BEAR_MEAT // len(here)
+        for tr in here:
+            tr["meat"] += share
+        victor["meat"] += self.BEAR_MEAT - share * len(here)
+
+    def _call_off(self, b, cold):
+        """It gives up on its man; he goes back to what he was about."""
+        self._unhook(b)
+        b["t2"] = self.time
+        self._bear_next(b, cold)
 
     def _bear_next(self, b, cold):
         """It weighs what each errand would gain it a minute, and goes."""
@@ -865,13 +1188,26 @@ class World:
                 options.append((rate(take * self.MEAT_GAIN, place,
                                      self.RAID_S),
                                 place, "raid", self.RAID_S))
+        for tr in [] if self._beaten(b) else self.trappers:
+            if tr["f"] != f or tr["fight"] is not None \
+                    or self._sheltered(tr):
+                continue
+            mins = (self.CHARGE_S * self.distance(here, tr["to"])
+                    + self.EFFORT_S) / 60
+            dread = self.RISK_K * (1 - hunger) ** 2 * (
+                1 + self.COMPANY_K * self._company(f, tr["to"], tr))
+            options.append((self.MAN_GAIN * (0.2 + hunger) / mins - dread,
+                            tr, "stalk", 0.0))
         woods = [i for i, slot in enumerate(self.trees)
                  if slot["f"] == f and slot["zone"] == "woods"]
         options.append((self.WANDER_PULL, ["tree", self.rng.choice(woods)],
                         "wander", jit(20.0, 60.0)))
         _, place, job, work = max(options,
                                   key=lambda o: o[0] * jit(0.85, 1.15))
-        self._send(b, place, job, work, walk)
+        if job == "stalk":
+            self._stalk(b, place)
+        else:
+            self._send(b, place, job, work, walk)
 
     def _season_turn(self):
         self.tally = self._fresh_tally()
@@ -1114,6 +1450,8 @@ class World:
             if tr["health"] <= 0:
                 dead.append((tr, "hunger" if starve > chill else "cold"))
                 continue
+            if tr["fight"] is not None:
+                continue  # the bear's turn decides what he does
             if self.time >= tr["t2"]:
                 self._trapper_done(tr)
                 self._trapper_next(tr, cold)
@@ -1249,7 +1587,17 @@ class World:
         elif pick == "shelter":
             self._go(tr, home, "shelter", self.SHELTER_S)
         else:
-            self._go(tr, home, "rest", jit(3.0, 8.0))
+            self._go(tr, self._idle_spot(tr), "rest", jit(3.0, 8.0))
+
+    def _idle_spot(self, tr):
+        """Home; or, watchful after a killing, the nearest neighbour's."""
+        home = ["plot", tr["f"], tr["plot"]]
+        if not self._alert(tr):
+            return home
+        near = [["plot", o["f"], o["plot"]] for o in self.trappers
+                if o["f"] == tr["f"] and o is not tr]
+        return min(near, key=lambda p: self.distance(home, p),
+                   default=home)
 
     EFFORT = {"set": "trap", "check": "trap", "collect": "trap",
               "stash": "trap"}
@@ -1272,6 +1620,10 @@ class World:
         self.plots[tr["f"]][tr["plot"]]["owner"] = None
         deaths = self.tally["deaths"]
         deaths[cause] = deaths.get(cause, 0) + 1
+        if cause == "bear":
+            for o in self.trappers:
+                if o["f"] == tr["f"]:
+                    o["alert"] = self.time
         if tr["winter"] is not None:
             self._winter_over(tr, 1.0)
         event = {"kind": "death", "id": tr["id"], "cause": cause,
@@ -1298,7 +1650,8 @@ class World:
             heir[key] += dead[key]
         theirs = self.plots[dead["f"]][dead["plot"]]
         mine = self.plots[heir["f"]][heir["plot"]]
-        if theirs["logs"] > mine["logs"]:
+        # One in a fight takes the goods but cannot stop to move house.
+        if theirs["logs"] > mine["logs"] and heir["fight"] is None:
             mine["owner"] = None
             theirs["owner"] = heir["id"]
             moved = heir["f"] != dead["f"]
@@ -1426,7 +1779,7 @@ class World:
                 return place(v)
             if t is None or key in ("owner", "by", "felled", "site",
                                      "tree", "carry", "winter", "target",
-                                     "fight", "blow"):
+                                     "fight", "blow", "alert", "hide"):
                 # Each of these may be empty; the ones it matters for are
                 # checked on their own below.
                 return v is None or isinstance(v, (str, dict)) or num(v)
@@ -1460,12 +1813,22 @@ class World:
         if any(b["job"] not in ("lodge", "feed", "cut", "haul", "fetch",
                                 "swim") for b in self.beavers):
             bad("a beaver's job")
+        fight = {"target": 0, "t0": 0.0, "company": 0, "wary": False,
+                 "saw": None, "contact": None, "shot": None, "hit": False,
+                 "help": 0, "next": None, "dmg": {}, "dead": []}
         for b in self.predators:
+            f = b["fight"]
+            if f is not None and not (
+                    like(f, fight) and all(num(f[k]) for k in (
+                        "saw", "contact", "shot", "next") if f[k] is not None)
+                    and all(num(x) for x in f["dmg"].values())
+                    and all(num(x) for x in f["dead"])):
+                bad("a bear's fight")
             if not (idx(b["f"], 2, False) and num(b["energy"])
                     and num(b["health"])
                     and b["job"] in ("wander", "fish", "hunt", "steal",
-                                     "raid", "eat", "flee", "den", "leave",
-                                     "dead")):
+                                     "raid", "stalk", "fight", "eat", "flee",
+                                     "den", "leave", "dead")):
                 bad("a bear")
         if any(st["state"] not in ("empty", "set", "caught")
                for row in self.sites for st in row):
@@ -1473,12 +1836,18 @@ class World:
         for tr in self.trappers:
             win = tr["winter"]
             if not (tr["job"] in ("rest", "set", "check", "collect", "stash",
-                                  "chop", "build", "fire", "shelter")
+                                  "chop", "build", "fire", "shelter",
+                                  "fight")
                     and all(num(x) for x in list(tr["effort"].values())
                             + list(tr["effort_prev"].values()))
                     and idx(tr["plot"], len(self.PLOT_U), False)
                     and idx(tr["site"], len(self.SITE_SPOTS))
                     and tr["carry"] in (None, "beaver", "log")
+                    and all(tr[k] is None or num(tr[k])
+                            for k in ("alert", "hide"))
+                    and (tr["fight"] is None or like(tr["fight"], {
+                        "bear": 0, "saw": None, "shot": None,
+                        "help": False}))
                     and (win is None or like(win, {
                         "start": 0.0, "low": 0.0, "share": 0.0,
                         "ready": False}))):
@@ -6661,6 +7030,36 @@ def envelope(seeds, years):
     return rows
 
 
+def fight_sample(seeds, years, arrive=6.0):
+    """Run each seed's valley with bears coming arrive times as often, a
+    minute at a time, and return every season's events, the men's
+    exposure (minutes alone, minutes in company), their watch (total
+    vigilance and minutes, calm and then after a killing), and whether
+    the rails and the dens held throughout."""
+    events, exposure, held = [], [0, 0], True
+    watch = [0.0, 0, 0.0, 0]
+    for seed in seeds:
+        w = World(seed)
+        w.BEAR_ARRIVE_K *= arrive
+        for n in range(years * 4):
+            end = (n + 1) * World.SEASON_S - 0.5
+            while w.time < end:
+                w.run(min(60.0, end - w.time))
+                live = [b for b in w.predators if b["job"] != "dead"]
+                held &= len(live) <= w.BEARS_MAX and len(
+                    {b["f"] for b in live}) == len(live)
+                held &= w.cold() < 1 or all(b["job"] == "den"
+                                            for b in live)
+                for tr in w.trappers:
+                    exposure[w._company(tr["f"], tr["to"], tr) > 0] += 1
+                    k = 2 * w._alert(tr)
+                    watch[k] += w._vigilance(tr)
+                    watch[k + 1] += 1
+            events += w.tally["events"]
+            w.run(0.5)
+    return events, exposure, watch, held
+
+
 def beaver_tests(view, cr, rows):
     """The trees, the beavers and their works, headless and drawn; rows
     is envelope((1, 2, 3, 4), 4)."""
@@ -7026,8 +7425,11 @@ def trapper_tests(view, cr, rows):
     deaths = sum(sum(r["tally"]["deaths"].values()) for r in every)
     assert rails <= 4 and deaths >= 1 and arrivals > rails, \
         (rails, arrivals, deaths)
+    # Bears have made the beavers-to-trapping link a near tie over four
+    # valleys; it is judged over eight.
+    more = envelope((5, 6, 7, 8), 4)
     shares = []
-    for r in every:
+    for r in every + [r for seed in more for r in more[seed]]:
         if r["season"] == 3:
             continue
         for effort in r["effort"].values():
@@ -7249,20 +7651,282 @@ def bear_tests(view, cr, rows):
     for _ in range(8):
         w.run(S)
         assert not w.predators and w.tally["bears"]["came"] == 0
-    w = staged(10, seed=22)
-    w.BEAR_ARRIVE_K = World.BEAR_ARRIVE_K
-    while len(w.beavers) < 12:
-        w._beaver(len(w.beavers) % 2, 0.7)
-    for f, k in ((0, 1), (1, 1)):
-        w._trapper(f, k, ["plot", f, k])
-    for tr in w.trappers:
-        tr["meat"] = 8
-    w.run(S - 20)
-    assert w.predators, "a rich valley draws a bear"
+    def valley(beavers, men):
+        w = staged(10)
+        w.BEAR_ARRIVE_K = 10 * World.BEAR_ARRIVE_K  # enough to count
+        bare(w)
+        for k in range(beavers):
+            w._beaver(k % 2, 0.7)
+        for k in range(men):
+            w._trapper(k % 2, k // 2, ["plot", k % 2, k // 2])["meat"] = 8
+        return w
+
+    came = []
+    for beavers, men in ((12, 4), (2, 1)):
+        w = valley(beavers, men)
+        n = 0
+        for _ in range(3 * 15):  # spring to autumn, sending each one off
+            w.run(60)
+            n += len(w.predators)
+            w.predators = []
+        came.append(n)
+    assert came[0] > 2 * came[1] > 0, came
+    w, most = valley(12, 4), 0
     for _ in range(3 * 4):
         w.run(S / 4)
-        assert len(w.predators) <= w.BEARS_MAX
+        most = max(most, len(w.predators))
         assert len({b["f"] for b in w.predators}) == len(w.predators)
+    assert most == w.BEARS_MAX, most
+
+    # A hungry bear goes for the man on his own, not the pair; a fed one
+    # would sooner fish, and one too hurt to fight goes for nobody.
+    def three(seed, hunger, t=10):
+        w = staged(t, seed)
+        c, a = w.trappers
+        w._trapper(1, 1, ["plot", 1, 0])
+        for tr, to in zip(w.trappers, (["site", 1, 1], ["plot", 1, 0],
+                                       ["plot", 1, 0])):
+            tr.update(f=1, to=to, t1=w.time)
+        c["plot"] = 1
+        b = w._bear(1, ["edge", 1])
+        b["energy"] = 1 - hunger
+        return w, a, c, b
+
+    for seed in range(5):
+        w, a, c, b = three(seed, 0.5)
+        w._bear_next(b, w.cold())
+        assert b["job"] == "stalk" and b["target"] == c["id"], b
+        assert b["fight"]["company"] == 0 and b["to"] == c["to"]
+        assert abs(b["t1"] - w.time - w.CHARGE_S
+                   * w.distance(["edge", 1], c["to"])) < 1e-9
+        w, a, c, b = three(seed, 0.1, 2 * S + 10)
+        w._bear_next(b, w.cold())
+        assert b["job"] == "fish", b["job"]
+        w, a, c, b = three(seed, 0.5)
+        c["to"] = a["to"]
+        w._bear_next(b, w.cold())
+        assert b["job"] != "stalk", "not with company"
+        w, a, c, b = three(seed, 0.5)
+        b["health"] = w.FLEE_AT * (1 - w.FLEE_HUNGER * 0.5) - 0.01
+        w._bear_next(b, w.cold())
+        assert b["job"] != "stalk", "not while too hurt to fight"
+
+    # He may see it coming: never if he never looks, at once if he always
+    # does; hunger and work dull his watch. If he moves off unseeing, here
+    # to his fellows, it lets him go.
+    w, a, c, b = three(0, 0.5)
+    tr = a
+    assert w._vigilance(tr) == 1.0
+    tr["fed"] = 0.0
+    assert w._vigilance(tr) == w.VIGILANCE[0]
+    tr.update(fed=1.0, job="chop", t1=w.time)
+    assert w._vigilance(tr) == w.VIGILANCE[1]
+    for k, seen in ((0.0, False), (1e9, True)):
+        w, a, c, b = three(0, 0.5)
+        w.NOTICE_K = k
+        w._bear_next(b, w.cold())
+        w.run(1)
+        assert (c["fight"] is not None) == seen, c["fight"]
+        assert (b["fight"]["saw"] is not None) == seen, b["fight"]
+    assert c["fight"] == {"bear": b["id"], "saw": w.time, "shot": None,
+                          "help": False}
+    w, a, c, b = three(0, 0.5)
+    w.NOTICE_K = 0.0
+    w._bear_next(b, w.cold())
+    w._go(c, ["plot", 1, 0], "rest", 5.0)  # to the others
+    w.run(1)
+    assert b["target"] is None and b["job"] != "stalk", b
+
+    # The fight. One man at his cabin on flank 1, the bear closing; the
+    # other flank's man is out of it.
+    def duel(**rates):
+        w = staged(S + 10)
+        w.trappers[0]["t2"] = 1e9
+        man = w.trappers[1]
+        man.update(to=["plot", 1, 0], t1=w.time, t2=w.time + 1e6,
+                   job="rest", meat=0, pelts=0)
+        b = w._bear(1, ["edge", 1])
+        b["energy"] = 0.3
+        w.NOTICE_K, w.HEAR_D = 0.0, 0.0
+        for k, v in rates.items():
+            setattr(w, k, v)
+        w._stalk(b, man)
+        return w, man, b
+
+    def fights(w):
+        return [e for e in w.tally["events"] if e["kind"] == "fight"]
+
+    # He sees it, and a sure shot drops it before it reaches him: the
+    # hide and the meat are his, he goes home, and the carcass lies a
+    # while.
+    w, man, b = duel(NOTICE_K=1e9, HIT_P=(1.0, 0.0), SHOT_DMG=2.0)
+    w.run(b["t1"] - w.time + 1)
+    e, = fights(w)
+    assert e["saw"] and e["shot"] and e["hit"] and e["slain"] and e["won"]
+    assert (e["dead"], e["help"], e["company"]) == (0, 0, 0), e
+    assert w.tally["bears"]["fights"] == 1 and w.tally["bears"]["slain"] == 1
+    assert b["job"] == "dead" and b["fight"] is None
+    assert man["fight"] is None and man["job"] == "rest"
+    assert man["pelts"] == w.HIDE_PELTS and man["meat"] == w.BEAR_MEAT
+    assert man["hide"] == e["t"] and w.stats()["bears"] == 0
+    w.run(w.CARCASS_S)
+    assert not w.predators, "the carcass is gone"
+    # A miss is his only shot: then it is knife and claws.
+    w, man, b = duel(NOTICE_K=1e9, HIT_P=(0.0, 0.0), CLAW_P=0.0,
+                     KNIFE_P=0.0)
+    w.run(b["t1"] - w.time + 1)
+    shot = man["fight"]["shot"]
+    assert shot is not None and b["job"] == "fight" and man["job"] == "fight"
+    w.run(10)
+    assert man["fight"]["shot"] == shot and b["health"] == 1.0
+    # Unseen, he gets no shot; claws that always land kill him, and the
+    # bear eats; knives that always land kill it in one exchange.
+    w, man, b = duel(CLAW_P=1.0, CLAW_DMG=2.0, KNIFE_P=0.0)
+    w.run(b["t1"] - w.time + w.EXCHANGE_S + 1)
+    e, = fights(w)
+    assert man not in w.trappers and w.tally["deaths"] == {"bear": 1}
+    assert not e["saw"] and not e["shot"] and e["dead"] == 1 and not e["won"]
+    assert w.tally["bears"]["mauled"] == 1
+    assert w.graves[-1]["place"] == ["plot", 1, 0]
+    assert b["job"] == "eat", b["job"]
+    energy = b["energy"]
+    w.run(b["t2"] - w.time + 1)
+    assert b["energy"] > energy + w.MAN_GAIN - w.BEAR_DRAIN * (
+        w.EAT_S + 5), b["energy"]
+    w, man, b = duel(KNIFE_P=1.0, KNIFE_DMG=2.0, CLAW_P=0.0)
+    w.run(b["t1"] - w.time + w.EXCHANGE_S + 1)
+    e, = fights(w)
+    assert e["slain"] and not e["shot"] and man["health"] == 1.0, e
+
+    # The shot carries HEAR_D, the struggle a third of it: men in earshot
+    # run to help, fire once as they come up, and share the meat.
+    for shoot, near, far in ((True, ["site", 1, 1], ["site", 1, 2]),
+                             (False, ["site", 1, 0], ["site", 1, 1])):
+        w, man, b = duel(NOTICE_K=1e9 if shoot else 0.0, HIT_P=(0.0, 0.0),
+                         CLAW_P=0.0, KNIFE_P=0.0)
+        w.HEAR_D = 0.5
+        helper = w._trapper(1, 1, near)
+        idle = w.trappers[0]
+        idle.update(f=1, plot=1, at=far, to=far, t1=w.time, t2=1e9)
+        helper.update(to=near, t1=w.time, t2=1e9, meat=0)
+        w.run(b["t1"] - w.time + 1)
+        assert helper["job"] == "fight" and helper["fight"]["help"]
+        assert abs(helper["t1"] - helper["t0"] - max(1.0, w.WALK_S * w.RUN_K
+                   * w.distance(near, ["plot", 1, 0]))) < 1e-9
+        assert idle["fight"] is None and idle["job"] != "fight"
+        w.run(helper["t1"] - w.time + 1)
+        assert helper["fight"]["shot"] is not None, helper["fight"]
+    # (A mid-fight valley, a helper still running, saves and runs on
+    # exactly as it would have.)
+    w, man, b = duel(NOTICE_K=1e9, HIT_P=(0.0, 0.0))
+    w.HEAR_D = 0.5
+    helper = w._trapper(1, 1, ["site", 1, 1])
+    helper["t1"] = w.time
+    w.run(math.ceil(b["t1"]) - w.time + 0.5)
+    assert helper["t1"] > w.time and man["fight"] and b["fight"]
+    w2 = World.from_dict(json.loads(json.dumps(w.to_dict())))
+    assert w2.to_dict() == w.to_dict()
+    for k, v in vars(w).items():
+        if k.isupper():
+            setattr(w2, k, v)  # the rates this test set
+    w.run(World.YEAR_S)
+    w2.run(World.YEAR_S)
+    assert w2.to_dict() == w.to_dict(), "a mid-fight world runs on the same"
+    w, man, b = duel(NOTICE_K=1e9, HIT_P=(0.0, 0.0), CLAW_P=0.0,
+                     KNIFE_P=1.0, KNIFE_DMG=0.07, FLEE_AT=0.0)
+    w.HEAR_D = 0.5
+    helper = w._trapper(1, 1, ["site", 1, 1])
+    helper.update(t1=w.time, t2=1e9, meat=0, pelts=0)
+    w.run(60)
+    e, = fights(w)
+    assert e["slain"] and e["help"] == 1, e
+    assert man["meat"] + helper["meat"] == w.BEAR_MEAT
+    assert man["pelts"] == w.HIDE_PELTS and helper["pelts"] == 0, \
+        "the hide to the man who did it most harm"
+
+    # A badly hurt bear breaks off for its den; a starving one presses on.
+    w, man, b = duel(NOTICE_K=1e9, HIT_P=(0.0, 0.0), CLAW_P=0.0,
+                     KNIFE_P=0.0)
+    b.update(health=0.2, energy=1.0)
+    w.run(b["t1"] - w.time + 1)
+    e, = fights(w)
+    assert e["fled"] and b["job"] == "flee" and b["to"] == ["den", 1], b
+    assert man["fight"] is None
+    w, man, b = duel(FLEE_HUNGER=1.0, CLAW_P=0.0, KNIFE_P=0.0)
+    b.update(health=0.2, energy=0.01)
+    w.run(b["t1"] - w.time + 3 * w.EXCHANGE_S)
+    assert b["job"] == "fight" and not fights(w), b["job"]
+    # One that got away heals while it is well fed.
+    w = staged(S + 10)
+    w.trappers = []
+    b = w._bear(1, ["den", 1])
+    b.update(health=0.3, energy=0.9, job="flee", t2=w.time + 400)
+    w.run(300)
+    assert abs(b["health"] - 0.3 - w.BEAR_HEAL_K * 300) < 1e-6, b["health"]
+
+    # Walking up on a bear at its kill is a fight of its own.
+    w, man, b = duel(CLAW_P=1.0, CLAW_DMG=2.0, KNIFE_P=0.0)
+    other = w.trappers[0]
+    other.update(f=1, plot=1, to=["plot", 1, 1], t1=w.time, t2=1e9)
+    w.run(b["t1"] - w.time + w.EXCHANGE_S + 1)
+    assert b["job"] == "eat" and w._alert(other), "his flank is wary"
+    w.CLAW_P, w.KNIFE_P, w.KNIFE_DMG = 0.0, 1.0, 2.0
+    w._go(other, ["plot", 1, 0], "rest", 30.0)
+    w.run(other["t1"] - w.time + w.EXCHANGE_S + 2)
+    assert w.tally["bears"]["fights"] == 2 and fights(w)[-1]["slain"]
+
+    # A man killed with a fellow at his side: the fellow, still fighting,
+    # takes his goods but not yet his cabin, and the killing leaves the
+    # flank watchful, idling in company, until ALERT_S has passed.
+    w, man, b = duel(NOTICE_K=1e9, HIT_P=(0.0, 0.0), CLAW_P=1.0,
+                     CLAW_DMG=2.0, KNIFE_P=0.0)
+    w.HEAR_D = 0.5
+    fellow = w._trapper(1, 1, ["plot", 1, 0])
+    fellow.update(t1=w.time, t2=1e9)
+    man.update(pelts=3, meat=4)
+    w.plots[1][0]["logs"], w.plots[1][1]["logs"] = 8, 2
+    w.run(b["t1"] - w.time + 1)
+    assert fellow["job"] == "fight", fellow["job"]
+    w.run(w.EXCHANGE_S + 1)
+    death = next(e for e in w.tally["events"] if e["kind"] == "death")
+    assert death["cause"] == "bear" and death["claimant"] == fellow["id"]
+    assert death["after"] - death["before"] == death["moved"] > 0, death
+    assert fellow["plot"] == 1 and fellow["fight"] is not None
+    assert fellow["alert"] is not None and w._alert(fellow)
+    fellow["fed"] = 1.0
+    assert w._vigilance(fellow) == w.ALERT_VIG
+    neighbour = w._trapper(1, 0, ["plot", 1, 0])
+    assert w._idle_spot(fellow) == ["plot", 1, 0]
+    fellow["alert"] = w.time - w.ALERT_S
+    assert w._idle_spot(fellow) == ["plot", 1, 1] and neighbour
+
+    # Over many fights in many valleys, at the bears' own choosing: the
+    # men win most but far from all; lone men are the ones attacked;
+    # a killing sharpens the survivors' watch and fattens their stores;
+    # the bears keep to their dens in deep winter and to their rails.
+    started = time.monotonic()
+    events, exposure, watch, held = fight_sample(range(1, 25), 6, 1.0)
+    took = time.monotonic() - started
+    assert took < 20, took
+    sample = [e for e in events if e["kind"] == "fight"]
+    won = sum(e["won"] for e in sample) / len(sample)
+    assert len(sample) >= 100 and 0.5 <= won <= 0.8, (len(sample), won)
+    lone = sum(e["company"] == 0 for e in sample)
+    assert lone / exposure[0] > (len(sample) - lone) / exposure[1], \
+        (lone, exposure)
+    assert watch[3] and watch[2] / watch[3] > watch[0] / watch[1], watch
+    assert held, "a bear out of its den in deep winter, or past a rail"
+    heirs = [e for e in events if e["kind"] == "death"
+             and e["cause"] == "bear" and e["claimant"]]
+    assert all(e["after"] - e["before"] == e["moved"] for e in heirs)
+    assert sum(e["moved"] > 0 for e in heirs) >= 1, heirs
+    # And in the four valleys the other tests read: fights enough to
+    # matter, and neither side has them all its own way (too few fights
+    # there to hold a rate to).
+    seen = [e for seed in rows for r in rows[seed]
+            for e in r["tally"]["events"] if e["kind"] == "fight"]
+    won = sum(e["won"] for e in seen)
+    assert len(seen) >= 8 and 0 < won < len(seen), (len(seen), won)
 
 
 def self_test():
@@ -7374,6 +8038,8 @@ def self_test():
                     dict(World(0)._bear(0, ["edge", 0]), to=["den", 9]))),
                 ("jobless", lambda d: d["predators"].append(
                     dict(World(0)._bear(0, ["edge", 0]), job="x"))),
+                ("lost", lambda d: d["trappers"][0].update(
+                    job="fight", to=["plot", 0, 9])),
                 ("stalled", lambda d: d.update(next_tick=0.0))):
             d = w.to_dict()
             spoil(d)
