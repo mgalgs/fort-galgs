@@ -17,6 +17,7 @@ import math
 import os
 import random
 import sys
+import tempfile
 
 import cairo
 import gi
@@ -387,6 +388,32 @@ class World:
         return w
 
 
+def world_path():
+    """Where the valley is kept between runs."""
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, "fort-galgs", "world.json")
+
+
+def load_world(path):
+    """The world saved at path, or a fresh one if there is none to be had:
+    missing, unreadable, not JSON, or of another schema. Never raises."""
+    try:
+        with open(path) as fh:
+            return World.from_dict(json.load(fh))
+    except Exception:  # anything wrong with the file means a fresh valley
+        return World(random.randrange(2 ** 31))
+
+
+def save_world(world, path):
+    """Write the world to path whole or not at all."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(world.to_dict(), fh, separators=(",", ":"))
+    os.replace(tmp, path)
+
+
 # --------------------------------------------------------------------------
 # The picture: the chip, with the fort's cores fenced off
 # --------------------------------------------------------------------------
@@ -491,6 +518,11 @@ class CpuView(Gtk.DrawingArea):
             self.drill_target = [None, None]
         self.on = on
         self.queue_draw()
+
+    def set_world(self, world):
+        self.world = world
+        self.wild = None  # its places are laid out afresh
+        self.look = self._season_look()
 
     def set_loads(self, loads):
         self.loads = loads
@@ -4366,7 +4398,7 @@ def ranges(cpus):
 # --------------------------------------------------------------------------
 
 class FortWindow(Adw.ApplicationWindow):
-    def __init__(self, app, time_scale=1.0):
+    def __init__(self, app, state_path=None, time_scale=1.0):
         super().__init__(title="Fort Galgs")
         if app is not None:
             self.set_application(app)
@@ -4383,6 +4415,12 @@ class FortWindow(Adw.ApplicationWindow):
         self.stack.add_named(self._build_home(), "home")
         self.stack.add_named(self._build_error(), "error")
         self.view.time_scale = time_scale
+        # Without a path (the self-test) the world is never read or kept.
+        self.state_path = state_path
+        self.save_id = 0
+        if state_path:
+            self.view.set_world(load_world(state_path))
+            self.save_id = GLib.timeout_add_seconds(60, self._save_world)
 
         header = Adw.HeaderBar(css_classes=["flat"])
         header.set_title_widget(Adw.WindowTitle(title="Fort Galgs",
@@ -4399,11 +4437,20 @@ class FortWindow(Adw.ApplicationWindow):
         self.connect("close-request", self._on_close)
 
     def _on_close(self, _win):
-        for source in (self.sample_id, self.status_id):
+        for source in (self.sample_id, self.status_id, self.save_id):
             if source:
                 GLib.source_remove(source)
-        self.sample_id = self.status_id = 0
+        self.sample_id = self.status_id = self.save_id = 0
+        self._save_world()
         return False
+
+    def _save_world(self):
+        if self.state_path:
+            try:
+                save_world(self.view.world, self.state_path)
+            except OSError as e:
+                print(f"could not keep the valley: {e}", file=sys.stderr)
+        return GLib.SOURCE_CONTINUE
 
     # -- pages ------------------------------------------------------------
 
@@ -4736,7 +4783,8 @@ class FortApp(Adw.Application):
 
     def do_activate(self):
         if not self.window:
-            self.window = FortWindow(self, time_scale=self.time_scale)
+            self.window = FortWindow(self, state_path=world_path(),
+                                     time_scale=self.time_scale)
             self.window.refresh_status()
         self.window.present()
 
@@ -4843,6 +4891,53 @@ def self_test():
             sys.stderr = err
     view.world = World(seed=7)
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
+
+    # The valley is kept between runs, through JSON, and goes on exactly as
+    # it would have; a missing or bad file starts a fresh one, quietly.
+    w = World(3)
+    w.run(2000)
+    w2 = World.from_dict(json.loads(json.dumps(w.to_dict())))
+    assert w2.to_dict() == w.to_dict()
+    w.run(World.YEAR_S)
+    w2.run(World.YEAR_S)
+    assert w2.to_dict() == w.to_dict(), "a loaded world runs on the same"
+    with tempfile.TemporaryDirectory() as tmp:
+        bad = {"nope": "nope", "list": "[]", "other": '{"version": 999}'}
+        for name, text in bad.items():
+            with open(os.path.join(tmp, name), "w") as fh:
+                fh.write(text)
+        err = sys.stderr
+        for name in ["missing", "."] + list(bad):
+            sys.stderr = io.StringIO()
+            try:
+                fresh = load_world(os.path.join(tmp, name))
+                said = sys.stderr.getvalue()
+            finally:
+                sys.stderr = err
+            assert fresh.time == 0 and not said, (name, said)
+        path = os.path.join(tmp, "a", "b", "world.json")
+        save_world(w, path)
+        assert os.listdir(os.path.dirname(path)) == ["world.json"]
+        assert load_world(path).time == w.time
+        old = os.environ.get("XDG_STATE_HOME")
+        os.environ["XDG_STATE_HOME"] = tmp
+        try:
+            assert world_path().startswith(tmp + os.sep), world_path()
+        finally:
+            if old is None:
+                del os.environ["XDG_STATE_HOME"]
+            else:
+                os.environ["XDG_STATE_HOME"] = old
+        kept = FortWindow(None, state_path=os.path.join(tmp, "w.json"))
+        assert kept.save_id and kept.view.world.time == 0
+        kept.view.world.run(42.0)
+        kept._on_close(kept)
+        assert load_world(os.path.join(tmp, "w.json")).time == 42.0
+        assert kept.save_id == 0
+    assert win.state_path is None and win.save_id == 0, "never the real one"
+    view.set_world(w2)
+    for size in ((300, 220), (1024, 680), (560, 420)):
+        view._draw(view, cr, *size)
     # The beaver swims the river, and dives for part of each crossing.
     view._draw(view, cr, 1024, 680)
     seen = set()

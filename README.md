@@ -8,7 +8,11 @@ One window: a live map of the chip, with the reserved cores inside a log
 stockade while the fort is up and a grove of trees where it stood while it is
 down; beside each running app, a switch to move it into or out of the fort
 now and a pin to keep it there; and one button to raise the fort or stand
-down. Mountain men stand watch on the walls while it is up.
+down. Mountain men stand watch on the walls while it is up. Around it a
+valley lives on through the seasons — beavers dam the river, trappers trap
+them and raise cabins against the winter — and keeps evolving across runs,
+kept in `$XDG_STATE_HOME/fort-galgs/world.json` (by default under
+`~/.local/state`).
 
 <p align="center">
   <img src="docs/screenshot.png" width="420"
