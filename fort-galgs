@@ -9,6 +9,9 @@ because those are read-only and cheap.
 Run with --self-test to build every page and draw every state once, or with
 --snapshot <png> to draw the chip from live load. --time-scale <x> runs the
 valley's clock x times faster than real time, to watch the seasons turn.
+--almanac <years> [--seed N] runs a fresh valley headless and prints a row
+for every season. The valley itself is kept in
+$XDG_STATE_HOME/fort-galgs/world.json between runs.
 """
 
 import copy
@@ -6999,6 +7002,28 @@ def self_test():
 
     trapper_tests(view, cr)
 
+    # The almanac prints a row a season, headless, touching no state file.
+    with tempfile.TemporaryDirectory() as tmp:
+        old = os.environ.get("XDG_STATE_HOME")
+        os.environ["XDG_STATE_HOME"] = tmp
+        try:
+            buf = io.StringIO()
+            almanac(1, seed=2, out=buf)
+            assert parse_args(["--almanac", "3"])["almanac"] == 3
+            assert parse_args(["--almanac", "3", "--seed", "5"])["seed"] == 5
+        finally:
+            if old is None:
+                del os.environ["XDG_STATE_HOME"]
+            else:
+                os.environ["XDG_STATE_HOME"] = old
+        assert not os.listdir(tmp), os.listdir(tmp)
+    lines = buf.getvalue().splitlines()
+    assert len(lines) == 5, lines
+    for word in ("season", "beavers", "dams", "lodges", "trappers",
+                 "cabins", "pelts", "trees", "deaths", "arrivals"):
+        assert word in lines[0], word
+    assert [ln.split()[0] for ln in lines[1:]] == list(World.SEASONS)
+
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], True)
     view.boats, view.potshot, view.walker_halted = [], None, 0.0
     for facing, phase in ((1, 0.0), (-1, 10.0)):
@@ -7411,13 +7436,38 @@ def snapshot(path):
 
 
 USAGE = ("usage: fort-galgs [--time-scale <x>] | --self-test"
-         " | --snapshot <png>")
+         " | --snapshot <png> | --almanac <years> [--seed N]")
+
+
+def almanac(years, seed=1, out=None):
+    """Run a fresh valley headless for so many years and print one row a
+    season: how it stands as the season ends, and what the season saw."""
+    out = out or sys.stdout
+    w = World(seed)
+    print(f"{'season':<14}{'beavers':>8}{'dams':>5}{'lodges':>7}"
+          f"{'trappers':>9}{'cabins':>7}{'pelts':>6}{'trees':>6}  "
+          f"{'deaths':<34}{'arrivals':>8}", file=out)
+    for n in range(int(years) * 4):
+        w.run((n + 1) * World.SEASON_S - 0.5 - w.time)
+        st = w.stats()
+        tally = st["tally"]
+        died = ", ".join([f"{k} {c}" for c, k in
+                          sorted(tally["deaths"].items())]
+                         + [f"{tally[k]} {k}" for k in ("trapped",
+                                                        "starved")
+                            if tally[k]]) or "-"
+        when = f"{World.SEASONS[st['season']]} {st['year']}"
+        print(f"{when:<14}{st['beavers']:>8}{st['dams']:>5}"
+              f"{st['lodges']:>7}{st['trappers']:>9}{st['cabins']:>7}"
+              f"{st['pelts']:>6}{st['trees']:>6}  {died:<34}"
+              f"{tally['arrivals']:>8}", file=out)
+        w.run(0.5)
 
 
 def parse_args(argv):
     """The command line as a dict; a usage error exits 2."""
     opts = {"self_test": False, "snapshot": None, "help": False,
-            "time_scale": 1.0}
+            "time_scale": 1.0, "almanac": None, "seed": 1}
     args = list(argv)
 
     def fail():
@@ -7442,11 +7492,22 @@ def parse_args(argv):
             opts["time_scale"] = x
         elif a == "--time-scale":
             fail()
+        elif a in ("--almanac", "--seed"):
+            try:
+                n = int(args.pop(0))
+            except (IndexError, ValueError):
+                fail()
+            if a == "--almanac" and n < 1:
+                fail()
+            opts["almanac" if a == "--almanac" else "seed"] = n
     return opts
 
 
 def main():
     opts = parse_args(sys.argv[1:])
+    if opts["almanac"]:
+        almanac(opts["almanac"], opts["seed"])
+        return 0
     if opts["self_test"]:
         self_test()
         return 0
