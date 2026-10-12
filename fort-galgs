@@ -490,6 +490,7 @@ class CpuView(Gtk.DrawingArea):
         self.world = World(seed=7)
         self.time_scale = 1.0             # world seconds per real second
         self.current = 0.0                # how far the glints have drifted
+        self.world_at = None              # monotonic s the world last ran
         self.look = self._season_look()   # the season's colours, per frame
         self.set_draw_func(self._draw)
         self.add_tick_callback(self._on_tick)
@@ -524,6 +525,18 @@ class CpuView(Gtk.DrawingArea):
         self.wild = None  # its places are laid out afresh
         self.look = self._season_look()
 
+    CATCH_UP_MAX = 10.0  # most real seconds one catch-up makes good
+
+    def catch_up(self, now):
+        """Run the world on to real time now (monotonic seconds) if the
+        picture has stopped ticking: hidden, minimised, or another page
+        showing. A long gap, like a suspend, counts for only a little."""
+        if self.world_at is not None and now - self.world_at > 1.0:
+            gap = min(now - self.world_at, self.CATCH_UP_MAX)
+            self.world.advance(gap * self.time_scale)
+        if self.world_at is None or now - self.world_at > 1.0:
+            self.world_at = now
+
     def set_loads(self, loads):
         self.loads = loads
 
@@ -535,6 +548,7 @@ class CpuView(Gtk.DrawingArea):
         self.phase = (now - self._t0) / 1_000_000.0
         dt = max(0.0, self.phase - prev)
         self._advance(min(dt, 0.1))
+        self.world_at = GLib.get_monotonic_time() / 1_000_000.0
         # Frame-rate independent easing: the same glide at 30 Hz or 144 Hz.
         k = 1.0 - math.exp(-dt * 7.0)
         for cpu, target in self.loads.items():
@@ -4421,6 +4435,7 @@ class FortWindow(Adw.ApplicationWindow):
         if state_path:
             self.view.set_world(load_world(state_path))
             self.save_id = GLib.timeout_add_seconds(60, self._save_world)
+        self.clock_id = GLib.timeout_add_seconds(1, self._world_clock)
 
         header = Adw.HeaderBar(css_classes=["flat"])
         header.set_title_widget(Adw.WindowTitle(title="Fort Galgs",
@@ -4437,12 +4452,17 @@ class FortWindow(Adw.ApplicationWindow):
         self.connect("close-request", self._on_close)
 
     def _on_close(self, _win):
-        for source in (self.sample_id, self.status_id, self.save_id):
+        for source in (self.sample_id, self.status_id, self.save_id,
+                       self.clock_id):
             if source:
                 GLib.source_remove(source)
-        self.sample_id = self.status_id = self.save_id = 0
+        self.sample_id = self.status_id = self.save_id = self.clock_id = 0
         self._save_world()
         return False
+
+    def _world_clock(self):
+        self.view.catch_up(GLib.get_monotonic_time() / 1_000_000.0)
+        return GLib.SOURCE_CONTINUE
 
     def _save_world(self):
         if self.state_path:
@@ -4877,6 +4897,17 @@ def self_test():
     view._advance(0.1)
     assert abs(view.world.time - before - 5.0) < 1e-6, view.world.time
     view.time_scale = 1.0
+    # Hidden, the picture stops ticking, and the window's clock runs the
+    # world on; a long gap counts for only a little.
+    view.world_at = None
+    view.catch_up(100.0)
+    before = view.world.time
+    view.catch_up(100.5)
+    assert view.world.time == before, "not while it ticks"
+    view.catch_up(104.0)
+    assert abs(view.world.time - before - 4.0) < 1e-6, view.world.time
+    view.catch_up(10_000.0)
+    assert abs(view.world.time - before - 4.0 - view.CATCH_UP_MAX) < 1e-6
     assert parse_args(["--time-scale", "60"])["time_scale"] == 60.0
     for bad in (["--time-scale", "0"], ["--time-scale", "x"],
                 ["--time-scale"]):
