@@ -6451,8 +6451,9 @@ def envelope(seeds, years):
     return rows
 
 
-def beaver_tests(view, cr):
-    """The trees, the beavers and their works, headless and drawn."""
+def beaver_tests(view, cr, rows):
+    """The trees, the beavers and their works, headless and drawn; rows
+    is envelope((1, 2, 3, 4), 4)."""
     w = World(1)
     assert len(w.trees) == 46 and all(w.tree_state(i) == "tree"
                                       for i in range(46))
@@ -6563,10 +6564,6 @@ def beaver_tests(view, cr):
 
     # Over several seeds and years, without leaning on the rails: dams and
     # lodges go up, the beavers hold on in numbers, and lodges bring kits.
-    started = time.monotonic()
-    rows = envelope((1, 2, 3, 4), 4)
-    took = time.monotonic() - started
-    assert took < 60, took
     later = [r for seed in rows for r in rows[seed][4:]]
     for seed, seasons in rows.items():
         first_dam = next(n for n, r in enumerate(seasons) if r["dams"])
@@ -6605,8 +6602,9 @@ def _set_clock(w, t):
     w.half_n = int(t // (w.SEASON_S / 2))
 
 
-def trapper_tests(view, cr):
-    """The trappers' needs, deaths and newcomers, headless and drawn."""
+def trapper_tests(view, cr, rows):
+    """The trappers' needs, deaths and newcomers, headless and drawn; rows
+    is envelope((1, 2, 3, 4), 4)."""
     S = World.SEASON_S
 
     def staged(t, beavers=True):
@@ -6808,7 +6806,6 @@ def trapper_tests(view, cr):
     # who trap through the autumn come out of the winter worse, most but
     # not all winters find the cabins ready, the unready suffer for it,
     # and a death leaves the others richer.
-    rows = envelope((1, 2, 3, 4), 4)
     later = [r for seed in rows for r in rows[seed][4:]]
     every = [r for seed in rows for r in rows[seed]]
     mean = sum(r["trappers"] for r in later) / len(later)
@@ -7086,7 +7083,12 @@ def self_test():
     view.set_world(w2)
     for size in ((300, 220), (1024, 680), (560, 420)):
         view._draw(view, cr, *size)
-    beaver_tests(view, cr)
+    # The valley over several seeds and years, which the tests below read.
+    started = time.monotonic()
+    rows = envelope((1, 2, 3, 4), 4)
+    took = time.monotonic() - started
+    assert took < 60, took
+    beaver_tests(view, cr, rows)
 
     # The woods stand still from frame to frame, clear of the grove and
     # out of the water, and every size lays out, down to none at all.
@@ -7113,7 +7115,7 @@ def self_test():
         assert abs(base - view._river_y(x)) > view._river_half_max(x), \
             (x, base)
 
-    trapper_tests(view, cr)
+    trapper_tests(view, cr, rows)
 
     # The almanac prints a row a season, headless, touching no state file.
     with tempfile.TemporaryDirectory() as tmp:
