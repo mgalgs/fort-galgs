@@ -11,6 +11,7 @@ Run with --self-test to build every page and draw every state once, or with
 valley's clock x times faster than real time, to watch the seasons turn.
 """
 
+import copy
 import io
 import json
 import math
@@ -18,6 +19,7 @@ import os
 import random
 import sys
 import tempfile
+import time
 
 import cairo
 import gi
@@ -296,11 +298,34 @@ class World:
 
     The world's rules. Time steps in whole-second ticks, and every choice,
     catch and drain happens in one; nothing is scripted, each actor reacts
-    to what it needs and what is near it.
+    to what it needs and what is near it, and everything it does costs
+    time. The currencies are time, body (a beaver's condition) and stores
+    (sticks), drawn from finite resources that regrow.
 
     Seasons. A year is an hour of world time, fifteen minutes a season,
     spring first; each blends into the next over its last minute. The
-    clock runs whether the fort is up or down.
+    clock runs whether the fort is up or down. Winter's cold keeps the
+    beavers in their lodges; spring's high water breaks a little off
+    every dam and lodge.
+
+    Trees. A fixed set of slots on each flank, in the woods back from the
+    river and along its banks. A felled tree leaves a stump (gnawed to a
+    point by a beaver, cut flat by an axe), which grows back as a sapling
+    and is a full tree again after REGROW_S.
+
+    Beavers. Two colonies, one on each flank's stretch of river, each
+    with its own dam site. A beaver's body is its condition: it drains
+    all the time and faster in winter, more so without a dam's pond to
+    keep a larder in; at none it starves. It feeds on bark along its own
+    banks (full trees feed best, saplings less, the pond's weed barely),
+    and it works when it has the strength and its colony needs sticks:
+    fells a bank tree into a pile of sticks, then carries them one at a
+    time to the dam, and once the dam is half up, to the lodge. Winter
+    keeps them all inside. Kits come at mid-spring from the colony's
+    surplus condition (each costs its mother KIT_COST), only as far as
+    the lodge has room; no lodge, no kits. Rails: a colony left empty
+    takes a pair of the other's young if it has plenty; a valley with
+    no beavers at all for a season gets a pair from upstream.
     """
 
     # -- the world's rates --
@@ -309,7 +334,34 @@ class World:
     YEAR_S = 4 * SEASON_S
     BLEND_S = 60.0      # ...the last this many blending into the next
     TICK_S = 1.0        # the world decides once a tick
-    VERSION = 1         # of the saved state's schema
+    VERSION = 2         # of the saved state's schema
+
+    # Tree slots per flank: (zone, side, count); side 1 is the near bank.
+    SLOTS = (("woods", 1, 8), ("woods", -1, 6), ("bank", 1, 4),
+             ("bank", -1, 3))
+    REGROW_S = 2 * YEAR_S   # a stump stands this long before it is a tree
+    STUMP_K = 0.3           # ...a bare stump for this much of that
+
+    DAM_U = (0.36, 0.64)    # each colony's dam, across the picture
+    POND_LEN = 0.12         # its pond reaches this far upstream
+    DAM_STICKS = 12
+    LODGE_STICKS = 8
+    STICKS_PER_TREE = 4
+    FLOOD_STICKS = (2, 1)   # spring's high water takes these off dam, lodge
+    LODGE_CAP = 6           # beavers a finished lodge holds
+    BEAVER_MAX = 12
+    COND_DRAIN = 1 / 1500   # condition lost a second...
+    WINTER_DRAIN = 1.0      # ...times this in winter, times (1.5 - dam)
+    FEED_S = 20.0
+    FEED_GAIN = 0.35        # at a full tree; half at a sapling
+    WEED_GAIN = 0.08        # grazing the pond with no tree to hand
+    CUT_S = 40.0
+    FETCH_S = 3.0
+    HAUL_S = 4.0
+    SWIM_S = 15.0           # seconds to swim a unit of distance
+    KIT_COST = 0.4
+    KIT_COND = 0.6
+    RESTOCK_S = SEASON_S
 
     def __init__(self, seed=1):
         self.seed = seed
@@ -317,6 +369,52 @@ class World:
         self.time = 0.0
         self.next_tick = self.TICK_S
         self.season_n = 0
+        self.half_n = 0
+        self.next_id = 1
+        self.trees = self._slots()
+        self.colonies = [{"dam": 0, "lodge": 0} for _ in (0, 1)]
+        self.beavers = []
+        for f in (0, 1):
+            for _ in range(3):
+                self._beaver(f, 0.7)
+        self.empty_since = None
+        self.tally = self._fresh_tally()
+
+    @classmethod
+    def _slots(cls):
+        """The fixed tree slots, the same in every world: each at (u, v)
+        within its zone, u along the flank from its outer edge."""
+        trees, j = [], 0
+        for f in (0, 1):
+            for zone, side, n in cls.SLOTS:
+                for _ in range(n):
+                    j += 1
+                    u = (0.31 + j * 0.7548777) % 1.0
+                    trees.append({
+                        "f": f, "zone": zone, "side": side,
+                        "u": u if f == 0 else 1 - u,
+                        "v": (0.17 + j * 0.5698403) % 1.0,
+                        "kind": "round" if zone == "bank" or j % 5 in (1, 3)
+                        else "pine",
+                        "size": (j * 0.618034) % 1.0,
+                        "felled": None, "by": None, "pile": 0})
+        return trees
+
+    @staticmethod
+    def _fresh_tally():
+        return {"trapped": 0, "starved": 0, "kits": [0, 0], "deaths": {},
+                "arrivals": 0, "pelts": 0, "rails": {"beavers": 0,
+                                                     "trappers": 0},
+                "events": []}
+
+    def _beaver(self, f, cond):
+        b = {"id": self.next_id, "f": f, "cond": cond, "job": "lodge",
+             "at": ["lodge", f], "to": ["lodge", f], "t0": self.time,
+             "t1": self.time, "t2": self.time, "stick": False,
+             "tree": None}
+        self.next_id += 1
+        self.beavers.append(b)
+        return b
 
     # -- the clock --
 
@@ -347,6 +445,82 @@ class World:
     def cold(self):
         return self.season_weights()[3]
 
+    # -- places --
+
+    def tree_state(self, i, t=None):
+        """"tree", "stump" or "sapling"."""
+        felled = self.trees[i]["felled"]
+        if felled is None:
+            return "tree"
+        age = (self.time if t is None else t) - felled
+        if age >= self.REGROW_S:
+            return "tree"
+        return "stump" if age < self.REGROW_S * self.STUMP_K else "sapling"
+
+    def growth(self, i):
+        """How grown a sapling is, 0..1."""
+        felled = self.trees[i]["felled"]
+        if felled is None:
+            return 1.0
+        k = self.STUMP_K
+        return min(1.0, max(0.0, ((self.time - felled) / self.REGROW_S - k)
+                            / (1 - k)))
+
+    def _standing(self, i):
+        tr = self.trees[i]
+        if tr["felled"] is not None and \
+                self.time - tr["felled"] >= self.REGROW_S:
+            tr["felled"], tr["by"], tr["pile"] = None, None, 0
+        return tr["felled"] is None
+
+    def place_u(self, place):
+        """Where a place lies across the picture, 0..1, and which side of
+        the river (1 near, -1 far, 0 in it)."""
+        kind = place[0]
+        if kind == "tree":
+            tr = self.trees[place[1]]
+            return self._flank_u(tr["f"], tr["u"]), tr["side"]
+        if kind == "dam":
+            return self.DAM_U[place[1]], 0
+        if kind == "lodge":
+            return self.DAM_U[place[1]] - self.POND_LEN * 0.45, 0
+        if kind == "swim":
+            return place[2], 0
+        return 0.5, 0
+
+    @staticmethod
+    def _flank_u(f, u):
+        return 0.03 + 0.27 * u if f == 0 else 0.70 + 0.27 * u
+
+    def distance(self, a, b):
+        (ua, sa), (ub, sb) = self.place_u(a), self.place_u(b)
+        return 3 * abs(ua - ub) + 0.3 * abs(sa - sb)
+
+    def _send(self, a, to, job, work, speed):
+        """Set actor a off to place to, to spend work seconds there at job
+        once it arrives, speed seconds to the unit of distance."""
+        a["at"] = a["to"]
+        a["to"] = list(to)
+        a["job"] = job
+        a["t0"] = self.time
+        a["t1"] = self.time + max(1.0, speed * self.distance(a["at"], to))
+        a["t2"] = a["t1"] + work
+
+    # -- the river's works --
+
+    def dam_k(self, f):
+        return min(1.0, self.colonies[f]["dam"] / self.DAM_STICKS)
+
+    def lodge_k(self, f):
+        return min(1.0, self.colonies[f]["lodge"] / self.LODGE_STICKS)
+
+    def _sticks_wanted(self, f):
+        c = self.colonies[f]
+        want = self.DAM_STICKS - c["dam"]
+        if c["dam"] >= self.DAM_STICKS / 2:
+            want += self.LODGE_STICKS - c["lodge"]
+        return want
+
     # -- stepping --
 
     def advance(self, dt):
@@ -364,15 +538,195 @@ class World:
         n = int(self.time // self.SEASON_S)
         if n != self.season_n:
             self.season_n = n
+            self._season_turn()
+        half = int(self.time // (self.SEASON_S / 2))
+        if half != self.half_n:
+            self.half_n = half
+            if half % 8 == 1:
+                self._births()
+        self._advance_beavers()
+        self._rails()
+
+    def _season_turn(self):
+        self.tally = self._fresh_tally()
+        if self.season() == 0:
+            for c in self.colonies:
+                c["dam"] = max(0, c["dam"] - self.FLOOD_STICKS[0])
+                c["lodge"] = max(0, c["lodge"] - self.FLOOD_STICKS[1])
+
+    # -- beavers --
+
+    def _advance_beavers(self):
+        cold = self.cold()
+        dead = []
+        for b in self.beavers:
+            drain = self.COND_DRAIN * self.TICK_S
+            if cold > 0:
+                drain *= 1 + cold * (self.WINTER_DRAIN
+                                     * (1.5 - self.dam_k(b["f"])) - 1)
+            b["cond"] -= drain
+            if b["cond"] <= 0:
+                dead.append(b)
+                continue
+            if self.time >= b["t2"]:
+                self._beaver_done(b)
+                self._beaver_next(b, cold)
+        for b in dead:
+            self.beavers.remove(b)
+            self.tally["starved"] += 1
+
+    def _beaver_done(self, b):
+        job, c = b["job"], self.colonies[b["f"]]
+        tree = b["to"][1] if b["to"][0] == "tree" else None
+        tr = self.trees[tree] if tree is not None else None
+        if job == "cut" and self._standing(tree):
+            tr.update(felled=self.time, by="beaver",
+                      pile=self.STICKS_PER_TREE)
+        elif job == "fetch" and tr["pile"] > 0:
+            tr["pile"] -= 1
+            b["stick"] = True
+        elif job == "haul" and b["stick"]:
+            b["stick"] = False
+            if c["dam"] < self.DAM_STICKS:
+                c["dam"] += 1
+            elif c["lodge"] < self.LODGE_STICKS:
+                c["lodge"] += 1
+        elif job == "feed":
+            if tr is None:
+                gain = self.WEED_GAIN
+            elif self._standing(tree):
+                gain = self.FEED_GAIN
+            else:
+                gain = self.FEED_GAIN * 0.5 * self.growth(tree)
+            b["cond"] = min(1.0, b["cond"] + gain)
+        b["tree"] = None
+
+    def _bank_trees(self, f, b):
+        """Flank f's bank slots, nearest b's lodge first."""
+        home = ["lodge", f]
+        return sorted((i for i, tr in enumerate(self.trees)
+                       if tr["f"] == f and tr["zone"] == "bank"),
+                      key=lambda i: self.distance(home, ["tree", i]))
+
+    def _beaver_next(self, b, cold):
+        f = b["f"]
+        jit = self.rng.uniform
+        if b["stick"]:
+            dest = "dam" if self.colonies[f]["dam"] < self.DAM_STICKS \
+                else "lodge"
+            self._send(b, [dest, f], "haul", self.HAUL_S, self.SWIM_S)
+            return
+        if cold > 0.5:
+            self._send(b, ["lodge", f], "lodge", 30.0, self.SWIM_S)
+            return
+        taken = {o["tree"] for o in self.beavers if o is not b}
+        trees = [i for i in self._bank_trees(f, b) if i not in taken]
+        hunger = 1 - b["cond"]
+        food = next((i for i in trees if self.tree_state(i) == "tree"),
+                    None)
+        if food is None:
+            food = next((i for i in trees
+                         if self.tree_state(i) == "sapling"), None)
+        scores = {"feed": (2.0 * hunger * hunger + 0.05) * jit(0.85, 1.15),
+                  "lodge": 0.35 * jit(0.85, 1.15),
+                  "swim": 0.15 * jit(0.85, 1.15)}
+        want = self._sticks_wanted(f)
+        pile = next((i for i in self._bank_trees(f, b)
+                     if self.trees[i]["pile"] > 0), None)
+        fell = next((i for i in trees if self._standing(i)), None)
+        if want > 0 and (pile is not None or fell is not None):
+            scores["work"] = 0.9 * min(1.0, want / 4) * b["cond"] \
+                * jit(0.85, 1.15)
+        pick = max(scores, key=scores.get)
+        if pick == "feed":
+            if food is None:
+                self._send(b, ["lodge", f], "feed", self.FEED_S,
+                           self.SWIM_S)
+            else:
+                b["tree"] = food
+                self._send(b, ["tree", food], "feed", self.FEED_S,
+                           self.SWIM_S)
+        elif pick == "work" and pile is not None:
+            b["tree"] = pile
+            self._send(b, ["tree", pile], "fetch", self.FETCH_S,
+                       self.SWIM_S)
+        elif pick == "work":
+            b["tree"] = fell
+            self._send(b, ["tree", fell], "cut", self.CUT_S, self.SWIM_S)
+        elif pick == "swim":
+            lo, hi = (0.04, 0.42) if f == 0 else (0.58, 0.96)
+            self._send(b, ["swim", f, round(jit(lo, hi), 3)], "swim",
+                       jit(4.0, 10.0), self.SWIM_S)
+        else:
+            self._send(b, ["lodge", f], "lodge", jit(20.0, 60.0),
+                       self.SWIM_S)
+
+    def _births(self):
+        """Mid-spring: kits from each colony's surplus, as far as its
+        lodge has room."""
+        for f in (0, 1):
+            mine = [b for b in self.beavers if b["f"] == f]
+            room = int(self.LODGE_CAP * self.lodge_k(f)) - len(mine)
+            surplus = sum(max(0.0, b["cond"] - 0.5) for b in mine)
+            kits = max(0, min(room, int(surplus / self.KIT_COST + 1e-9),
+                              self.BEAVER_MAX - len(self.beavers)))
+            for _ in range(kits):
+                mother = max(mine, key=lambda b: b["cond"])
+                mother["cond"] -= self.KIT_COST
+                self._beaver(f, self.KIT_COND)
+            self.tally["kits"][f] += kits
+            self.tally["events"].append(
+                {"kind": "kits", "f": f, "n": kits,
+                 "lodge": self.lodge_k(f)})
+        for f in (0, 1):
+            here = [b for b in self.beavers if b["f"] == f]
+            there = [b for b in self.beavers if b["f"] != f]
+            if not here and len(there) >= 4:
+                # The young of a crowded colony strike out downriver.
+                for b in sorted(there, key=lambda b: b["cond"])[:2]:
+                    b["f"] = f
+                    b["stick"], b["tree"] = False, None
+                    self._send(b, ["lodge", f], "lodge", 10.0, self.SWIM_S)
+
+    def _rails(self):
+        if self.beavers:
+            self.empty_since = None
+            return
+        if self.empty_since is None:
+            self.empty_since = self.time
+        elif self.time - self.empty_since >= self.RESTOCK_S:
+            c = self.colonies
+            f = 1 if c[1]["dam"] > c[0]["dam"] else 0
+            for _ in range(2):
+                self._beaver(f, 0.7)
+            self.empty_since = None
+            self.tally["rails"]["beavers"] += 1
+
+    # -- reading it --
+
+    def stats(self):
+        c = self.colonies
+        return {
+            "season": self.season(), "year": self.year(),
+            "beavers": len(self.beavers),
+            "dams": sum(x["dam"] >= self.DAM_STICKS for x in c),
+            "dam_sticks": [x["dam"] for x in c],
+            "lodges": sum(x["lodge"] >= self.LODGE_STICKS for x in c),
+            "trees": sum(self.tree_state(i) == "tree"
+                         for i in range(len(self.trees))),
+            "tally": json.loads(json.dumps(self.tally)),
+        }
 
     # -- saving --
 
+    STATE = ("seed", "time", "next_tick", "season_n", "half_n", "next_id",
+             "trees", "colonies", "beavers", "empty_since", "tally")
+
     def to_dict(self):
+        d = {k: copy.deepcopy(getattr(self, k)) for k in self.STATE}
         v, state, gauss = self.rng.getstate()
-        return {"version": self.VERSION, "seed": self.seed,
-                "time": self.time, "next_tick": self.next_tick,
-                "season_n": self.season_n,
-                "rng": [v, list(state), gauss]}
+        d.update(version=self.VERSION, rng=[v, list(state), gauss])
+        return d
 
     @classmethod
     def from_dict(cls, d):
@@ -380,9 +734,10 @@ class World:
         if not isinstance(d, dict) or d.get("version") != cls.VERSION:
             raise ValueError("not this world's schema")
         w = cls(d["seed"])
-        w.time = float(d["time"])
-        w.next_tick = float(d["next_tick"])
-        w.season_n = int(d["season_n"])
+        for k in cls.STATE:
+            setattr(w, k, copy.deepcopy(d[k]))
+        if len(w.trees) != len(cls._slots()) or len(w.colonies) != 2:
+            raise ValueError("not this valley")
         v, state, gauss = d["rng"]
         w.rng.setstate((v, tuple(state), gauss))
         return w
@@ -2784,8 +3139,12 @@ class CpuView(Gtk.DrawingArea):
         room = max(0.0, bottom - top)
         half = max(3.0, min(t * 0.3, room * 0.14))
         amp = max(0.0, min(t * 0.6, room / 2 - half * self._swell_max() - 2))
+        world = self.world
         self.river = {"w": width, "y": (top + bottom) / 2, "amp": amp,
-                      "half": half}
+                      "half": half, "ponds": [
+                          ((u - world.POND_LEN) * width, u * width,
+                           world.dam_k(f))
+                          for f, u in enumerate(world.DAM_U)]}
 
     def _river_y(self, x):
         r = self.river
@@ -2793,23 +3152,38 @@ class CpuView(Gtk.DrawingArea):
         return r["y"] + r["amp"] * (math.sin(u * 8.2 + 0.5) * 0.8
                                     + math.sin(u * 15.1 + 2.0) * 0.2)
 
+    POND_WIDEN = 0.5    # a finished dam pools the river this much wider
+
     def _river_half(self, x):
         """Half the river's width at x; it narrows and widens a little,
-        and runs high in spring."""
+        runs high in spring, and pools wider above a beaver dam."""
+        pond = max(self._pond(x, lo, hi) * k
+                   for lo, hi, k in self.river["ponds"])
         return self._river_base(x) * (1.0 + self.HIGH_WATER
-                                      * self.look["spring"])
+                                      * self.look["spring"]) \
+            * (1.0 + self.POND_WIDEN * pond)
+
+    def _pond(self, x, lo, hi):
+        """How much of a full pond stands at x, for one between lo and
+        the dam at hi: swelling from upstream, held back at the dam."""
+        ln = hi - lo
+        return self._ramp(x, lo, lo + 0.45 * ln) \
+            * (1 - self._ramp(x, hi - 0.04 * ln, hi + 0.1 * ln))
 
     def _river_base(self, x):
         r = self.river
         return r["half"] * (1.0 + 0.15 * math.sin(x / r["w"] * 11.0 + 1.0))
 
     def _swell_max(self):
-        return 1.0 + self.HIGH_WATER
+        return (1.0 + self.HIGH_WATER) * (1.0 + self.POND_WIDEN)
 
     def _river_half_max(self, x):
-        """The most _river_half(x) can ever be, in any season: what the
-        layout keeps the land clear of."""
-        return self._river_base(x) * self._swell_max()
+        """The most _river_half(x) can ever be, in any season and behind
+        any dam: what the layout keeps the land clear of."""
+        pond = max(self._pond(x, lo, hi) for lo, hi, _ in
+                   self.river["ponds"])
+        return self._river_base(x) * (1.0 + self.HIGH_WATER) \
+            * (1.0 + self.POND_WIDEN * pond)
 
     def _river_edge(self, x, side):
         """The river's far (side -1) or near (side 1) bank at x."""
@@ -2923,56 +3297,222 @@ class CpuView(Gtk.DrawingArea):
             cr.set_source_rgb(*STONE_RGB)
             cr.fill()
 
-    BEAVER_S = 46.0     # a beaver takes this long to swim the picture
+    # -- the beavers' works on the river ----------------------------------
 
-    def _swim_u(self):
-        return (self.phase / self.BEAVER_S + 0.3) % 1.0
+    def _water_xy(self, place):
+        """Where in the water a beaver bound for place swims to: off the
+        bank below a tree, at the dam, beside the lodge, or out in the
+        stream."""
+        world = self.world
+        w = self.river["w"]
+        u, side = world.place_u(place)
+        x = u * w
+        if place[0] == "tree" and self.wild is not None and not self.on:
+            spot = self.wild["tree_at"].get(place[1])
+            if spot is not None:
+                x = spot[0]
+        lane = {"dam": -0.1, "lodge": 0.35}.get(place[0], 0.0)
+        if side:
+            lane = 0.65 * side
+        return x, self._river_y(x) + lane * self._river_half(x)
 
-    def _swim_at(self, u):
-        x = -30 + u * (self.river["w"] + 60)
-        return x, self._river_y(x) + 0.45 * self._river_half(x)
+    def _bank_xy(self, b):
+        """A beaver at its tree, on the bank in the idle picture: (x, feet,
+        facing), or None if the tree is not in the picture."""
+        if self.wild is None or b["to"][0] != "tree":
+            return None
+        spot = self.wild["tree_at"].get(b["to"][1])
+        if spot is None:
+            return None
+        x, base, h = spot[:3]
+        facing = 1 if b["id"] % 2 else -1
+        return x - facing * (0.12 * h + 0.2 * self.wild["s"]), base, facing
 
-    def _swimmer(self):
-        """The swimming beaver: (x, y, dive), x None while he is under.
-        dive is seconds since his tail slapped the water, or negative."""
-        u = self._swim_u()
-        x, y = self._swim_at(u)
-        dive = (u - 0.58) * self.BEAVER_S if 0.58 <= u < 0.78 else -1.0
-        return (None if 0.62 <= u < 0.78 else x), y, dive
+    def _beaver_pose(self, b):
+        """What one beaver is doing as drawn now: (pose, x, y, facing,
+        dive), pose one of "swim", "dive" (tail up, going under), "under"
+        (a string of bubbles), "bank" (at a tree), "work" (at the dam) or
+        "inside" (in the lodge, not drawn)."""
+        t = self.world.time
+        if t < b["t1"]:
+            ax, ay = self._water_xy(b["at"])
+            bx, by = self._water_xy(b["to"])
+            span = b["t1"] - b["t0"]
+            p = (t - b["t0"]) / span if span > 0 else 1.0
+            e = self._ramp(p, 0.0, 1.0)
+            x, y = ax + (bx - ax) * e, ay + (by - ay) * e
+            facing = 1 if bx >= ax else -1
+            # On a long swim he slaps his tail and dives in the middle
+            # fifth, coming up further on.
+            if span >= 6 and 0.4 <= p < 0.6:
+                if p < 0.46:
+                    return "dive", x, y, facing, (p - 0.4) * span
+                return "under", x, y, facing, (p - 0.4) * span
+            return "swim", x, y, facing, -1.0
+        job, to = b["job"], b["to"]
+        if to[0] == "tree":
+            bank = self._bank_xy(b)
+            if bank is not None and not self.on:
+                return ("bank",) + bank + (-1.0,)
+            if self.on:
+                return "inside", 0.0, 0.0, 1, -1.0
+            x, y = self._water_xy(to)
+            return "swim", x, y, 1, -1.0
+        if job == "lodge" or (job == "feed" and to[0] == "lodge"
+                              and int(t / 7 + b["id"]) % 2):
+            return "inside", 0.0, 0.0, 1, -1.0
+        x, y = self._water_xy(to)
+        if job == "swim":
+            # Paddling about, turning now and then.
+            x += math.sin(t * 0.4 + b["id"]) * self.river["half"] * 1.5
+        facing = 1 if math.cos(t * 0.4 + b["id"]) > 0 else -1
+        return ("work" if to[0] == "dam" else "swim"), x, y, facing, -1.0
 
-    def _draw_swimmer(self, cr):
-        """A beaver swimming downstream with a V of ripples behind him;
-        partway he slaps his tail and dives, and comes up again further
-        on."""
-        x, y, dive = self._swimmer()
+    def _works_items(self):
+        """The river's works as drawn: each colony's dam and lodge, and
+        every beaver in the water, as (kind, args)."""
+        world, w = self.world, self.river["w"]
+        items = []
+        for f, c in enumerate(world.colonies):
+            if c["dam"] > 0:
+                items.append(("dam", (world.DAM_U[f] * w,
+                                      world.dam_k(f))))
+            if c["lodge"] > 0:
+                x, y = self._water_xy(["lodge", f])
+                items.append(("lodge", (x, y, world.lodge_k(f))))
+        for b in world.beavers:
+            pose = self._beaver_pose(b)
+            if pose[0] not in ("bank", "inside"):
+                items.append(("beaver", (b,) + pose))
+        return items
+
+    def _draw_works(self, cr):
         s = self.river["half"] * 1.5
-        if 0 <= dive < 1.6:
-            # The splash stays where he went down.
-            sx, sy = self._swim_at(0.58)
-            self._splash(cr, sx - s * 0.4, sy, s, dive)
-        if x is None:
-            # A string of bubbles marks where he swims below.
-            bx, by = self._swim_at(self._swim_u())
+        snow = self.look["winter"]
+        for kind, args in self._works_items():
+            if kind == "dam":
+                self._dam(cr, *args)
+            elif kind == "lodge":
+                x, y, k = args
+                self._lodge(cr, x, y, s * 1.6, k, snow)
+            else:
+                self._draw_swimmer(cr, s, *args)
+
+    def _draw_swimmer(self, cr, s, b, pose, x, y, facing, dive):
+        """A beaver swimming with a V of ripples behind him, a stick in
+        his teeth if he carries one; diving, he slaps his tail and goes
+        under, leaving a string of bubbles."""
+        if pose in ("dive", "under") and dive < 1.6:
+            self._splash(cr, x - facing * s * 0.4, y, s, dive)
+        if pose == "under":
             cr.set_source_rgba(*WATER_HI_RGB, 0.6)
             for k in range(3):
-                b = (self.phase * 1.7 + k / 3) % 1.0
-                cr.arc(bx - k * s * 0.3, by - b * 2, max(0.6, s * 0.05),
-                       0, 2 * math.pi)
+                u = (self.phase * 1.7 + k / 3) % 1.0
+                cr.arc(x - facing * k * s * 0.3, y - u * 2,
+                       max(0.6, s * 0.05), 0, 2 * math.pi)
                 cr.fill()
             return
-        ln = s * (1.6 + 0.2 * math.sin(self.phase * 3))
-        nose = x + s * 0.5
-        cr.set_line_width(1.1)
+        moving = pose != "work"
+        if moving:
+            ln = s * (1.6 + 0.2 * math.sin(self.phase * 3 + b["id"]))
+            nose = x + facing * s * 0.5
+            cr.set_line_width(1.1)
+            for side in (-1, 1):
+                grad = cairo.LinearGradient(nose, y, nose - facing * ln, y)
+                grad.add_color_stop_rgba(0.0, *WATER_HI_RGB, 0.8)
+                grad.add_color_stop_rgba(1.0, *WATER_HI_RGB, 0.0)
+                cr.set_source(grad)
+                cr.move_to(nose - facing * s * 0.1, y)
+                cr.line_to(nose - facing * ln, y + side * ln * 0.32)
+                cr.stroke()
+        else:
+            # Working the dam: bobbing as he tucks sticks in.
+            y += math.sin(self.phase * 4 + b["id"]) * s * 0.06
+        self._beaver(cr, x, y, s, facing, swim=True, stick=b["stick"],
+                     dive=min(1.0, dive / 0.5) if pose == "dive" else 0.0)
+
+    def _dam(self, cr, x, k):
+        """Sticks and mud laid across the river at x, growing in from both
+        banks as k runs 0..1; a notch is left mid-stream, where the water
+        spills white over it."""
+        half = self._river_half(x)
+        y = self._river_y(x)
+        th = max(3.0, self.river["half"] * 0.7)
+        reach = 1.15 * half * min(1.0, k * 1.15)
+        mud = self.river["half"] * 0.35 + 1
         for side in (-1, 1):
-            grad = cairo.LinearGradient(nose, y, nose - ln, y)
-            grad.add_color_stop_rgba(0.0, *WATER_HI_RGB, 0.8)
-            grad.add_color_stop_rgba(1.0, *WATER_HI_RGB, 0.0)
-            cr.set_source(grad)
-            cr.move_to(nose - s * 0.1, y)
-            cr.line_to(nose - ln, y + side * ln * 0.32)
+            y0 = y + side * (half + mud * 0.6)
+            y1 = y0 - side * (reach + mud * 0.6)
+            cr.set_source_rgb(*MUD_RGB)
+            self._rounded(cr, x - th / 2, min(y0, y1), th,
+                          abs(y1 - y0), th * 0.4)
+            cr.fill()
+            n = max(2, int(abs(y1 - y0) / max(1.5, th * 0.35)))
+            cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            for j in range(n):
+                sy = y0 + (y1 - y0) * (j + 0.5) / n
+                tilt = (0.6 if j % 2 else -0.6) * th
+                cr.set_source_rgb(*(TRUNK_RGB if j % 3 else WOOD_HI_RGB))
+                cr.set_line_width(max(0.8, th * 0.22))
+                cr.move_to(x - th * 0.75, sy - tilt * 0.3)
+                cr.line_to(x + th * 0.75, sy + tilt * 0.3)
+                cr.stroke()
+        if k > 0.6:
+            # The spill through the notch, and foam below it.
+            cr.set_line_width(1.0)
+            for j in range(3):
+                fy = y + (j - 1) * half * 0.12
+                u = (self.phase * 1.3 + j / 3) % 1.0
+                cr.set_source_rgba(1, 1, 1, 0.7 * (1 - u) * (k - 0.6) / 0.4)
+                cr.move_to(x + th * 0.6, fy)
+                cr.line_to(x + th * (0.9 + 1.6 * u), fy + half * 0.05)
+                cr.stroke()
+
+    def _lodge(self, cr, x, y, s, k, snow):
+        """A beavers' lodge: a dome of sticks and mud out in the pond, s
+        across when finished, rising as k runs 0..1, under snow in
+        winter."""
+        if k <= 0:
+            return
+        w = s * (0.5 + 0.5 * k)
+        h = s * 0.55 * k
+        cr.save()
+        cr.translate(x, y)
+        cr.move_to(-w / 2, 0)
+        cr.curve_to(-w * 0.45, -h * 0.9, -w * 0.2, -h, 0, -h)
+        cr.curve_to(w * 0.2, -h, w * 0.45, -h * 0.9, w / 2, 0)
+        cr.close_path()
+        cr.set_source_rgb(*BEAVER_DARK_RGB)
+        cr.fill_preserve()
+        cr.save()
+        cr.clip()
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_line_width(max(0.8, s * 0.04))
+        n = max(4, int(14 * k))
+        for j in range(n):
+            a = (j * 0.618034) % 1.0
+            b = (j * 0.381966) % 1.0
+            cr.set_source_rgb(*(TRUNK_RGB if j % 2 else WOOD_RGB))
+            cx, cy = (a - 0.5) * w, -b * h
+            cr.move_to(cx - s * 0.14, cy + (0.05 if j % 2 else -0.05) * s)
+            cr.line_to(cx + s * 0.14, cy - (0.05 if j % 2 else -0.05) * s)
             cr.stroke()
-        self._beaver(cr, x, y, s, 1, swim=True,
-                     dive=min(1.0, dive / 1.8) if dive >= 0 else 0.0)
+        cr.restore()
+        if snow > 0.01:
+            cr.set_source_rgba(*SNOW_RGB, 0.95 * snow)
+            cr.save()
+            cr.translate(0, -h * 0.82)
+            cr.scale(w * 0.36, h * 0.3)
+            cr.arc(0, 0, 1, math.pi, 2 * math.pi)
+            cr.restore()
+            cr.fill()
+        # Where it meets the water.
+        cr.set_source_rgba(*WATER_HI_RGB, 0.5)
+        cr.set_line_width(1.0)
+        cr.move_to(-w * 0.6, 0.5)
+        cr.line_to(w * 0.6, 0.5)
+        cr.stroke()
+        cr.restore()
 
     def _splash(self, cr, x, y, s, e):
         """Rings and drops where a tail slapped the water, e seconds on."""
@@ -3105,11 +3645,12 @@ class CpuView(Gtk.DrawingArea):
             cr.fill()
 
     @staticmethod
-    def _beaver(cr, x, y, s, facing, thrash=0.0, swim=False, dive=0.0):
+    def _beaver(cr, x, y, s, facing, thrash=0.0, swim=False, dive=0.0,
+                stick=False):
         """A beaver about s long, nose toward facing, belly at y. Swimming,
         y is the waterline and only his head and back show; dive runs 0..1
         as he tips nose-down, tail flung up, and sinks. thrash rocks him,
-        in radians."""
+        in radians. stick puts one crosswise in his teeth."""
         if s < 2:
             return
         cr.save()
@@ -3150,6 +3691,16 @@ class CpuView(Gtk.DrawingArea):
         cr.set_source_rgb(0.02, 0.02, 0.02)
         cr.arc(s * 0.41, -s * 0.33, max(0.4, s * 0.025), 0, 2 * math.pi)
         cr.fill()
+        if stick:
+            cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            cr.set_source_rgb(*TRUNK_RGB)
+            cr.set_line_width(max(0.8, s * 0.07))
+            cr.move_to(s * 0.15, -s * 0.12)
+            cr.line_to(s * 0.85, -s * 0.3)
+            cr.stroke()
+            cr.set_source_rgb(*LEAF_RGB)
+            cr.arc(s * 0.85, -s * 0.33, max(0.6, s * 0.06), 0, 2 * math.pi)
+            cr.fill()
         if not swim:
             cr.set_source_rgb(*BEAVER_DARK_RGB)
             for fx in (-0.2, 0.18):
@@ -3314,11 +3865,35 @@ class CpuView(Gtk.DrawingArea):
                     and base - h < py)
                 for px, py, w, ht in keep)
 
-        trees = self._scatter_trees(width, height, t, mud,
-                                    ("pine", "round", "pine", "bush"), clear)
+        # The world's tree slots, each at its (u, v) in its zone of its
+        # flank; one that would hide something is drawn smaller, never
+        # left out, so the woods in the picture are the world's woods.
+        tree_at = {}
+        for i, slot in enumerate(self.world.trees):
+            fl = flanks[slot["f"]]
+            rect = fl["near"] if slot["side"] > 0 else fl["far"]
+            if rect is None:
+                continue
+            x0, y0, x1, y1 = rect
+            if slot["side"] > 0:
+                v0, v1 = (0.02, 0.12) if slot["zone"] == "bank" \
+                    else (0.16, 0.44)
+            else:
+                v0, v1 = (0.82, 1.0) if slot["zone"] == "bank" \
+                    else (0.0, 0.7)
+            x = x0 + 0.25 * s + slot["u"] * max(0.0, x1 - x0 - 0.5 * s)
+            base = y0 + (v0 + (v1 - v0) * slot["v"]) * (y1 - y0)
+            h = t * ((0.42 + 0.25 * slot["size"]) if slot["zone"] == "bank"
+                     else (0.55 + 0.4 * slot["size"]))
+            if not clear(x, base, h, (x - 0.32 * h, base - h, x + 0.32 * h,
+                                      base)):
+                h *= 0.55
+            tree_at[i] = (x, base, h, slot["kind"], i)
+        trees = sorted(tree_at.values(), key=lambda tr: tr[1])
 
         self.wild = {"key": key, "s": s, "t": t, "mud": mud, "trees": trees,
-                     "flanks": flanks, "pastures": pastures, "grove": grove}
+                     "tree_at": tree_at, "flanks": flanks,
+                     "pastures": pastures, "grove": grove}
         self.sites = sites
         self.trappers = []
         for f, fl in enumerate(flanks):
@@ -3569,19 +4144,115 @@ class CpuView(Gtk.DrawingArea):
         trees.sort(key=lambda tr: tr[1])
         return trees
 
-    def _draw_wilds(self, cr):
-        """The woods, the trappers and the horses, nearest last."""
-        items = [(tree[1], 0, self._draw_tree, tree)
+    def _wild_items(self):
+        """Everything in the idle picture's woods and pastures, as (feet,
+        layer, draw, arg), to be drawn nearest last."""
+        items = [(tree[1], 0, self._draw_slot, tree)
                  for tree in self.wild["trees"]]
+        for b in self.world.beavers:
+            pose = self._beaver_pose(b)
+            if pose[0] == "bank":
+                items.append((pose[2], 1, self._draw_bank_beaver,
+                              (b,) + pose))
         items += [(st["y"], 1, self._draw_site, st) for st in self.sites]
         items += [(fl["cache"][1], 1, self._draw_cache, f)
                   for f, fl in enumerate(self.wild["flanks"]) if fl["cache"]]
         items += [(tr["y"], 2, self._draw_trapper, tr)
                   for tr in self.trappers]
         items += [(hs["y"], 2, self._draw_horse, hs) for hs in self.horses]
+        return items
+
+    def _draw_wilds(self, cr):
+        """The woods, the beavers ashore, the trappers and the horses,
+        nearest last."""
+        items = self._wild_items()
         items.sort(key=lambda it: it[:2])
         for _, _, draw, arg in items:
             draw(cr, arg)
+
+    def _draw_slot(self, cr, tree):
+        """One of the world's trees as it stands now: grown, a stump with
+        the beavers' sticks piled by it, or a sapling coming up."""
+        x, base, h, kind, i = tree
+        state = self.world.tree_state(i)
+        if state == "tree":
+            self._draw_tree(cr, tree)
+            return
+        slot = self.world.trees[i]
+        if state == "sapling":
+            g = 0.25 + 0.75 * self.world.growth(i)
+            self._sapling(cr, x, base, h * g, kind == "pine")
+        elif slot["by"] == "beaver":
+            self._gnawed(cr, x, base, h * 0.22)
+        else:
+            self._stump(cr, x, base, h * 0.22)
+        if state == "stump":
+            cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            cr.set_source_rgb(*TRUNK_RGB)
+            cr.set_line_width(max(0.8, h * 0.03))
+            for j in range(slot["pile"]):
+                sx = x + h * (0.12 + 0.07 * (j % 2))
+                sy = base - h * 0.025 * j
+                cr.move_to(sx - h * 0.1, sy)
+                cr.line_to(sx + h * 0.12, sy - h * 0.02)
+                cr.stroke()
+
+    def _draw_bank_beaver(self, cr, args):
+        """A beaver ashore at its tree: gnawing it, eating its bark, or
+        picking up a stick."""
+        b, _, x, feet, facing, _ = args
+        s = self.wild["s"] * 0.55
+        busy = b["job"] in ("cut", "feed") and self.world.time >= b["t1"]
+        thrash = math.sin(self.phase * 9 + b["id"]) * 0.08 if busy else 0.0
+        self._beaver(cr, x, feet, s, facing, thrash=thrash,
+                     stick=b["stick"])
+        if busy and b["job"] == "cut":
+            # Chips flying from the cut.
+            for k in range(3):
+                u = (self.phase * 1.8 + k / 3) % 1.0
+                cr.set_source_rgba(*WOOD_HI_RGB, 1 - u)
+                cr.arc(x + facing * s * (0.6 + 0.5 * u),
+                       feet - s * (0.4 + 0.5 * u - 0.6 * u * u),
+                       max(0.6, s * 0.04), 0, 2 * math.pi)
+                cr.fill()
+
+    @staticmethod
+    def _gnawed(cr, x, base, h):
+        """What a beaver leaves of a tree: a stump gnawed to a point."""
+        w = h * 0.7
+        cr.set_source_rgb(*TRUNK_RGB)
+        cr.move_to(x - w * 0.5, base)
+        cr.line_to(x - w * 0.42, base - h * 0.55)
+        cr.line_to(x, base - h)
+        cr.line_to(x + w * 0.42, base - h * 0.55)
+        cr.line_to(x + w * 0.5, base)
+        cr.close_path()
+        cr.fill()
+        cr.set_source_rgb(*WOOD_HI_RGB)
+        cr.move_to(x - w * 0.36, base - h * 0.55)
+        cr.line_to(x, base - h)
+        cr.line_to(x + w * 0.36, base - h * 0.55)
+        cr.line_to(x, base - h * 0.7)
+        cr.close_path()
+        cr.fill()
+
+    def _sapling(self, cr, x, base, h, pine):
+        """A young tree coming up where one was felled."""
+        if pine:
+            self._pine(cr, x, base, h, 0.0)
+            return
+        cr.set_source_rgb(*TRUNK_RGB)
+        cr.set_line_width(max(0.8, h * 0.05))
+        cr.move_to(x, base)
+        cr.line_to(x, base - h * 0.7)
+        cr.stroke()
+        look = self.look
+        bare = look["winter"]
+        if bare < 0.99:
+            cr.set_source_rgba(*look["leaf_hi"][0], 1 - bare)
+            for dx, dy in ((-0.15, -0.65), (0.15, -0.75), (0.0, -0.9)):
+                cr.arc(x + dx * h, base + dy * h, h * 0.15, 0, 2 * math.pi)
+                cr.fill()
 
     def _draw_trapper(self, cr, tr):
         walking = bool(tr["route"])
@@ -3885,7 +4556,7 @@ class CpuView(Gtk.DrawingArea):
         chip_foot = oy + t_o * 1.05 + label_h + gap * 1.25 if rest else 0.0
         self._lay_river(width, chip_foot, fy - 0.9 * t, t)
         self._draw_river(cr)
-        self._draw_swimmer(cr)
+        self._draw_works(cr)
         key = (width, height, len(fort), len(rest))
         pad = gap * 0.8
         die = (ox - pad, oy - pad * 1.55, ox + ow + pad,
@@ -4836,6 +5507,161 @@ SAMPLE_STATE = {
 }
 
 
+def envelope(seeds, years):
+    """Run each seed's valley for so many years headless, and return one
+    row per season per seed: its stats just before the season turns."""
+    rows = {}
+    for seed in seeds:
+        w = World(seed)
+        rows[seed] = []
+        for n in range(years * 4):
+            w.run((n + 1) * World.SEASON_S - 0.5 - w.time)
+            rows[seed].append(w.stats())
+            w.run(0.5)
+    return rows
+
+
+def beaver_tests(view, cr):
+    """The trees, the beavers and their works, headless and drawn."""
+    w = World(1)
+    assert len(w.trees) == 42 and all(w.tree_state(i) == "tree"
+                                      for i in range(42))
+    assert [sum(b["f"] == f for b in w.beavers) for f in (0, 1)] == [3, 3]
+    assert w.colonies == [{"dam": 0, "lodge": 0}] * 2
+
+    # A beaver fells a bank tree into a pile of sticks; the stump comes
+    # up a sapling, then a tree.
+    b = w.beavers[0]
+    i = w._bank_trees(0, b)[0]
+    b["tree"] = i
+    w._send(b, ["tree", i], "cut", w.CUT_S, w.SWIM_S)
+    w.run(b["t2"] - w.time + 1)
+    tr = w.trees[i]
+    assert tr["by"] == "beaver" and tr["felled"] is not None, tr
+    felled = tr["felled"]
+    assert w.tree_state(i) == "stump"
+    assert w.tree_state(i, felled + w.REGROW_S * 0.5) == "sapling"
+    assert w.tree_state(i, felled + w.REGROW_S) == "tree"
+
+    # Kits come in spring from surplus, as far as the lodge has room.
+    w = World(2)
+    w.beavers = []
+    for _ in range(4):
+        w._beaver(0, 0.9)
+    w._births()
+    assert len(w.beavers) == 4, "no lodge, no kits"
+    w.colonies[0]["lodge"] = w.LODGE_STICKS
+    w._births()
+    assert len(w.beavers) == 6 and w.tally["kits"][0] == 2, w.tally
+    assert sorted(round(b["cond"], 2) for b in w.beavers) == \
+        [0.5, 0.5, 0.6, 0.6, 0.9, 0.9]
+
+    # A valley empty of beavers for a season gets a pair from upstream,
+    # at the colony with the bigger dam.
+    w = World(3)
+    w.beavers = []
+    w.colonies[1]["dam"] = 5
+    w.run(w.RESTOCK_S + 1)
+    assert [b["f"] for b in w.beavers] == [1, 1], w.beavers
+    assert w.tally["rails"]["beavers"] == 1
+
+    # In winter, the fit ones keep to the lodge.
+    w = World(4)
+    w.run(3 * w.SEASON_S + 120)
+    for b in w.beavers:
+        b["cond"] = 1.0
+    w.run(w.SEASON_S / 2 - 120)
+    assert w.beavers and all(b["job"] == "lodge" for b in w.beavers)
+
+    # The pond above a finished dam widens the river, never past the most
+    # the layout allows for.
+    view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
+    view.set_world(World(5))
+    wide = []
+    for sticks in (0, 6, 12):
+        for c in view.world.colonies:
+            c["dam"] = sticks
+        view._draw(view, cr, 1024, 680)
+        for k in range(200):
+            x = k / 199 * 1024
+            assert view._river_half(x) <= view._river_half_max(x) + 1e-9
+        wide.append(view._river_half(
+            (World.DAM_U[0] - World.POND_LEN / 2) * 1024))
+    assert wide[2] > wide[0], wide
+
+    # A swimming beaver dives partway and comes up further on; one at a
+    # tree is on the bank in the idle picture, and in the bushes (not
+    # drawn) while the fort is up. Both pictures show the works.
+    w = view.world
+    b = w.beavers[0]
+    w._send(b, ["dam", 1], "haul", w.HAUL_S, w.SWIM_S)
+    seen = set()
+    for k in range(40):
+        w.time = b["t0"] + (b["t1"] - b["t0"]) * k / 40
+        seen.add(view._beaver_pose(b)[0])
+    assert seen == {"swim", "dive", "under"}, seen
+    i = w._bank_trees(0, b)[0]
+    w._send(b, ["tree", i], "cut", w.CUT_S, w.SWIM_S)
+    w.time = b["t1"] + 1
+    view._draw(view, cr, 1024, 680)
+    assert any(it[2] == view._draw_bank_beaver and it[3][0] is b
+               for it in view._wild_items())
+    view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], True)
+    view._draw(view, cr, 1024, 680)
+    assert not any(kind == "beaver" and args[0] is b
+                   for kind, args in view._works_items())
+    kinds = {kind for kind, _ in view._works_items()}
+    w.colonies[0]["lodge"] = w.LODGE_STICKS
+    assert {"dam", "lodge"} <= {kind for kind, _ in view._works_items()}, \
+        kinds
+    before = w.time
+    for _ in range(30 * 30):
+        view._advance(1 / 30)
+    assert abs(w.time - before - 30) < 1e-6, "the world runs on under siege"
+    view._draw(view, cr, 1024, 680)
+    view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
+
+    # Over several seeds and years, without leaning on the rails: dams and
+    # lodges go up, the beavers hold on in numbers, and lodges bring kits.
+    started = time.monotonic()
+    rows = envelope((1, 2, 3, 4), 4)
+    took = time.monotonic() - started
+    assert took < 60, took
+    later = [r for seed in rows for r in rows[seed][4:]]
+    for seed, seasons in rows.items():
+        first_dam = next(n for n, r in enumerate(seasons) if r["dams"])
+        first_lodge = next(n for n, r in enumerate(seasons) if r["lodges"])
+        assert first_dam < 8 and first_lodge < 12, (seed, first_dam)
+    mean = sum(r["beavers"] for r in later) / len(later)
+    assert 3 <= mean <= 12, mean
+    assert max(r["beavers"] for s_ in rows.values() for r in s_) <= 12
+    rails = sum(r["tally"]["rails"]["beavers"] for s_ in rows.values()
+                for r in s_)
+    assert rails <= 4, rails
+    kits = [e for s_ in rows.values() for r in s_
+            for e in r["tally"]["events"] if e["kind"] == "kits"]
+    with_lodge = [e["n"] for e in kits if e["lodge"] >= 0.5]
+    without = [e["n"] for e in kits if e["lodge"] == 0]
+    assert with_lodge and sum(with_lodge) / len(with_lodge) > (
+        sum(without) / len(without) if without else 0), kits
+    # The same valleys with dams that never hold: the beavers dwindle.
+    dammed = undammed = 0
+    for seed in (1, 2, 3, 4):
+        w = World(seed)
+        w.DAM_STICKS = 10 ** 6
+        w.run(World.YEAR_S)
+        for _ in range(12):
+            w.run(World.SEASON_S)
+            undammed += len(w.beavers)
+        dammed += sum(r["beavers"] for r in rows[seed][4:])
+    assert dammed > undammed, (dammed, undammed)
+    for seed, seasons in rows.items():
+        n = next(n for n, r in enumerate(seasons) if r["lodges"])
+        before = [r["beavers"] for r in seasons[:n + 1]]
+        after = [r["beavers"] for r in seasons[n + 1:]]
+        assert sum(after) / len(after) > sum(before) / len(before), seed
+
+
 def self_test():
     """Build every page and draw every state against a real surface.
 
@@ -4969,14 +5795,7 @@ def self_test():
     view.set_world(w2)
     for size in ((300, 220), (1024, 680), (560, 420)):
         view._draw(view, cr, *size)
-    # The beaver swims the river, and dives for part of each crossing.
-    view._draw(view, cr, 1024, 680)
-    seen = set()
-    for k in range(40):
-        view.phase = view.BEAVER_S * k / 40
-        x, y, dive = view._swimmer()
-        seen.add("under" if x is None else "dive" if dive >= 0 else "swim")
-    assert seen == {"swim", "dive", "under"}, seen
+    beaver_tests(view, cr)
 
     # The woods stand still from frame to frame, clear of the grove and
     # out of the water, and every size lays out, down to none at all.
