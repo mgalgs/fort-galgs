@@ -382,9 +382,13 @@ class World:
     with nobody in it loses a log a season. More trappers means the
     sites, the trees and the beavers go further around; fewer, the
     more each one gets. Newcomers arrive in spring, more the more
-    beavers the valley holds, into the free plot furthest along. Rails:
-    a spring with nobody left brings one regardless; never more than
-    TRAPPERS_MAX.
+    beavers the valley holds (ARRIVE_K), into the free plot furthest
+    along. Through summer and autumn a lone drifter may come the same
+    way, a chance each tick that grows with the square of the plots
+    standing free and with the beavers (DRIFT_K), and fades as winter
+    nears; none travel in the cold. So a death is felt for a while and
+    then filled, sooner the emptier the valley. Rails: a spring with
+    nobody left brings one regardless; never more than TRAPPERS_MAX.
 
     Bears. Each tick gives them their turn before anyone else's. A bear
     keeps to one flank, and its body is its energy and its health. It
@@ -509,7 +513,9 @@ class World:
     BAIT_S = 240.0          # a set trap's bait is good this long
     TRAP_BASE = 0.15        # trapping's pull with no beavers about
     REST_PULL = 0.08        # how much he likes an idle moment
-    ARRIVE_K = 0.8          # newcomers a spring per BEAVER_REF beavers
+    ARRIVE_K = 0.9          # newcomers a spring per BEAVER_REF beavers
+    DRIFT_K = 0.5           # drifters a summer per BEAVER_REF beavers, at
+                            # ...one plot free; times the square of them
     GRAVE_S = 2 * YEAR_S
 
     BEARS_MAX = 2           # rail: never more in the valley
@@ -800,6 +806,7 @@ class World:
         self._advance_beavers()
         self._catches()
         self._advance_trappers()
+        self._drifters()
         self._rails()
         if self.graves and self.time - self.graves[0]["t"] >= self.GRAVE_S:
             self.graves.pop(0)
@@ -1689,15 +1696,36 @@ class World:
                         st.update(by=None, state="empty", since=self.time)
         return heir["id"], self.stores(dead), before, self.stores(heir)
 
-    def _arrivals(self):
-        """Spring: newcomers drawn by the beavers, into free plots."""
-        free = [(f, k) for f in (0, 1) for k in range(len(self.PLOT_U))
+    def _free_plots(self):
+        return [(f, k) for f in (0, 1) for k in range(len(self.PLOT_U))
                 if self.plots[f][k]["owner"] is None]
-        x = self.ARRIVE_K * len(self.beavers) / self.BEAVER_REF
-        n = int(x) + (self.rng.random() < x % 1)
-        if not self.trappers and n == 0:
-            n = 1
-            self.tally["rails"]["trappers"] += 1
+
+    def _drifters(self):
+        """Summer and autumn: now and then a lone newcomer, likelier the
+        more plots stand free (as its square), the more beavers there
+        are and the further winter is off."""
+        if self.season() not in (1, 2) or self.cold() >= 0.5:
+            return
+        short = min(len(self._free_plots()),
+                    self.TRAPPERS_MAX - len(self.trappers))
+        if short <= 0:
+            return
+        p = self.DRIFT_K * short ** 2 * len(self.beavers) \
+            / self.BEAVER_REF * (1 - self.urgency()) \
+            * self.TICK_S / self.SEASON_S
+        if p > 0 and self.rng.random() < p:
+            self._arrivals(1)
+
+    def _arrivals(self, n=None):
+        """Newcomers into free plots: n of them, or in spring as many as
+        the beavers draw."""
+        free = self._free_plots()
+        if n is None:
+            x = self.ARRIVE_K * len(self.beavers) / self.BEAVER_REF
+            n = int(x) + (self.rng.random() < x % 1)
+            if not self.trappers and n == 0:
+                n = 1
+                self.tally["rails"]["trappers"] += 1
         n = min(n, len(free), self.TRAPPERS_MAX - len(self.trappers))
         for _ in range(n):
             per = [sum(tr["f"] == f for tr in self.trappers) for f in (0, 1)]
@@ -7715,9 +7743,9 @@ def _set_clock(w, t):
     w.half_n = int(t // (w.SEASON_S / 2))
 
 
-def trapper_tests(view, cr, rows):
+def trapper_tests(view, cr, rows, more):
     """The trappers' needs, deaths and newcomers, headless and drawn; rows
-    is envelope((1, 2, 3, 4), 4)."""
+    is envelope((1, 2, 3, 4), 4) and more envelope((5, 6, 7, 8), 4)."""
     S = World.SEASON_S
 
     def staged(t, beavers=True):
@@ -7898,7 +7926,7 @@ def trapper_tests(view, cr, rows):
     for seed in range(12):
         w = staged(10)
         w.rng.seed(seed)
-        while len(w.beavers) < 12:
+        while len(w.beavers) < 9:
             w._beaver(seed % 2, 0.7)
         w._arrivals()
         counts.add(w.tally["arrivals"])
@@ -7914,6 +7942,33 @@ def trapper_tests(view, cr, rows):
     tr = w.trappers[0]
     assert (tr["f"], tr["plot"], tr["at"]) == (1, 1, ["edge", 1]), tr
 
+    # Out of spring a lone drifter comes now and then to a short-handed
+    # valley, sooner the more plots stand free; never in the winter, nor
+    # past TRAPPERS_MAX, nor to a valley without beavers.
+    def drift(t, men, beavers=12, k=World.DRIFT_K, seed=0):
+        w = staged(t)
+        w.DRIFT_K = k
+        w.rng.seed(seed)
+        while len(w.beavers) < beavers:
+            w._beaver(0, 0.7)
+        w.beavers = w.beavers[:beavers]
+        for tr in w.trappers[men:]:
+            w.plots[tr["f"]][tr["plot"]]["owner"] = None
+        w.trappers = w.trappers[:men]
+        for _ in range(300):
+            w._drifters()
+        return w
+
+    assert len(drift(S + 10, 1, k=1e3).trappers) == 4
+    for t in (1.5 * S + 10, 2 * S + 10):
+        assert drift(t, 0, k=1e3).tally["arrivals"] > 0, t
+    assert drift(3 * S + 10, 0, k=1e3).tally["arrivals"] == 0
+    assert drift(S + 10, 1, beavers=0, k=1e3).tally["arrivals"] == 0
+    assert drift(10, 1, k=1e3).tally["arrivals"] == 0, "spring's own"
+    came = [sum(drift(S + 10, men, seed=seed).tally["arrivals"] > 0
+                for seed in range(40)) for men in (2, 1)]
+    assert came[0] < came[1], came
+
     # Over several seeds and years: the trappers hold on in numbers, some
     # die and some come; they trap harder when beavers are plenty; those
     # who trap through the autumn come out of the winter worse, most but
@@ -7923,6 +7978,17 @@ def trapper_tests(view, cr, rows):
     every = [r for seed in rows for r in rows[seed]]
     mean = sum(r["trappers"] for r in later) / len(later)
     assert 1 <= mean <= 4, mean
+    # ...and over eight, the drifters and the spring keep the valley
+    # between half and nearly full, the drifters coming in summer and
+    # autumn and never in the winter.
+    eight = [r for e in (rows, more) for seed in e for r in e[seed]]
+    later8 = [r for r in eight if r["year"] > 1]
+    mean = sum(r["trappers"] for r in later8) / len(later8)
+    assert 2.5 <= mean <= 3, mean
+    assert sum(r["trappers"] == 4 for r in later8) < len(later8) / 2
+    drifted = [r["tally"]["arrivals"] for r in eight if r["season"] > 0]
+    assert sum(drifted) >= 8 and not any(
+        r["tally"]["arrivals"] for r in eight if r["season"] == 3), drifted
     assert max(r["trappers"] for r in every) <= 4
     rails = sum(r["tally"]["rails"]["trappers"] for r in every)
     arrivals = sum(r["tally"]["arrivals"] for r in every)
@@ -7931,7 +7997,6 @@ def trapper_tests(view, cr, rows):
         (rails, arrivals, deaths)
     # Bears have made the beavers-to-trapping link a near tie over four
     # valleys; it is judged over eight.
-    more = envelope((5, 6, 7, 8), 4)
     shares = []
     for r in every + [r for seed in more for r in more[seed]]:
         if r["season"] == 3:
@@ -8062,15 +8127,16 @@ def trapper_tests(view, cr, rows):
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
 
 
-def bear_tests(view, cr, rows):
+def bear_tests(view, cr, rows, more):
     """The bears' year, their hunting and their fights, headless and
-    drawn; rows is envelope((1, 2, 3, 4), 4)."""
+    drawn; rows and more are as for trapper_tests."""
     S = World.SEASON_S
 
     def staged(t, seed=21):
         w = World(seed)
         _set_clock(w, t)
-        w.BEAR_ARRIVE_K = 0.0  # only the bears a test puts there
+        w.BEAR_ARRIVE_K = 0.0  # only the bears a test puts there...
+        w.DRIFT_K = 0.0        # ...and the men
         for tr in w.trappers:
             tr["t0"] = tr["t1"] = tr["t2"] = w.time
         return w
@@ -8410,9 +8476,9 @@ def bear_tests(view, cr, rows):
     # a killing sharpens the survivors' watch and fattens their stores;
     # the bears keep to their dens in deep winter and to their rails.
     started = time.monotonic()
-    events, exposure, watch, held = fight_sample(range(1, 25), 6, 1.0)
+    events, exposure, watch, held = fight_sample(range(1, 29), 6, 1.0)
     took = time.monotonic() - started
-    assert took < 20, took
+    assert took < 25, took
     sample = [e for e in events if e["kind"] == "fight"]
     won = sum(e["won"] for e in sample) / len(sample)
     assert len(sample) >= 100 and 0.5 <= won <= 0.8, (len(sample), won)
@@ -8499,10 +8565,10 @@ def bear_tests(view, cr, rows):
     assert view._almanac_text()[2] == ""
     view._draw_almanac(cr, 680)
 
-    # And in the four valleys the other tests read: fights enough to
+    # And in the eight valleys the other tests read: fights enough to
     # matter, and neither side has them all its own way (too few fights
     # there to hold a rate to).
-    seen = [e for seed in rows for r in rows[seed]
+    seen = [e for env in (rows, more) for seed in env for r in env[seed]
             for e in r["tally"]["events"] if e["kind"] == "fight"]
     won = sum(e["won"] for e in seen)
     assert len(seen) >= 8 and 0 < won < len(seen), (len(seen), won)
@@ -8696,8 +8762,9 @@ def self_test():
         assert abs(base - view._river_y(x)) > view._river_half_max(x), \
             (x, base)
 
-    trapper_tests(view, cr, rows)
-    bear_tests(view, cr, rows)
+    more = envelope((5, 6, 7, 8), 4)
+    trapper_tests(view, cr, rows, more)
+    bear_tests(view, cr, rows, more)
 
     # The almanac prints a row a season, headless, touching no state file.
     with tempfile.TemporaryDirectory() as tmp:
