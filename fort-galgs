@@ -418,7 +418,7 @@ class World:
     WINTER_LOGS = 10        # logs he wants in hand to burn
     HEARTH_S = 90.0         # sheltering burns a log this often...
     COLD_HEARTH = 0.7       # ...and keeps out this much less without one
-    THAW_LOGS = 4           # the spring thaw rots this much of any cabin
+    THAW_LOGS = 6           # the spring thaw rots this much of any cabin
     FED_DRAIN = 1 / 1200    # fed-ness lost a second
     HUNGER_K = 1 / 1800     # health lost a second with nothing in him
     COLD_K = 1 / 600        # ...and out in the full cold of winter
@@ -6839,6 +6839,12 @@ def trapper_tests(view, cr, rows):
     cold = [e["loss"] for e in winters if not e["ready"]]
     snug = [e["loss"] for e in winters if e["ready"]]
     assert sum(cold) / len(cold) > sum(snug) / len(snug), (cold, snug)
+    # ...and it is the men who trapped hardest through the autumn whose
+    # cabins the winter finds unfinished.
+    over = [e["ready"] for e in winters if e["share"] > mid]
+    under = [e["ready"] for e in winters if e["share"] <= mid]
+    assert not all(over) and sum(over) / len(over) < \
+        sum(under) / len(under), (over, under)
     heirs = [e for e in events if e["kind"] == "death" and e["claimant"]]
     assert all(e["after"] - e["before"] == e["moved"] for e in heirs)
     assert sum(e["after"] - e["before"] for e in heirs) > 0, heirs
