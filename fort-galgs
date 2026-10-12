@@ -7,9 +7,11 @@ user sees. The live picture reads /proc/stat and cgroup cpu.stat directly,
 because those are read-only and cheap.
 
 Run with --self-test to build every page and draw every state once, or with
---snapshot <png> to draw the chip from live load.
+--snapshot <png> to draw the chip from live load. --time-scale <x> runs the
+valley's clock x times faster than real time, to watch the seasons turn.
 """
 
+import io
 import json
 import math
 import os
@@ -111,6 +113,28 @@ BEAVER_DARK_RGB = (0.22, 0.15, 0.10)
 PELT_RGB = (0.56, 0.38, 0.22)
 PELT_DARK_RGB = (0.35, 0.22, 0.12)
 CORD_RGB = (0.83, 0.74, 0.52)
+
+# The seasons, each across the whole picture: spring, summer, autumn, winter.
+SPRING_GRASS_RGB = (0.20, 0.37, 0.17)
+AUTUMN_GRASS_RGB = (0.29, 0.28, 0.14)
+WINTER_GRASS_RGB = (0.74, 0.79, 0.86)
+WINTER_GRASS_LOW_RGB = (0.46, 0.52, 0.62)
+SPRING_TUFT_RGB = (0.42, 0.62, 0.28)
+AUTUMN_TUFT_RGB = (0.55, 0.46, 0.22)
+WINTER_TUFT_RGB = (0.50, 0.46, 0.34)
+SPRING_LEAF_RGB = (0.33, 0.58, 0.24)
+SPRING_LEAF_HI_RGB = (0.47, 0.71, 0.33)
+AUTUMN_LEAF_RGBS = ((0.84, 0.42, 0.11), (0.74, 0.19, 0.11),
+                    (0.88, 0.70, 0.18))
+AUTUMN_LEAF_HI_RGBS = ((0.95, 0.58, 0.20), (0.86, 0.32, 0.17),
+                       (0.97, 0.83, 0.33))
+BARE_LEAF_RGB = (0.44, 0.31, 0.17)
+BLOSSOM_RGB = (0.99, 0.82, 0.88)
+SNOW_RGB = (0.94, 0.96, 1.00)
+ICE_RGB = (0.80, 0.90, 0.97)
+SPRING_WATER_RGB = (0.21, 0.37, 0.48)
+AUTUMN_WATER_RGB = (0.12, 0.29, 0.44)
+WINTER_WATER_RGB = (0.17, 0.27, 0.37)
 
 
 CSS = b"""
@@ -263,6 +287,107 @@ class GroupSampler:
 
 
 # --------------------------------------------------------------------------
+# The valley: what lives there, and the rules it lives by
+# --------------------------------------------------------------------------
+
+class World:
+    """The valley around the fort, run headless: no drawing, no pixels.
+
+    The world's rules. Time steps in whole-second ticks, and every choice,
+    catch and drain happens in one; nothing is scripted, each actor reacts
+    to what it needs and what is near it.
+
+    Seasons. A year is an hour of world time, fifteen minutes a season,
+    spring first; each blends into the next over its last minute. The
+    clock runs whether the fort is up or down.
+    """
+
+    # -- the world's rates --
+    SEASONS = ("spring", "summer", "autumn", "winter")
+    SEASON_S = 900.0    # world seconds in a season...
+    YEAR_S = 4 * SEASON_S
+    BLEND_S = 60.0      # ...the last this many blending into the next
+    TICK_S = 1.0        # the world decides once a tick
+    VERSION = 1         # of the saved state's schema
+
+    def __init__(self, seed=1):
+        self.seed = seed
+        self.rng = random.Random(seed)
+        self.time = 0.0
+        self.next_tick = self.TICK_S
+        self.season_n = 0
+
+    # -- the clock --
+
+    def season(self, t=None):
+        """0 spring, 1 summer, 2 autumn, 3 winter."""
+        return int((self.time if t is None else t) // self.SEASON_S) % 4
+
+    def year(self):
+        return int(self.time // self.YEAR_S) + 1
+
+    def season_t(self):
+        """How far into this season, 0..1."""
+        return self.time % self.SEASON_S / self.SEASON_S
+
+    def season_weights(self, t=None):
+        """How much each season shows, summing to 1: one alone for most of
+        a season, easing into the next over its last BLEND_S."""
+        t = self.time if t is None else t
+        s = self.season(t)
+        u = min(1.0, max(0.0, (t % self.SEASON_S - self.SEASON_S
+                               + self.BLEND_S) / self.BLEND_S))
+        k = u * u * (3 - 2 * u)
+        w = [0.0] * 4
+        w[s] += 1 - k
+        w[(s + 1) % 4] += k
+        return w
+
+    def cold(self):
+        return self.season_weights()[3]
+
+    # -- stepping --
+
+    def advance(self, dt):
+        """Move the clock on dt seconds, deciding at every tick crossed."""
+        end = self.time + max(0.0, dt)
+        while self.next_tick <= end:
+            self.time = self.next_tick
+            self.next_tick += self.TICK_S
+            self._tick()
+        self.time = end
+
+    run = advance
+
+    def _tick(self):
+        n = int(self.time // self.SEASON_S)
+        if n != self.season_n:
+            self.season_n = n
+
+    # -- saving --
+
+    def to_dict(self):
+        v, state, gauss = self.rng.getstate()
+        return {"version": self.VERSION, "seed": self.seed,
+                "time": self.time, "next_tick": self.next_tick,
+                "season_n": self.season_n,
+                "rng": [v, list(state), gauss]}
+
+    @classmethod
+    def from_dict(cls, d):
+        """The world d describes; raises on anything not of this schema."""
+        if not isinstance(d, dict) or d.get("version") != cls.VERSION:
+            raise ValueError("not this world's schema")
+        w = cls(d["seed"])
+        w.time = float(d["time"])
+        w.next_tick = float(d["next_tick"])
+        w.season_n = int(d["season_n"])
+        v, state, gauss = d["rng"]
+        w.rng.setstate((v, tuple(state), gauss))
+        return w
+
+
+# --------------------------------------------------------------------------
 # The picture: the chip, with the fort's cores fenced off
 # --------------------------------------------------------------------------
 
@@ -335,6 +460,10 @@ class CpuView(Gtk.DrawingArea):
         self.trappers = []
         self.pelts = [[0, 0], [0, 0]]     # per flank: pelts stacked, bales
         self.horses = []
+        self.world = World(seed=7)
+        self.time_scale = 1.0             # world seconds per real second
+        self.current = 0.0                # how far the glints have drifted
+        self.look = self._season_look()   # the season's colours, per frame
         self.set_draw_func(self._draw)
         self.add_tick_callback(self._on_tick)
         click = Gtk.GestureClick()
@@ -551,7 +680,11 @@ class CpuView(Gtk.DrawingArea):
 
     def _advance(self, dt):
         """Step the scene: the walker's halts, the redcoats' march, and the
-        sentries choosing whom to shoot."""
+        sentries choosing whom to shoot. The valley's clock runs on
+        whether the fort is up or down."""
+        self.world.advance(dt * self.time_scale)
+        # The current slows under the winter ice.
+        self.current += dt * 0.035 * (1 - 0.7 * self.look["winter"])
         if self._bugling() or self.relief is not None \
                 or self.potshot is not None:
             self.walker_halted += dt
@@ -2539,21 +2672,54 @@ class CpuView(Gtk.DrawingArea):
 
     # -- the land, and the river across it --------------------------------
 
+    @staticmethod
+    def _mix(weights, rgbs):
+        return tuple(sum(w * c[k] for w, c in zip(weights, rgbs))
+                     for k in range(3))
+
+    def _season_look(self):
+        """The season's colours and weights, mixed once a frame from the
+        world's clock so every season blends into the next."""
+        w = self.world.season_weights()
+        mix = self._mix
+        return {
+            "w": w, "spring": w[0], "autumn": w[2], "winter": w[3],
+            "grass": mix(w, (SPRING_GRASS_RGB, GRASS_RGB, AUTUMN_GRASS_RGB,
+                             WINTER_GRASS_RGB)),
+            "grass_low": mix(w, (GRASS_LOW_RGB, GRASS_LOW_RGB, GRASS_LOW_RGB,
+                                 WINTER_GRASS_LOW_RGB)),
+            "tuft": mix(w, (SPRING_TUFT_RGB, GRASS_HI_RGB, AUTUMN_TUFT_RGB,
+                            WINTER_TUFT_RGB)),
+            "water": mix(w, (SPRING_WATER_RGB, WATER_RGB, AUTUMN_WATER_RGB,
+                             WINTER_WATER_RGB)),
+            "leaf": [mix(w, (SPRING_LEAF_RGB, LEAF_RGB, AUTUMN_LEAF_RGBS[k],
+                             BARE_LEAF_RGB)) for k in range(3)],
+            "leaf_hi": [mix(w, (SPRING_LEAF_HI_RGB, LEAF_HI_RGB,
+                                AUTUMN_LEAF_HI_RGBS[k], BARE_LEAF_RGB))
+                        for k in range(3)],
+        }
+
     def _draw_land(self, cr, width, height):
         """Grass over the whole picture, fading out at the foot into the
-        window below it; worn browner while the redcoats are marching."""
-        grass = TRODDEN_RGB if self.on else GRASS_RGB
+        window below it, coloured by the season; worn browner while the
+        redcoats are marching, though snow covers even that."""
+        look = self.look
+        grass = look["grass"]
+        if self.on:
+            grass = self._mix((1 - look["winter"] * 0.8,
+                               look["winter"] * 0.8),
+                              (TRODDEN_RGB, WINTER_GRASS_RGB))
         grad = cairo.LinearGradient(0, 0, 0, height)
         grad.add_color_stop_rgba(0.0, *grass, 0.95)
-        grad.add_color_stop_rgba(0.82, *GRASS_LOW_RGB, 0.9)
-        grad.add_color_stop_rgba(1.0, *GRASS_LOW_RGB, 0.0)
+        grad.add_color_stop_rgba(0.82, *look["grass_low"], 0.9)
+        grad.add_color_stop_rgba(1.0, *look["grass_low"], 0.0)
         cr.rectangle(0, 0, width, height)
         cr.set_source(grad)
         cr.fill()
         # Tufts scattered evenly (an R2 sequence), the same every frame.
         n = int(min(220, width * height / 1100))
         cr.set_line_width(1.0)
-        cr.set_source_rgba(*GRASS_HI_RGB, 0.30 if self.on else 0.45)
+        cr.set_source_rgba(*look["tuft"], 0.30 if self.on else 0.45)
         for i in range(n):
             x = (0.5 + i * 0.7548777) % 1.0 * width
             y = (0.5 + i * 0.5698403) % 1.0 * height * 0.88
@@ -2563,12 +2729,15 @@ class CpuView(Gtk.DrawingArea):
                 cr.line_to(x + dx, y - h * (1.0 - abs(dx) * 0.2))
         cr.stroke()
 
+    HIGH_WATER = 0.25   # the spring melt widens the river by this much
+
     def _lay_river(self, width, top, bottom, t):
         """Run the river from left to right inside the band (top, bottom),
-        meandering as far as the band allows."""
+        meandering as far as the band allows, with room left for it to
+        rise."""
         room = max(0.0, bottom - top)
         half = max(3.0, min(t * 0.3, room * 0.14))
-        amp = max(0.0, min(t * 0.6, room / 2 - half - 2))
+        amp = max(0.0, min(t * 0.6, room / 2 - half * self._swell_max() - 2))
         self.river = {"w": width, "y": (top + bottom) / 2, "amp": amp,
                       "half": half}
 
@@ -2579,9 +2748,22 @@ class CpuView(Gtk.DrawingArea):
                                     + math.sin(u * 15.1 + 2.0) * 0.2)
 
     def _river_half(self, x):
-        """Half the river's width at x; it narrows and widens a little."""
+        """Half the river's width at x; it narrows and widens a little,
+        and runs high in spring."""
+        return self._river_base(x) * (1.0 + self.HIGH_WATER
+                                      * self.look["spring"])
+
+    def _river_base(self, x):
         r = self.river
         return r["half"] * (1.0 + 0.15 * math.sin(x / r["w"] * 11.0 + 1.0))
+
+    def _swell_max(self):
+        return 1.0 + self.HIGH_WATER
+
+    def _river_half_max(self, x):
+        """The most _river_half(x) can ever be, in any season: what the
+        layout keeps the land clear of."""
+        return self._river_base(x) * self._swell_max()
 
     def _river_edge(self, x, side):
         """The river's far (side -1) or near (side 1) bank at x."""
@@ -2605,8 +2787,22 @@ class CpuView(Gtk.DrawingArea):
         cr.set_source_rgba(*MUD_RGB, 0.9)
         cr.fill()
         band(0)
-        cr.set_source_rgb(*WATER_RGB)
+        cr.set_source_rgb(*self.look["water"])
         cr.fill()
+        ice = self.look["winter"]
+        if ice > 0.01:
+            # Shelves of ice grow in from both banks.
+            cr.set_source_rgba(*ICE_RGB, 0.85 * ice)
+            for side in (-1, 1):
+                cr.move_to(xs[0], self._river_edge(xs[0], side))
+                for x in xs[1:]:
+                    cr.line_to(x, self._river_edge(x, side))
+                for k, x in enumerate(reversed(xs)):
+                    jag = 0.25 + 0.12 * math.sin(k * 1.7) ** 2
+                    cr.line_to(x, self._river_edge(x, side)
+                               - side * self._river_half(x) * jag * ice)
+                cr.close_path()
+                cr.fill()
         # Shallows along the near bank.
         cr.set_source_rgba(*WATER_HI_RGB, 0.18)
         cr.set_line_width(self.river["half"] * 0.4)
@@ -2621,7 +2817,7 @@ class CpuView(Gtk.DrawingArea):
         n = max(6, int(w / 26))
         cr.set_line_width(1.2)
         for i in range(n):
-            u = ((i * 0.618034) + self.phase * 0.035) % 1.0
+            u = ((i * 0.618034) + self.current) % 1.0
             x = -20 + u * span + (i * 37) % 23
             lane = ((i * 0.381966) % 1.0) * 1.3 - 0.65
             y = self._river_y(x) + lane * self._river_half(x)
@@ -2759,8 +2955,10 @@ class CpuView(Gtk.DrawingArea):
     # -- the grove, where the fort stands when it is down ------------------
 
     def _pine(self, cr, x, base, h, sway):
-        """A conifer: trunk and three tiers, its tip swaying by sway."""
+        """A conifer: trunk and three tiers, its tip swaying by sway. Green
+        the year round; in winter, snow lies along each tier."""
         w = h * 0.5
+        snow = self.look["winter"]
         cr.set_source_rgb(*TRUNK_RGB)
         cr.rectangle(x - w * 0.07, base - h * 0.2, w * 0.14, h * 0.2)
         cr.fill()
@@ -2768,35 +2966,96 @@ class CpuView(Gtk.DrawingArea):
                                             (0.38, 0.84, 0.78),
                                             (0.60, 1.0, 0.55))):
             dx = sway * (hi - 0.1)
-            cr.move_to(x - w / 2 * frac + sway * lo, base - h * lo)
-            cr.line_to(x + dx, base - h * hi)
-            cr.line_to(x + w / 2 * frac + sway * lo, base - h * lo)
+            left = (x - w / 2 * frac + sway * lo, base - h * lo)
+            right = (x + w / 2 * frac + sway * lo, base - h * lo)
+            tip = (x + dx, base - h * hi)
+            cr.move_to(*left)
+            cr.line_to(*tip)
+            cr.line_to(*right)
             cr.close_path()
             cr.set_source_rgb(*(PINE_RGB if i % 2 == 0 else PINE_HI_RGB))
             cr.fill()
+            if snow > 0.01:
+                # A cap over the tip and a sag of snow along the boughs.
+                k = 0.42
+                cr.move_to(tip[0] + (left[0] - tip[0]) * k,
+                           tip[1] + (left[1] - tip[1]) * k)
+                cr.line_to(*tip)
+                cr.line_to(tip[0] + (right[0] - tip[0]) * k,
+                           tip[1] + (right[1] - tip[1]) * k)
+                cr.curve_to(tip[0], tip[1] + (left[1] - tip[1]) * 0.25,
+                            tip[0], tip[1] + (left[1] - tip[1]) * 0.55,
+                            tip[0] + (left[0] - tip[0]) * k,
+                            tip[1] + (left[1] - tip[1]) * k)
+                cr.close_path()
+                cr.set_source_rgba(*SNOW_RGB, 0.95 * snow)
+                cr.fill()
 
-    def _round_tree(self, cr, x, base, h, sway):
-        """A broadleaf: trunk and a canopy of three overlapping puffs."""
+    def _round_tree(self, cr, x, base, h, sway, i=0):
+        """A broadleaf: trunk and a canopy of three overlapping puffs, in
+        the season's colours: blossom in spring, red, orange or yellow (by
+        i) in autumn, and bare branches under snow in winter."""
+        look = self.look
+        bare = look["winter"]
         r = h * 0.26
         cr.set_source_rgb(*TRUNK_RGB)
         cr.rectangle(x - h * 0.04, base - h * 0.45, h * 0.08, h * 0.45)
         cr.fill()
         cy = base - h + r
-        for dx, dy, rr, rgb in ((-0.55, 0.35, 0.85, LEAF_RGB),
-                                (0.55, 0.35, 0.85, LEAF_RGB),
-                                (0.0, 0.0, 1.0, LEAF_HI_RGB)):
-            cr.set_source_rgb(*rgb)
-            cr.arc(x + dx * r + sway, cy + dy * r, r * rr, 0, 2 * math.pi)
-            cr.fill()
+        if bare > 0.01:
+            cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            cr.set_source_rgba(*TRUNK_RGB, bare)
+            for dx, dy, wd in ((-0.75, 0.0, 0.05), (0.7, -0.15, 0.05),
+                               (0.05, -0.85, 0.04), (-0.3, -0.55, 0.03),
+                               (0.35, 0.35, 0.03)):
+                cr.set_line_width(max(0.8, h * wd))
+                cr.move_to(x, base - h * 0.4)
+                cr.curve_to(x, cy + r * 0.6, x + dx * r * 0.4, cy + dy * r,
+                            x + dx * r + sway, cy + dy * r)
+                cr.stroke()
+        hue = i % 3
+        canopy = 1 - bare
+        if canopy > 0.01:
+            for dx, dy, rr, rgb in (
+                    (-0.55, 0.35, 0.85, look["leaf"][hue]),
+                    (0.55, 0.35, 0.85, look["leaf"][hue]),
+                    (0.0, 0.0, 1.0, look["leaf_hi"][hue])):
+                cr.set_source_rgba(*rgb, canopy)
+                cr.arc(x + dx * r + sway, cy + dy * r, r * rr, 0,
+                       2 * math.pi)
+                cr.fill()
+        if look["spring"] > 0.01:
+            cr.set_source_rgba(*BLOSSOM_RGB, look["spring"])
+            for k in range(6):
+                bx = ((0.3 + (k + i) * 0.7548777) % 1.0 - 0.5) * 2.2 * r
+                by = ((0.6 + (k + i) * 0.5698403) % 1.0 - 0.6) * 1.4 * r
+                cr.arc(x + bx + sway, cy + by, max(0.7, r * 0.11), 0,
+                       2 * math.pi)
+                cr.fill()
+        if bare > 0.01:
+            cr.set_source_rgba(*SNOW_RGB, 0.9 * bare)
+            for dx, dy in ((-0.75, 0.0), (0.7, -0.15), (0.05, -0.85)):
+                cr.save()
+                cr.translate(x + dx * r + sway, cy + dy * r - r * 0.05)
+                cr.scale(r * 0.28, r * 0.09)
+                cr.arc(0, 0, 1, 0, 2 * math.pi)
+                cr.restore()
+                cr.fill()
 
-    @staticmethod
-    def _bush(cr, x, base, s):
-        for dx, dy, rr, rgb in ((-0.5, 0.0, 0.55, LEAF_RGB),
-                                (0.5, 0.0, 0.55, LEAF_RGB),
-                                (0.0, -0.3, 0.65, LEAF_HI_RGB)):
+    def _bush(self, cr, x, base, s):
+        look = self.look
+        for dx, dy, rr, rgb in ((-0.5, 0.0, 0.55, look["leaf"][0]),
+                                (0.5, 0.0, 0.55, look["leaf"][2]),
+                                (0.0, -0.3, 0.65, look["leaf_hi"][1])):
             cr.set_source_rgb(*rgb)
             cr.arc(x + dx * s, base - s * 0.45 + dy * s, s * rr,
                    0, 2 * math.pi)
+            cr.fill()
+        if look["winter"] > 0.01:
+            cr.set_source_rgba(*SNOW_RGB, 0.95 * look["winter"])
+            cr.arc(x, base - s * 0.75, s * 0.62, math.pi * 1.05,
+                   math.pi * 1.95)
+            cr.close_path()
             cr.fill()
 
     @staticmethod
@@ -2882,7 +3141,8 @@ class CpuView(Gtk.DrawingArea):
             if corner or i % 3 != 1:
                 self._pine(cr, tx, y + edge * 0.2, th, sway)
             else:
-                self._round_tree(cr, tx, y + edge * 0.2, th * 0.9, sway)
+                self._round_tree(cr, tx, y + edge * 0.2, th * 0.9, sway,
+                                 i)
 
         # Bushes down the sides and along the front, with a gap for a path.
         s = t * 0.16
@@ -2914,8 +3174,8 @@ class CpuView(Gtk.DrawingArea):
         floor = height * 0.94
 
         def bank(x0, x1, side):
-            ys = [self._river_edge(x0 + (x1 - x0) * k / 16, side)
-                  for k in range(17)]
+            ys = [self._river_y(x) + side * self._river_half_max(x)
+                  for x in (x0 + (x1 - x0) * k / 16 for k in range(17))]
             return max(ys) + mud if side > 0 else min(ys) - mud
 
         flanks, sites, pastures = [], [], []
@@ -3250,8 +3510,8 @@ class CpuView(Gtk.DrawingArea):
             box = (x - 0.32 * h, base - h, x + 0.32 * h, base)
             if base > height * 0.94 or base < 0.5 * h:
                 continue
-            far = self._river_edge(x, -1) - mud
-            near = self._river_edge(x, 1) + mud
+            far = self._river_y(x) - self._river_half_max(x) - mud
+            near = self._river_y(x) + self._river_half_max(x) + mud
             if not (base <= far or base >= near + 0.35 * h):
                 continue
             if not clear(x, base, h, box):
@@ -3424,7 +3684,7 @@ class CpuView(Gtk.DrawingArea):
         if kind == "pine":
             self._pine(cr, x, base, h, sway)
         elif kind == "round":
-            self._round_tree(cr, x, base, h, sway)
+            self._round_tree(cr, x, base, h, sway, i)
         elif kind == "stump":
             self._stump(cr, x, base, h)
         else:
@@ -3479,8 +3739,8 @@ class CpuView(Gtk.DrawingArea):
             base = (0.41 + i * 0.5698403) % 1.0 * height * 0.94
             w = t * (0.25 + 0.15 * ((i * 0.618) % 1.0))
             box = (x - w * 0.6, base - w * 0.6, x + w * 0.6, base + 2)
-            far = self._river_edge(x, -1) - mud
-            near = self._river_edge(x, 1) + mud
+            far = self._river_y(x) - self._river_half_max(x) - mud
+            near = self._river_y(x) + self._river_half_max(x) + mud
             if (far < base < near + w * 0.6) or not clear(
                     x, base, w * 0.6, box) or any(
                     overlaps(box, (tx - 0.32 * h, tb - h, tx + 0.32 * h,
@@ -3529,6 +3789,7 @@ class CpuView(Gtk.DrawingArea):
         self.fort_box = None
         if not self.cores:
             return
+        self.look = self._season_look()
         fort = [c for c in self.cores
                 if any(cpu in self.reserved for cpu in c["cpus"])]
         rest = [c for c in self.cores if c not in fort]
@@ -3638,6 +3899,39 @@ class CpuView(Gtk.DrawingArea):
             self._draw_sentries(cr, towers, floor, walk, walk_y, t)
         else:
             self._draw_wilds(cr)
+        self._draw_weather(cr, width, height, t)
+
+    def _draw_weather(self, cr, width, height, t):
+        """Leaves drifting down in autumn, snow falling in winter, each
+        flake or leaf on its own slow loop down the picture."""
+        look = self.look
+        area = width * height
+        leaves = int(min(36, area / 9000) * look["autumn"])
+        flakes = int(min(140, area / 2500) * look["winter"])
+        tt = self.phase
+        for i in range(leaves):
+            fall = (0.13 + i * 0.5698403 + tt * (0.03 + 0.02 * (i % 3)))
+            y = fall % 1.0 * (height + 20) - 10
+            x = ((0.41 + i * 0.7548777) % 1.0 * width
+                 + math.sin(tt * 1.3 + i) * t * 0.25) % width
+            cr.save()
+            cr.translate(x, y)
+            cr.rotate(math.sin(tt * 2.1 + i * 1.7) * 1.2)
+            cr.scale(max(1.5, t * 0.05), max(0.8, t * 0.025))
+            cr.arc(0, 0, 1, 0, 2 * math.pi)
+            cr.restore()
+            cr.set_source_rgba(*AUTUMN_LEAF_HI_RGBS[i % 3],
+                               0.9 * min(1.0, look["autumn"] * 2))
+            cr.fill()
+        cr.set_source_rgba(*SNOW_RGB, 0.85 * min(1.0, look["winter"] * 2))
+        for i in range(flakes):
+            fall = (0.29 + i * 0.5698403 + tt * (0.04 + 0.015 * (i % 4)))
+            y = fall % 1.0 * (height + 10) - 5
+            x = ((0.17 + i * 0.7548777) % 1.0 * width
+                 + math.sin(tt * 0.8 + i * 2.3) * t * 0.15) % width
+            cr.arc(x, y, max(0.8, t * (0.012 + 0.008 * (i % 3))), 0,
+                   2 * math.pi)
+            cr.fill()
 
     def _tiles(self, cr, cores, x0, y0, cols, t, tile_h, label_h, gap, mine):
         for i, core in enumerate(cores):
@@ -4072,7 +4366,7 @@ def ranges(cpus):
 # --------------------------------------------------------------------------
 
 class FortWindow(Adw.ApplicationWindow):
-    def __init__(self, app):
+    def __init__(self, app, time_scale=1.0):
         super().__init__(title="Fort Galgs")
         if app is not None:
             self.set_application(app)
@@ -4088,6 +4382,7 @@ class FortWindow(Adw.ApplicationWindow):
         self.stack.add_named(self._build_loading(), "loading")
         self.stack.add_named(self._build_home(), "home")
         self.stack.add_named(self._build_error(), "error")
+        self.view.time_scale = time_scale
 
         header = Adw.HeaderBar(css_classes=["flat"])
         header.set_title_widget(Adw.WindowTitle(title="Fort Galgs",
@@ -4426,9 +4721,10 @@ def load_css():
 
 
 class FortApp(Adw.Application):
-    def __init__(self):
+    def __init__(self, time_scale=1.0):
         super().__init__(application_id=APP_ID)
         self.window = None
+        self.time_scale = time_scale
 
     def do_startup(self):
         Adw.Application.do_startup(self)
@@ -4440,7 +4736,7 @@ class FortApp(Adw.Application):
 
     def do_activate(self):
         if not self.window:
-            self.window = FortWindow(self)
+            self.window = FortWindow(self, time_scale=self.time_scale)
             self.window.refresh_status()
         self.window.present()
 
@@ -4502,6 +4798,51 @@ def self_test():
     win.view._draw(win.view, cr, 60, 40)  # drives every clamp
 
     view = win.view
+    # The seasons turn every fifteen minutes, a year an hour, blending
+    # into each other over the last minute, whether the fort is up or not.
+    w = World(1)
+    assert (w.season(), w.year()) == (0, 1)
+    w.run(World.SEASON_S * 5)
+    assert (w.season(), w.year()) == (1, 2), (w.season(), w.year())
+    w = World(1)
+    prev = None
+    for k in range(int(2 * World.SEASON_S)):
+        weights = w.season_weights(k * 0.5 + World.SEASON_S - 200)
+        assert abs(sum(weights) - 1) < 1e-9, weights
+        if prev:
+            assert max(abs(a - b) for a, b in zip(weights, prev)) <= 0.05
+        prev = weights
+    assert w.season_weights(800.0) == [1.0, 0.0, 0.0, 0.0]
+    weights = w.season_weights(World.SEASON_S - World.BLEND_S / 2)
+    assert abs(weights[0] - 0.5) < 1e-9 and abs(weights[1] - 0.5) < 1e-9
+    for on in (False, True):
+        view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], on)
+        before = view.world.time
+        view._advance(0.1)
+        assert view.world.time > before, "the clock runs up and down"
+        for t in (0.0, 850.0, 900.0, 1800.0, 2700.0, 3550.0):
+            view.world.time = t
+            for size in ((60, 40), (300, 220), (560, 420), (1024, 680)):
+                view._draw(view, cr, *size)
+    view.time_scale = 50.0
+    before = view.world.time
+    view._advance(0.1)
+    assert abs(view.world.time - before - 5.0) < 1e-6, view.world.time
+    view.time_scale = 1.0
+    assert parse_args(["--time-scale", "60"])["time_scale"] == 60.0
+    for bad in (["--time-scale", "0"], ["--time-scale", "x"],
+                ["--time-scale"]):
+        err = sys.stderr
+        sys.stderr = io.StringIO()
+        try:
+            parse_args(bad)
+            assert False, bad
+        except SystemExit as e:
+            assert e.code == 2, bad
+        finally:
+            sys.stderr = err
+    view.world = World(seed=7)
+    view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
     # The beaver swims the river, and dives for part of each crossing.
     view._draw(view, cr, 1024, 680)
     seen = set()
@@ -4533,7 +4874,8 @@ def self_test():
     assert trees and view.wild["trees"] == trees, "the woods hold still"
     for x, base, h, kind, i in trees:
         assert not view._in_box(view.wild["grove"], x, base), (x, base)
-        assert abs(base - view._river_y(x)) > view._river_half(x), (x, base)
+        assert abs(base - view._river_y(x)) > view._river_half_max(x), \
+            (x, base)
 
     # Four idle minutes: the trappers set traps, collect what they catch,
     # and stash the pelts, keeping out of the grove and off the water but
@@ -4736,7 +5078,8 @@ def self_test():
     for x, base, h, kind, i in view.scenery["trees"]:
         for box in [view.fort_box] + view.barracks_box:
             assert not view._in_box(box, x, base), (x, base, kind)
-        assert abs(base - view._river_y(x)) > view._river_half(x), (x, base)
+        assert abs(base - view._river_y(x)) > view._river_half_max(x), \
+            (x, base)
         for pts in view.trails:
             for k in range(49):
                 p = k / 48
@@ -4999,18 +5342,53 @@ def snapshot(path):
     print(f"wrote {path}")
 
 
+USAGE = ("usage: fort-galgs [--time-scale <x>] | --self-test"
+         " | --snapshot <png>")
+
+
+def parse_args(argv):
+    """The command line as a dict; a usage error exits 2."""
+    opts = {"self_test": False, "snapshot": None, "help": False,
+            "time_scale": 1.0}
+    args = list(argv)
+
+    def fail():
+        print(USAGE, file=sys.stderr)
+        raise SystemExit(2)
+
+    while args:
+        a = args.pop(0)
+        if a == "--self-test":
+            opts["self_test"] = True
+        elif a in ("--help", "-h"):
+            opts["help"] = True
+        elif a == "--snapshot" and len(args) == 1:
+            opts["snapshot"] = args.pop(0)
+        elif a == "--time-scale" and args:
+            try:
+                x = float(args.pop(0))
+            except ValueError:
+                fail()
+            if not 0 < x < float("inf"):
+                fail()
+            opts["time_scale"] = x
+        elif a == "--time-scale":
+            fail()
+    return opts
+
+
 def main():
-    args = sys.argv[1:]
-    if "--self-test" in args:
+    opts = parse_args(sys.argv[1:])
+    if opts["self_test"]:
         self_test()
         return 0
-    if args[:1] == ["--snapshot"] and len(args) == 2:
-        snapshot(args[1])
+    if opts["snapshot"]:
+        snapshot(opts["snapshot"])
         return 0
-    if "--help" in args or "-h" in args:
+    if opts["help"]:
         print(__doc__)
         return 0
-    return FortApp().run(sys.argv[:1])
+    return FortApp(opts["time_scale"]).run(sys.argv[:1])
 
 
 if __name__ == "__main__":
