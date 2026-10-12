@@ -20,6 +20,7 @@ import json
 import math
 import os
 import random
+import signal
 import sys
 import tempfile
 import time
@@ -38,6 +39,13 @@ try:
     DesktopAppInfo = GioUnix.DesktopAppInfo
 except (ValueError, ImportError):  # GLib before 2.86
     DesktopAppInfo = Gio.DesktopAppInfo
+
+try:
+    gi.require_version("GLibUnix", "2.0")
+    from gi.repository import GLibUnix  # noqa: E402
+    signal_add = GLibUnix.signal_add
+except (ValueError, ImportError, AttributeError):  # GLib before 2.86
+    signal_add = GLib.unix_signal_add
 
 APP_ID = "io.mgalgs.FortGalgs"
 BACKEND = os.path.join(os.path.dirname(os.path.realpath(__file__)),
@@ -7466,6 +7474,16 @@ class FortApp(Adw.Application):
         # exactly the load the fort exists for. Failing only costs that.
         run_backend(["adopt", str(os.getpid())],
                     lambda ok, text: ok or print(text, file=sys.stderr))
+        # Here, not on the window: the self-test builds windows with no
+        # main loop running, and one would swallow a real Ctrl-C.
+        signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, self._on_sigint)
+
+    def _on_sigint(self):
+        """Ctrl-C keeps the valley, as closing the window does."""
+        if self.window is not None:
+            self.window._on_close(self.window)
+        self.quit()
+        return GLib.SOURCE_REMOVE
 
     def do_activate(self):
         if not self.window:
@@ -8636,6 +8654,12 @@ def self_test():
         kept._on_close(kept)
         assert load_world(os.path.join(tmp, "w.json")).time == 42.0
         assert kept.save_id == 0
+        # Ctrl-C saves it too, and quits.
+        kept.view.world.run(8.0)
+        app, quits = FortApp(), []
+        app.window, app.quit = kept, lambda: quits.append(1)
+        assert app._on_sigint() == GLib.SOURCE_REMOVE and quits == [1]
+        assert load_world(os.path.join(tmp, "w.json")).time == 50.0
     assert win.state_path is None and win.save_id == 0, "never the real one"
     view.set_world(w2)
     for size in ((300, 220), (1024, 680), (560, 420)):
