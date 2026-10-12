@@ -367,9 +367,27 @@ class World:
     a spring with nobody left brings one regardless; never more than
     TRAPPERS_MAX.
 
-    Predators. PREDATORS names the species that hunt the trappers; none
-    yet. Each tick gives them their turn before anyone else's, and a
-    trapper they kill dies (and leaves his goods) like any other.
+    Bears. Each tick gives them their turn before anyone else's. A bear
+    keeps to one flank, and its body is its energy and its health. It
+    comes in from the flank's edge, at most one a flank, more often the
+    more the flank offers it: beavers out, beavers in traps, meat in the
+    caches and men about, all counting for more in the seasons the river
+    fishes well; a valley with none of these brings none. Energy drains
+    all the time it is afoot and a little while it sleeps; at none it
+    starves. Whenever it is free it weighs what each errand would gain it
+    a minute, walk and work together, and does the best:
+    - fish at a riffle, poor in spring, good in summer, best in autumn,
+      nothing under the ice;
+    - hunt: wait at a bank tree for a beaver to come within reach, a
+      better chance the more are out;
+    - steal: take a beaver from a trap that has caught one;
+    - raid: rob a cache of meals, only while its owner is well away;
+    - wander.
+    Its belly is the cap on all of these: a full bear does not eat, it
+    wanders. Winter it sleeps in a den on its flank, from the first cold
+    to the thaw, so it wakes hungry in spring; one with little left and
+    nothing on its flank worth staying for walks out the way it came.
+    Rails: never more than BEARS_MAX.
     """
 
     # -- the world's rates --
@@ -378,7 +396,7 @@ class World:
     YEAR_S = 4 * SEASON_S
     BLEND_S = 60.0      # ...the last this many blending into the next
     TICK_S = 1.0        # the world decides once a tick
-    VERSION = 3         # of the saved state's schema
+    VERSION = 4         # of the saved state's schema
 
     # Tree slots per flank: (zone, side, count); side 1 is the near bank.
     SLOTS = (("woods", 1, 8), ("woods", -1, 5), ("bank", 1, 6),
@@ -440,7 +458,26 @@ class World:
     REST_PULL = 0.08        # how much he likes an idle moment
     ARRIVE_K = 0.8          # newcomers a spring per BEAVER_REF beavers
     GRAVE_S = 2 * YEAR_S
-    PREDATORS = ()          # species that hunt the trappers
+
+    BEARS_MAX = 2           # rail: never more in the valley
+    BEAR_ARRIVE_K = 0.6     # bears a season per unit a flank offers
+    BEAR_DRAIN = 1 / 2400   # energy lost a second afoot...
+    DEN_DRAIN = 1 / 6000    # ...and asleep in the den
+    DEN_U = 0.06            # the den, across its flank from the edge
+    BEAR_WALK_S = 12.0      # seconds to walk a unit of distance
+    FISH_S = 60.0
+    FISH_GAIN = 0.12        # energy from a spell at the riffle...
+    FISH_K = (0.15, 0.6, 1.0, 0.0)  # ...times how it fishes each season
+    HUNT_S = 90.0           # waiting at a bank tree for a beaver
+    BEAR_CATCH_K = 1 / 400  # catches a second there per BEAVER_REF out
+    BEAVER_GAIN = 0.3
+    STEAL_S = 90.0          # working a beaver out of a trap
+    RAID_S = 30.0
+    RAID_MEAT = 2           # meals it takes from a cache...
+    RAID_FAR = 0.8          # ...only with the owner at least this far off
+    MEAT_GAIN = 0.06        # a meal
+    LEAVE_E = 0.15          # energy below which, with nothing near, it goes
+    WANDER_PULL = 0.02
 
     def __init__(self, seed=1):
         self.seed = seed
@@ -493,6 +530,9 @@ class World:
         return {"trapped": 0, "starved": 0, "kits": [0, 0], "deaths": {},
                 "arrivals": 0, "pelts": 0, "rails": {"beavers": 0,
                                                      "trappers": 0},
+                "bears": {"came": 0, "left": 0, "starved": 0, "slain": 0,
+                          "fights": 0, "mauled": 0, "eaten": 0,
+                          "robbed": 0},
                 "events": []}
 
     def _trapper(self, f, k, at):
@@ -509,6 +549,15 @@ class World:
         tr["t1"] = self.time + self.WALK_S * self.distance(at, tr["to"])
         tr["t2"] = tr["t1"] + 2.0
         return tr
+
+    def _bear(self, f, at):
+        b = {"id": self.next_id, "f": f, "energy": 0.6, "health": 1.0,
+             "job": "wander", "at": list(at), "to": list(at),
+             "t0": self.time, "t1": self.time, "t2": self.time,
+             "target": None, "fight": None, "blow": None}
+        self.next_id += 1
+        self.predators.append(b)
+        return b
 
     def _beaver(self, f, cond):
         b = {"id": self.next_id, "f": f, "cond": cond, "job": "lodge",
@@ -603,6 +652,9 @@ class World:
             return self._flank_u(place[1], u), side
         if kind == "edge":
             return (0.0 if place[1] == 0 else 1.0), 1
+        if kind == "den":
+            u = self.DEN_U
+            return self._flank_u(place[1], u if place[1] == 0 else 1 - u), 1
         return 0.5, 0
 
     @staticmethod
@@ -669,8 +721,157 @@ class World:
         if self.graves and self.time - self.graves[0]["t"] >= self.GRAVE_S:
             self.graves.pop(0)
 
+    # -- bears --
+
     def _advance_predators(self):
-        """Round 2's bears go here; there are none yet."""
+        cold = self.cold()
+        self._bear_arrivals(cold)
+        tally = self.tally["bears"]
+        for b in list(self.predators):
+            job, arrived = b["job"], self.time >= b["t1"]
+            if job == "dead":
+                if self.time >= b["t2"]:
+                    self.predators.remove(b)
+                continue
+            asleep = job == "den" and arrived
+            b["energy"] -= (self.DEN_DRAIN if asleep else self.BEAR_DRAIN) \
+                * self.TICK_S
+            if b["energy"] <= 0:
+                self.predators.remove(b)
+                tally["starved"] += 1
+                continue
+            if job == "leave" and arrived:
+                self.predators.remove(b)
+                tally["left"] += 1
+                continue
+            if job == "hunt" and arrived and self.time < b["t2"]:
+                self._bear_hunt(b)
+            if cold >= 0.5 and job != "den" or asleep and cold < 0.5 \
+                    or self.time >= b["t2"]:
+                self._bear_done(b)
+                self._bear_next(b, cold)
+
+    def _offer(self, f):
+        """What flank f holds for a bear, beyond the fish."""
+        caught = sum(st["state"] == "caught" for st in self.sites[f])
+        men = [tr for tr in self.trappers if tr["f"] == f]
+        meat = sum(tr["meat"] for tr in men)
+        return (sum(b["f"] == f for b in self.beavers) / self.BEAVER_REF
+                + caught / 2 + meat / (4 * self.MEAT_PER_BEAVER)
+                + 0.3 * len(men)) * (1 + self.FISH_K[self.season()])
+
+    def _bear_arrivals(self, cold):
+        if len(self.predators) >= self.BEARS_MAX or cold >= 0.5:
+            return
+        held = {b["f"] for b in self.predators}
+        free = [f for f in (0, 1) if f not in held]
+        if not free:
+            return
+        f = max(free, key=self._offer)
+        p = self.BEAR_ARRIVE_K * self._offer(f) * self.TICK_S / self.SEASON_S
+        if self.rng.random() < p:
+            self._bear(f, ["edge", f])
+            self.tally["bears"]["came"] += 1
+
+    def _bear_hunt(self, b):
+        """Waiting at the bank: a beaver may come within reach."""
+        out = self._flank_beavers(b["f"])
+        p = self.BEAR_CATCH_K * self.TICK_S * len(out) / self.BEAVER_REF
+        if out and self.rng.random() < p:
+            self.beavers.remove(min(out, key=lambda x: x["cond"]))
+            self.tally["bears"]["eaten"] += 1
+            self._feed(b, self.BEAVER_GAIN)
+            b["t2"] = self.time
+
+    def _feed(self, b, gain):
+        b["energy"] = min(1.0, b["energy"] + gain)
+
+    def _bear_done(self, b):
+        job, to = b["job"], b["to"]
+        if self.time < b["t2"]:
+            return  # called away before it finished
+        if job == "fish":
+            self._feed(b, self.FISH_GAIN * self.FISH_K[self.season()])
+        elif job == "steal":
+            site = self.sites[to[1]][to[2]]
+            if site["state"] == "caught":
+                site.update(state="empty", by=None, since=self.time)
+                self.tally["bears"]["eaten"] += 1
+                self._feed(b, self.BEAVER_GAIN)
+        elif job == "raid":
+            owner = self._owner(to)
+            if owner is not None and owner["meat"] > 0 \
+                    and self._far(owner, to):
+                take = min(owner["meat"], self.RAID_MEAT)
+                owner["meat"] -= take
+                self.tally["bears"]["robbed"] += 1
+                self._feed(b, take * self.MEAT_GAIN)
+
+    def _owner(self, plot):
+        oid = self.plots[plot[1]][plot[2]]["owner"]
+        return next((tr for tr in self.trappers if tr["id"] == oid), None)
+
+    def _where(self, a):
+        """The place an actor is at, or last left."""
+        return a["to"] if self.time >= a["t1"] else a["at"]
+
+    def _far(self, tr, place):
+        return self.distance(self._where(tr), place) >= self.RAID_FAR
+
+    def _bear_next(self, b, cold):
+        """It weighs what each errand would gain it a minute, and goes."""
+        f = b["f"]
+        jit = self.rng.uniform
+        walk = self.BEAR_WALK_S
+        if cold >= 0.5:
+            self._send(b, ["den", f], "den", self.SEASON_S, walk)
+            return
+        if b["energy"] < self.LEAVE_E and self._offer(f) < self.WANDER_PULL:
+            self._send(b, ["edge", f], "leave", 0.0, walk)
+            return
+        hunger = 1 - b["energy"]
+        here = b["to"]
+
+        def rate(gain, place, work, speed=walk):
+            # A full belly is the cap: what it cannot eat is worth nothing.
+            mins = (speed * self.distance(here, place) + work) / 60
+            return min(gain, hunger) / max(mins, 1 / 60)
+
+        options = []
+        fish = self.FISH_GAIN * self.FISH_K[self.season()]
+        for k, st in enumerate(self.sites[f]):
+            place = ["site", f, k]
+            if fish > 0:
+                options.append((rate(fish, place, self.FISH_S), place,
+                                "fish", self.FISH_S))
+            if st["state"] == "caught":
+                options.append((rate(self.BEAVER_GAIN, place, self.STEAL_S),
+                                place, "steal", self.STEAL_S))
+        out = len(self._flank_beavers(f))
+        bank = next((i for i in self._bank_trees(f, b)
+                     if self._standing(i)), None)
+        if out and bank is not None:
+            p = 1 - math.exp(-self.BEAR_CATCH_K * out / self.BEAVER_REF
+                             * self.HUNT_S)
+            place = ["tree", bank]
+            options.append((rate(self.BEAVER_GAIN * p, place, self.HUNT_S),
+                            place, "hunt", self.HUNT_S))
+        for k, plot in enumerate(self.plots[f]):
+            place = ["plot", f, k]
+            owner = self._owner(place)
+            if owner is not None and owner["meat"] > 0 \
+                    and self._far(owner, place):
+                take = min(owner["meat"], self.RAID_MEAT)
+                options.append((rate(take * self.MEAT_GAIN, place,
+                                     self.RAID_S),
+                                place, "raid", self.RAID_S))
+        woods = [i for i, slot in enumerate(self.trees)
+                 if slot["f"] == f and slot["zone"] == "woods"]
+        options.append((self.WANDER_PULL, ["tree", self.rng.choice(woods)],
+                        "wander", jit(20.0, 60.0)))
+        _, place, job, work = max(options,
+                                  key=lambda o: o[0] * jit(0.85, 1.15))
+        self._send(b, place, job, work, walk)
 
     def _season_turn(self):
         self.tally = self._fresh_tally()
@@ -1147,6 +1348,7 @@ class World:
             "trees": sum(self.tree_state(i) == "tree"
                          for i in range(len(self.trees))),
             "trappers": len(self.trappers),
+            "bears": sum(b["job"] != "dead" for b in self.predators),
             "cabins": sum(p["logs"] >= self.CABIN_LOGS
                           for row in self.plots for p in row),
             "pelts": sum(tr["pelts"] for tr in self.trappers),
@@ -1191,7 +1393,7 @@ class World:
         fresh = World(0)
         grave = {"place": ["plot", 0, 0], "t": 0.0, "id": 0}
         protos = {"beavers": fresh.beavers[0], "trappers": fresh.trappers[0],
-                  "graves": grave}
+                  "graves": grave, "predators": fresh._bear(0, ["edge", 0])}
 
         def bad(why):
             raise ValueError("not this world's state: " + why)
@@ -1207,7 +1409,7 @@ class World:
         def place(p):
             n = {"tree": (2, len(self.trees)), "dam": (2, 2),
                  "lodge": (2, 2), "swim": (3, 2), "plot": (3, 2),
-                 "site": (3, 2), "edge": (2, 2)}
+                 "site": (3, 2), "edge": (2, 2), "den": (2, 2)}
             if not isinstance(p, list) or not p or p[0] not in n \
                     or len(p) != n[p[0]][0] or not idx(p[1], n[p[0]][1],
                                                        False):
@@ -1223,7 +1425,8 @@ class World:
             if key in ("at", "to", "place"):
                 return place(v)
             if t is None or key in ("owner", "by", "felled", "site",
-                                     "tree", "carry", "winter"):
+                                     "tree", "carry", "winter", "target",
+                                     "fight", "blow"):
                 # Each of these may be empty; the ones it matters for are
                 # checked on their own below.
                 return v is None or isinstance(v, (str, dict)) or num(v)
@@ -1257,6 +1460,13 @@ class World:
         if any(b["job"] not in ("lodge", "feed", "cut", "haul", "fetch",
                                 "swim") for b in self.beavers):
             bad("a beaver's job")
+        for b in self.predators:
+            if not (idx(b["f"], 2, False) and num(b["energy"])
+                    and num(b["health"])
+                    and b["job"] in ("wander", "fish", "hunt", "steal",
+                                     "raid", "eat", "flee", "den", "leave",
+                                     "dead")):
+                bad("a bear")
         if any(st["state"] not in ("empty", "set", "caught")
                for row in self.sites for st in row):
             bad("a trap")
@@ -6945,6 +7155,116 @@ def trapper_tests(view, cr, rows):
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
 
 
+def bear_tests(view, cr, rows):
+    """The bears' year, their hunting and their fights, headless and
+    drawn; rows is envelope((1, 2, 3, 4), 4)."""
+    S = World.SEASON_S
+
+    def staged(t, seed=21):
+        w = World(seed)
+        _set_clock(w, t)
+        w.BEAR_ARRIVE_K = 0.0  # only the bears a test puts there
+        for tr in w.trappers:
+            tr["t0"] = tr["t1"] = tr["t2"] = w.time
+        return w
+
+    def bare(w):
+        w.beavers, w.trappers, w.RESTOCK_S = [], [], 1e9
+        for row in w.plots:
+            for p in row:
+                p["owner"] = None
+
+    # The first cold sends a bear to its den, where it sleeps on little
+    # until the thaw wakes it.
+    w = staged(3 * S + 100)
+    b = w._bear(0, ["edge", 0])
+    w.run(10)
+    assert b["job"] == "den" and b["to"] == ["den", 0], b
+    e = b["energy"]
+    w.run(100)
+    assert abs(e - b["energy"] - w.DEN_DRAIN * 100) < 1e-6, b["energy"]
+    w.run(4 * S + 30 - w.time)
+    assert b in w.predators and b["job"] != "den", b
+
+    # With nothing left in it, it starves; low, on a flank with nothing
+    # for it, it walks out the way it came.
+    w = staged(2 * S + 10)
+    w._bear(0, ["edge", 0])["energy"] = 0.01
+    w.run(30)
+    assert not w.predators and w.tally["bears"]["starved"] == 1
+    bare(w)
+    b = w._bear(1, ["tree", 30])
+    b["energy"] = 0.1
+    w.run(2)
+    assert b["job"] == "leave" and b["to"] == ["edge", 1], b
+    w.run(b["t1"] - w.time + 1)
+    assert not w.predators and w.tally["bears"]["left"] == 1
+
+    # What it eats: fish by the season, a beaver at the bank or out of a
+    # trap (no pelt for anyone), meals from a cache whose owner is away;
+    # never past full.
+    w = staged(2 * S + 10)
+    b = w._bear(0, ["site", 0, 0])
+
+    def finish(job, to, energy=0.5):
+        b.update(job=job, to=to, energy=energy, t1=w.time, t2=w.time)
+        w._bear_done(b)
+        return b["energy"] - energy
+
+    assert abs(finish("fish", ["site", 0, 0]) - w.FISH_GAIN) < 1e-9
+    assert abs(finish("fish", ["site", 0, 0], 0.95) - 0.05) < 1e-9
+    w.sites[0][1].update(state="caught", by=w.trappers[0]["id"])
+    assert abs(finish("steal", ["site", 0, 1]) - w.BEAVER_GAIN) < 1e-9
+    assert w.sites[0][1]["state"] == "empty" and w.sites[0][1]["by"] is None
+    assert w.tally["bears"]["eaten"] == 1 and w.tally["trapped"] == 0
+    owner = w.trappers[0]
+    far = max((i for i, slot in enumerate(w.trees) if slot["f"] == 0),
+              key=lambda i: w.distance(["plot", 0, 0], ["tree", i]))
+    owner.update(meat=5, to=["tree", far], t1=w.time)
+    assert abs(finish("raid", ["plot", 0, 0]) - w.RAID_MEAT * w.MEAT_GAIN) \
+        < 1e-9 and owner["meat"] == 5 - w.RAID_MEAT
+    owner.update(to=["plot", 0, 0])
+    assert finish("raid", ["plot", 0, 0]) == 0, "not with him home"
+    assert w.tally["bears"]["robbed"] == 1
+    w = staged(3 * S + 450)
+    b = w._bear(0, ["site", 0, 0])
+    assert finish("fish", ["site", 0, 0]) == 0, "nothing under the ice"
+    w = staged(S + 10)
+    w.BEAR_CATCH_K = 10.0
+    for x in w.beavers:
+        x.update(job="swim", t2=1e9)
+    n = len(w.beavers)
+    i = w._bank_trees(0, None)[0]
+    b = w._bear(0, ["tree", i])
+    b.update(job="hunt", energy=0.5, t2=w.time + w.HUNT_S)
+    w.run(1)
+    assert len(w.beavers) == n - 1 and w.tally["bears"]["eaten"] == 1
+    assert w.tally["trapped"] == 0 and b["energy"] > 0.79, b
+
+    # Bears come to what a flank offers: none to an empty valley, soon
+    # to a rich one; never more than BEARS_MAX, never two on a flank.
+    w = staged(10)
+    w.BEAR_ARRIVE_K, w.TRAPPERS_MAX = World.BEAR_ARRIVE_K, 0
+    bare(w)
+    for _ in range(8):
+        w.run(S)
+        assert not w.predators and w.tally["bears"]["came"] == 0
+    w = staged(10, seed=22)
+    w.BEAR_ARRIVE_K = World.BEAR_ARRIVE_K
+    while len(w.beavers) < 12:
+        w._beaver(len(w.beavers) % 2, 0.7)
+    for f, k in ((0, 1), (1, 1)):
+        w._trapper(f, k, ["plot", f, k])
+    for tr in w.trappers:
+        tr["meat"] = 8
+    w.run(S - 20)
+    assert w.predators, "a rich valley draws a bear"
+    for _ in range(3 * 4):
+        w.run(S / 4)
+        assert len(w.predators) <= w.BEARS_MAX
+        assert len({b["f"] for b in w.predators}) == len(w.predators)
+
+
 def self_test():
     """Build every page and draw every state against a real surface.
 
@@ -7050,6 +7370,10 @@ def self_test():
                 ("timeless", lambda d: d.update(time="x")),
                 ("nowhere", lambda d: d["beavers"][0].update(
                     at=["plot", 0, 9])),
+                ("denless", lambda d: d["predators"].append(
+                    dict(World(0)._bear(0, ["edge", 0]), to=["den", 9]))),
+                ("jobless", lambda d: d["predators"].append(
+                    dict(World(0)._bear(0, ["edge", 0]), job="x"))),
                 ("stalled", lambda d: d.update(next_tick=0.0))):
             d = w.to_dict()
             spoil(d)
@@ -7122,6 +7446,7 @@ def self_test():
             (x, base)
 
     trapper_tests(view, cr, rows)
+    bear_tests(view, cr, rows)
 
     # The almanac prints a row a season, headless, touching no state file.
     with tempfile.TemporaryDirectory() as tmp:
