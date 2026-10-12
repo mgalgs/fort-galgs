@@ -1179,7 +1179,103 @@ class World:
             raise ValueError("not this valley")
         v, state, gauss = d["rng"]
         w.rng.setstate((v, tuple(state), gauss))
+        w._check()
         return w
+
+    GROWS = ("beavers", "trappers", "graves", "predators", "events")
+
+    def _check(self):
+        """Raise ValueError unless every field a fresh world has is here,
+        of the same kind, and every place and index is one this valley
+        has: the right version alone does not make a file sound."""
+        fresh = World(0)
+        grave = {"place": ["plot", 0, 0], "t": 0.0, "id": 0}
+        protos = {"beavers": fresh.beavers[0], "trappers": fresh.trappers[0],
+                  "graves": grave}
+
+        def bad(why):
+            raise ValueError("not this world's state: " + why)
+
+        def num(v, lo=-math.inf, hi=math.inf):
+            return isinstance(v, (int, float)) and not isinstance(v, bool) \
+                and math.isfinite(v) and lo <= v <= hi
+
+        def idx(v, n, none=True):
+            return v is None and none or isinstance(v, int) and \
+                not isinstance(v, bool) and 0 <= v < n
+
+        def place(p):
+            n = {"tree": (2, len(self.trees)), "dam": (2, 2),
+                 "lodge": (2, 2), "swim": (3, 2), "plot": (3, 2),
+                 "site": (3, 2), "edge": (2, 2)}
+            if not isinstance(p, list) or not p or p[0] not in n \
+                    or len(p) != n[p[0]][0] or not idx(p[1], n[p[0]][1],
+                                                       False):
+                return False
+            if p[0] == "swim":
+                return num(p[2], 0, 1)
+            if p[0] in ("plot", "site"):
+                k = len(self.PLOT_U if p[0] == "plot" else self.SITE_SPOTS)
+                return idx(p[2], k, False)
+            return True
+
+        def like(v, t, key=""):
+            if key in ("at", "to", "place"):
+                return place(v)
+            if t is None or key in ("owner", "by", "felled", "site",
+                                     "tree", "carry", "winter"):
+                # Each of these may be empty; the ones it matters for are
+                # checked on their own below.
+                return v is None or isinstance(v, (str, dict)) or num(v)
+            if isinstance(t, bool):
+                return isinstance(v, bool)
+            if isinstance(t, (int, float)):
+                return num(v)
+            if isinstance(t, str):
+                return isinstance(v, str)
+            if isinstance(t, dict):
+                return isinstance(v, dict) and all(
+                    k in v and like(v[k], t[k], k) for k in t)
+            if not isinstance(v, list):
+                return False
+            if key in self.GROWS:
+                proto = protos.get(key)
+                return proto is None or all(like(x, proto) for x in v)
+            return len(v) == len(t) and all(
+                like(x, y, key) for x, y in zip(v, t))
+
+        for k in self.STATE:
+            if not like(getattr(self, k), getattr(fresh, k), k):
+                bad(k)
+        if not (num(self.time, 0) and num(self.next_tick)
+                and self.time < self.next_tick <= self.time + self.TICK_S):
+            bad("clock")
+        trees = len(self.trees)
+        for a in self.beavers + self.trappers:
+            if not (idx(a["f"], 2, False) and idx(a["tree"], trees)):
+                bad("an actor's whereabouts")
+        if any(b["job"] not in ("lodge", "feed", "cut", "haul", "fetch",
+                                "swim") for b in self.beavers):
+            bad("a beaver's job")
+        if any(st["state"] not in ("empty", "set", "caught")
+               for row in self.sites for st in row):
+            bad("a trap")
+        for tr in self.trappers:
+            win = tr["winter"]
+            if not (tr["job"] in ("rest", "set", "check", "collect", "stash",
+                                  "chop", "build", "fire", "shelter")
+                    and all(num(x) for x in list(tr["effort"].values())
+                            + list(tr["effort_prev"].values()))
+                    and idx(tr["plot"], len(self.PLOT_U), False)
+                    and idx(tr["site"], len(self.SITE_SPOTS))
+                    and tr["carry"] in (None, "beaver", "log")
+                    and (win is None or like(win, {
+                        "start": 0.0, "low": 0.0, "share": 0.0,
+                        "ready": False}))):
+                bad("a trapper")
+        for slot in self.trees:
+            if not (slot["felled"] is None or num(slot["felled"])):
+                bad("a tree")
 
 
 def world_path():
@@ -1191,10 +1287,16 @@ def world_path():
 
 def load_world(path):
     """The world saved at path, or a fresh one if there is none to be had:
-    missing, unreadable, not JSON, or of another schema. Never raises."""
+    missing, unreadable, not JSON, of another schema, or one that will not
+    run a season on. Never raises."""
     try:
         with open(path) as fh:
-            return World.from_dict(json.load(fh))
+            d = json.load(fh)
+        trial = World.from_dict(d)
+        trial.run(World.SEASON_S)
+        json.dumps(trial.stats())
+        json.dumps(trial.to_dict())
+        return World.from_dict(d)
     except Exception:  # anything wrong with the file means a fresh valley
         return World(random.randrange(2 ** 31))
 
@@ -6938,6 +7040,17 @@ def self_test():
     assert w2.to_dict() == w.to_dict(), "a loaded world runs on the same"
     with tempfile.TemporaryDirectory() as tmp:
         bad = {"nope": "nope", "list": "[]", "other": '{"version": 999}'}
+        # Of this schema but broken within: each would raise later, in
+        # the frame clock or while the window is built.
+        for name, spoil in (
+                ("hungerless", lambda d: d["trappers"][0].pop("fed")),
+                ("timeless", lambda d: d.update(time="x")),
+                ("nowhere", lambda d: d["beavers"][0].update(
+                    at=["plot", 0, 9])),
+                ("stalled", lambda d: d.update(next_tick=0.0))):
+            d = w.to_dict()
+            spoil(d)
+            bad[name] = json.dumps(d)
         for name, text in bad.items():
             with open(os.path.join(tmp, name), "w") as fh:
                 fh.write(text)
