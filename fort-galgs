@@ -120,6 +120,17 @@ PELT_RGB = (0.56, 0.38, 0.22)
 PELT_DARK_RGB = (0.35, 0.22, 0.12)
 CORD_RGB = (0.83, 0.74, 0.52)
 
+# The bears, their dens, and what is left of one.
+BEAR_RGB = (0.43, 0.29, 0.17)
+BEAR_DARK_RGB = (0.27, 0.17, 0.10)
+BEAR_HI_RGB = (0.66, 0.53, 0.37)
+BEAR_MUZZLE_RGB = (0.62, 0.48, 0.33)
+CLAW_RGB = (0.88, 0.85, 0.74)
+FISH_RGB = (0.74, 0.78, 0.82)
+DEN_RGB = (0.33, 0.26, 0.18)
+DEN_MOUTH_RGB = (0.07, 0.05, 0.04)
+BEAR_HIDE_RGB = (0.55, 0.39, 0.24)
+
 # The seasons, each across the whole picture: spring, summer, autumn, winter.
 SPRING_GRASS_RGB = (0.20, 0.37, 0.17)
 AUTUMN_GRASS_RGB = (0.29, 0.28, 0.14)
@@ -1900,8 +1911,10 @@ class CpuView(Gtk.DrawingArea):
     valley that lives on its own (World): the seasons turn over the whole
     picture, beavers fell trees along the banks and build dams and
     lodges, and trappers trap them, chop and build cabins, cook at their
-    fires and sit out the winter, or die of it. The world runs on whether
-    the fort is up or down; this view only draws it.
+    fires and sit out the winter, or die of it; bears fish, den up and
+    now and then fight a trapper, drawn shot, blood and all, in the idle
+    picture only. The world runs on whether the fort is up or down; this
+    view only draws it.
 
     While the fort is up, the reserved cores stand inside a log stockade,
     embers rising in their orange tiles; mountain men watch from its
@@ -2905,7 +2918,7 @@ class CpuView(Gtk.DrawingArea):
     def _mountain_man(cr, x, feet, s, facing, step=0.0, shouldered=False,
                       glint=0.0, kneel=0.0, aim=0.0, shot=-1.0, bugle=0.0,
                       toot=-1.0, elev=0.04, beaver=False, axe=0.0,
-                      log=False):
+                      log=False, knife=0.0):
         """A buckskin-clad mountain man with a coonskin cap and a long rifle.
 
         Drawn in a 100-unit-tall model with the feet at 0; facing is +1 for
@@ -2917,6 +2930,8 @@ class CpuView(Gtk.DrawingArea):
         his shoulder, hanging down his back, and log carries one on it.
         axe above 0 puts an axe in his hands instead, raised behind him at
         1 and swung through at 0, with the rifle slung across his back.
+        knife above 0 likewise slings the rifle and puts a knife in his
+        near hand, thrust out at 1.
         """
         cr.save()
         cr.translate(x, feet)
@@ -3001,7 +3016,7 @@ class CpuView(Gtk.DrawingArea):
             return 9 - 82 * math.cos(angle), -56 - 82 * math.sin(angle)
 
         leg(-step, BUCK_DARK_RGB, False)
-        if axe > 0:
+        if axe > 0 or knife > 0:
             # The rifle slung across his back while his hands are busy.
             cr.set_source_rgb(*STEEL_RGB)
             cr.set_line_width(2.2)
@@ -3152,6 +3167,33 @@ class CpuView(Gtk.DrawingArea):
             cr.set_source_rgb(*SKIN_RGB)
             cr.arc(*hand, 3.5, 0, 2 * math.pi)
             cr.fill()
+        elif knife > 0:
+            # The far forearm up to ward off, the near hand driving the
+            # blade in, low and forward.
+            guard = (20, -86 + drop)
+            hand = lerp((14, -58 + drop), (38, -70 + drop), knife)
+            for start, end, rgb in (((4, -73 + drop), guard, BUCK_DARK_RGB),
+                                    (shoulder, hand, BUCK_RGB)):
+                cr.set_source_rgb(*rgb)
+                cr.set_line_width(6)
+                cr.move_to(*start)
+                cr.line_to(*end)
+                cr.stroke()
+            cr.set_source_rgb(*SEAM_RGB)
+            cr.set_line_width(3)
+            cr.move_to(hand[0] - 3, hand[1] + 2)
+            cr.line_to(hand[0] + 1, hand[1] - 1)
+            cr.stroke()
+            cr.set_source_rgb(*STEEL_RGB)
+            cr.move_to(hand[0], hand[1] - 2.5)
+            cr.line_to(hand[0] + 17, hand[1] - 6)
+            cr.line_to(hand[0] + 2, hand[1] + 1.5)
+            cr.close_path()
+            cr.fill()
+            cr.set_source_rgb(*SKIN_RGB)
+            for p in (guard, hand):
+                cr.arc(*p, 3, 0, 2 * math.pi)
+                cr.fill()
         else:
             if not shouldered:
                 tip = rifle()
@@ -4982,7 +5024,7 @@ class CpuView(Gtk.DrawingArea):
         world = self.world
         for f in (0, 1):
             fl = {"near": None, "far": None, "ford": None, "sites": [],
-                  "plots": [], "edge": None}
+                  "plots": [], "edge": None, "den": None}
             flanks.append(fl)
             x0, x1 = (0.0, gx0 - 0.1 * t) if f == 0 \
                 else (gx1 + 0.1 * t, float(width))
@@ -5050,7 +5092,11 @@ class CpuView(Gtk.DrawingArea):
                     "wall": inside(-side * 0.5, 0.08),
                     "fire": inside(side * 0.6, 0.45),
                     "cache": inside(-side * 0.5, 0.42),
-                    "pile": inside(side * 0.78, 0.03), "side": side})
+                    "pile": inside(side * 0.78, 0.03),
+                    "hide": inside(-side * 1.0, 0.12), "side": side})
+            # The den in the woods behind, out toward the flank's edge.
+            fl["den"] = (nx0 + 0.8 * s if f == 0 else nx1 - 0.8 * s,
+                         ny0 + 0.3 * H)
         if floor - gy1 >= 1.2 * s:
             pastures.append((gx0 + 0.3 * s, gy1 + 0.6 * s, gx1 - 0.3 * s,
                              floor - 0.1 * s))
@@ -5066,7 +5112,10 @@ class CpuView(Gtk.DrawingArea):
                 keep += [(pl["cabin"][0], pl["cabin"][1], 0.75 * s,
                           1.3 * s),
                          (pl["fire"][0], pl["fire"][1], 0.4 * s, s),
-                         (pl["cache"][0], pl["cache"][1], 0.5 * s, s)]
+                         (pl["cache"][0], pl["cache"][1], 0.5 * s, s),
+                         (pl["hide"][0], pl["hide"][1], 0.4 * s, s)]
+            if fl["den"]:
+                keep.append((fl["den"][0], fl["den"][1], 0.8 * s, 0.6 * s))
             if fl["ford"]:
                 (xf, ya), (_, yb) = fl["ford"]
                 keep += [(xf, ya + (yb - ya) * k / 4, 0.6 * s, s)
@@ -5158,7 +5207,13 @@ class CpuView(Gtk.DrawingArea):
                     * self.wild["s"]
             return x, y
         if kind == "site":
-            return fl["sites"][place[2]]["stand"]
+            st = fl["sites"][place[2]]
+            if job in ("fish", "steal"):
+                # A bear goes down into the shallows, not to his stand.
+                return st["x"] + st["face"] * 0.2 * self.wild["s"], st["y"]
+            return st["stand"]
+        if kind == "den":
+            return fl["den"]
         if kind == "tree":
             spot = self.wild["tree_at"].get(place[1])
             if spot is None:
@@ -5218,14 +5273,17 @@ class CpuView(Gtk.DrawingArea):
                     else -1
             return b[0], b[1], face, False
         a = self._spot(f, tr["at"], "rest")
-        if a is None:
-            a = b
+        return self._walk_xy(f, b if a is None else a, b,
+                             (t - tr["t0"]) / max(1e-9, tr["t1"] - tr["t0"]))
+
+    def _walk_xy(self, f, a, b, frac):
+        """(x, feet, facing, True) frac of the way along the dry route from
+        a to b on flank f."""
         pts = self._route(f, a, b)
         lens = [math.hypot(q[0] - p[0], q[1] - p[1])
                 for p, q in zip(pts, pts[1:])]
         total = sum(lens)
-        p = (t - tr["t0"]) / max(1e-9, tr["t1"] - tr["t0"])
-        go = min(1.0, max(0.0, p)) * total
+        go = min(1.0, max(0.0, frac)) * total
         for j, ln in enumerate(lens):
             p0, p1 = pts[j], pts[j + 1]
             if go <= ln or j == len(lens) - 1:
@@ -5235,6 +5293,46 @@ class CpuView(Gtk.DrawingArea):
                         p0[1] + (p1[1] - p0[1]) * min(1.0, k), face, True)
             go -= ln
         return b[0], b[1], 1, True
+
+    BEAR_K = 1.05       # a bear against a man, in the picture
+
+    def _bear_place(self, b):
+        """Bear b's start and end on its flank's ground, and which side of
+        the man's spot it stands at if it is at a man (else 0); None if
+        the picture has no room for it."""
+        f, job = b["f"], b["job"]
+        end = self._spot(f, b["to"], job)
+        if end is None:
+            return None
+        start = self._spot(f, b["at"], "rest") or end
+        side = 0
+        if job in ("stalk", "fight", "eat", "dead"):
+            if abs(start[0] - end[0]) > 1:
+                side = 1 if start[0] > end[0] else -1
+            else:
+                x0, _, x1, _ = self.wild["flanks"][f]["near"]
+                side = 1 if end[0] < (x0 + x1) / 2 else -1
+            end = (end[0] + side * 0.6 * self.wild["s"], end[1])
+        return start, end, side
+
+    def _bear_xy(self, b):
+        """Where bear b is drawn now: (x, feet, facing, walking), or None
+        if it is out of the picture or asleep in its den."""
+        w = self.world
+        place = self._bear_place(b)
+        if place is None or b["job"] == "den" and w.time >= b["t1"]:
+            return None
+        start, end, side = place
+        if w.time < b["t1"]:
+            return self._walk_xy(b["f"], start, end, (w.time - b["t0"])
+                                 / max(1e-9, b["t1"] - b["t0"]))
+        if side:
+            face = -side
+        elif b["to"][0] == "site":
+            face = self.wild["flanks"][b["f"]]["sites"][b["to"][2]]["face"]
+        else:
+            face = 1 if start[0] <= end[0] else -1
+        return end[0], end[1], face, False
 
     HORSE_COATS = ((HORSE_RGB, HORSE_DARK_RGB),
                    (HORSE_GREY_RGB, HORSE_GREY_DARK_RGB),
@@ -5361,6 +5459,13 @@ class CpuView(Gtk.DrawingArea):
                             world.time >= owner["t1"]:
                         items.append((pl["fire"][1], 1, self._draw_fire,
                                       (pl, owner)))
+                    if owner["hide"] is not None and 0 <= world.time \
+                            - owner["hide"] < world.HIDE_S:
+                        items.append((pl["hide"][1], 1, self._draw_hide,
+                                      (pl, owner)))
+            if fl["den"] and any(b["f"] == f and b["job"] != "dead"
+                                 for b in world.predators):
+                items.append((fl["den"][1], 1, self._draw_den, (f, fl)))
         for g in world.graves:
             f = g["place"][1] if g["place"][0] in ("plot", "site", "edge") \
                 else world.trees[g["place"][1]]["f"] \
@@ -5373,6 +5478,11 @@ class CpuView(Gtk.DrawingArea):
             if at is not None and not (tr["job"] == "shelter"
                                        and world.time >= tr["t1"]):
                 items.append((at[1], 2, self._draw_trapper, (tr, at)))
+        for b in world.predators:
+            at = self._bear_xy(b)
+            if at is not None:
+                items.append((at[1], 1 if b["job"] == "dead" else 2,
+                              self._draw_bear, (b, at)))
         items += [(hs["y"], 2, self._draw_horse, hs) for hs in self.horses]
         return items
 
@@ -5475,8 +5585,35 @@ class CpuView(Gtk.DrawingArea):
         axe at a tree, or standing at ease looking about him."""
         tr, (x, feet, facing, walking) = args
         t, job = self.world.time, tr["job"]
-        kneel = axe = 0.0
-        if not walking:
+        kneel = axe = aim = knife = 0.0
+        shot = -1.0
+        fight = tr["fight"]
+        b = fight and next((b for b in self.world.predators
+                            if b["id"] == fight["bear"]), None)
+        place = b and self._bear_place(b)
+        if place and not walking:
+            # Facing the bear: the rifle up as it comes, one shot, then
+            # the knife; helpers stand in beside him, away from it.
+            side, s = place[2] or facing, self.wild["s"]
+            facing = side
+            target = b["fight"] and b["fight"]["target"]
+            men = sorted((o for o in self.world.trappers if o["fight"]
+                          and o["fight"]["bear"] == b["id"]
+                          and t >= o["t1"]),
+                         key=lambda o: o["id"] != target)
+            k = men.index(tr) if tr in men else 0
+            x -= side * 0.32 * s * k
+            feet += 0.08 * s * k
+            if fight["shot"] is not None:
+                shot = t - fight["shot"]
+            if b["job"] == "stalk" and fight["saw"] is not None:
+                aim = self._ramp(t - fight["saw"], 0.0, self.world.REACT_S)
+            elif 0 <= shot < 0.8:
+                aim = 1.0
+            elif b["job"] == "fight":
+                knife = 0.15 + 0.85 * max(0.0, math.sin(
+                    self.phase * 6.0 + tr["id"]))
+        elif not walking:
             into, left = t - tr["t1"], tr["t2"] - t
             if job in ("set", "check", "collect", "stash", "fire", "build"):
                 kneel = self._ramp(into, 0.0, 0.6) \
@@ -5490,10 +5627,333 @@ class CpuView(Gtk.DrawingArea):
             if walking else 0.0
         self._mountain_man(cr, x, feet, self.wild["s"], facing,
                            step=step, shouldered=walking and job != "build",
-                           kneel=kneel, axe=axe,
+                           kneel=kneel, axe=axe, aim=aim, elev=-0.06,
+                           shot=shot if shot < 3.0 else -1.0, knife=knife,
                            beaver=walking and job == "stash"
                            and tr["carry"] == "beaver",
                            log=walking and job == "build")
+
+    def _draw_bear(self, cr, args):
+        """A bear at whatever it is about: ambling, charging or fleeing,
+        fishing in the shallows, nosing at a trap, a cache or its kill,
+        rearing to sniff the air, or up on its hind legs fighting, its
+        blows drawing blood; slain, it lies where it fell a while."""
+        b, (x, feet, facing, walking) = args
+        world, s = self.world, self.wild["s"] * self.BEAR_K
+        t, job = world.time, b["job"]
+        if job == "dead":
+            age = 1 - (b["t2"] - t) / world.CARCASS_S
+            fade = 1 - max(0.0, age - 0.6) / 0.4
+            cr.set_source_rgba(*BLOOD_RGB, 0.7 * fade)
+            cr.save()
+            cr.translate(x, feet)
+            cr.scale(0.55 * s * min(1.0, 0.4 + age * 3), 0.12 * s)
+            cr.arc(0, 0, 1, 0, 2 * math.pi)
+            cr.restore()
+            cr.fill()
+            cr.push_group()
+            self._bear(cr, x, feet, s, facing, fall=1.0)
+            cr.pop_group_to_source()
+            cr.paint_with_alpha(fade)
+            return
+        step = stand = charge = head = swipe = 0.0
+        fish = False
+        if walking:
+            fast = job in ("stalk", "flee")
+            step = math.sin(self.phase * (11.0 if fast else 6.0) + b["id"])
+            charge = 1.0 if fast else 0.0
+        elif job == "fight":
+            stand = 1.0
+            e = t - (b["fight"]["next"] - world.EXCHANGE_S)
+            swipe = math.sin(min(1.0, max(0.0, e / 0.6)) * math.pi)
+        elif job == "fish":
+            head = 0.7 + 0.3 * math.sin(self.phase * 1.1 + b["id"])
+            swipe = max(0.0, math.sin(self.phase * 1.3 + b["id"])) ** 8
+            fish = b["t2"] - t < 8.0
+            e = (self.phase + b["id"]) % 2.4
+            self._splash(cr, x + facing * 0.35 * s, feet, s * 0.4, e)
+        elif job in ("steal", "raid", "eat"):
+            head = 0.85 + 0.15 * math.sin(self.phase * 4.0 + b["id"])
+        elif job in ("hunt", "stalk"):
+            head = 0.35
+        elif job == "wander":
+            u = (self.phase / 9.0 + b["id"] * 0.37) % 1.0
+            stand = math.sin(u / 0.3 * math.pi) if u < 0.3 else 0.0
+        self._bear(cr, x, feet, s, facing, step=step, stand=stand,
+                   charge=charge, head=head, swipe=swipe, fish=fish)
+        blow = b["blow"]
+        if blow is not None and 0 <= t - blow["t"] < 0.7:
+            if blow["on"] == "bear":
+                self._spray(cr, x + facing * 0.3 * s,
+                            feet - (0.4 + 0.45 * stand) * s, s * 0.9,
+                            -facing, t - blow["t"], blow["t"] % 1.0)
+            else:
+                self._spray(cr, x + facing * 0.6 * s, feet - 0.6 * s,
+                            s * 0.9, facing, t - blow["t"], blow["t"] % 1.0)
+
+    def _draw_den(self, cr, args):
+        """A bear's den, and while one sleeps in it, its breath."""
+        f, fl = args
+        world = self.world
+        asleep = any(b["f"] == f and b["job"] == "den"
+                     and world.time >= b["t1"] for b in world.predators)
+        x, base = fl["den"]
+        self._den(cr, x, base, self.wild["s"], self.look["winter"],
+                  self.phase if asleep else -1.0, 1 if f == 0 else -1)
+
+    def _draw_hide(self, cr, args):
+        pl, owner = args
+        x, y = pl["hide"]
+        self._hide(cr, x, y, self.wild["s"] * 0.9)
+
+    @staticmethod
+    def _bear(cr, x, feet, s, facing, step=0.0, stand=0.0, charge=0.0,
+              head=0.0, swipe=0.0, fall=0.0, fish=False):
+        """A grizzly about s at the hump, nose toward facing, feet at feet.
+
+        Drawn in a 100-unit model. step swings its legs, -1..1; charge
+        (0..1) lowers and stretches it into a run; stand (0..1) rears it
+        up on its hind legs, forepaws out; head (0..1) lowers its head to
+        the water or the ground; swipe (0..1) raises the near forepaw to
+        strike; fish puts one in its jaws. fall above 0 lays it on its
+        side, dead."""
+        if s < 2:
+            return
+        cr.save()
+        cr.translate(x, feet)
+        cr.scale(facing * s / 100.0, s / 100.0)
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_line_join(cairo.LINE_JOIN_ROUND)
+
+        def blob(cx, cy, rx, ry, rgb, rot=0.0):
+            cr.save()
+            cr.translate(cx, cy)
+            cr.rotate(rot)
+            cr.scale(rx, ry)
+            cr.arc(0, 0, 1, 0, 2 * math.pi)
+            cr.restore()
+            cr.set_source_rgb(*rgb)
+            cr.fill()
+
+        def limb(a, b, w, rgb, claws=True):
+            cr.set_source_rgb(*rgb)
+            cr.set_line_width(w)
+            cr.move_to(*a)
+            cr.line_to(*b)
+            cr.stroke()
+            blob(b[0] + 2, b[1] - 1, w * 0.6, w * 0.35, rgb)
+            if claws:
+                cr.set_source_rgb(*CLAW_RGB)
+                cr.set_line_width(1.4)
+                for k in (-1, 0, 1):
+                    cr.move_to(b[0] + w * 0.5, b[1] + k * 2.2 - 1)
+                    cr.line_to(b[0] + w * 0.5 + 4, b[1] + k * 2.6)
+                cr.stroke()
+
+        if fall > 0:
+            # On its side, legs out stiff toward the viewer's left.
+            cr.set_source_rgba(0, 0, 0, 0.25)
+            cr.save()
+            cr.scale(58, 7)
+            cr.arc(0, 0, 1, 0, 2 * math.pi)
+            cr.restore()
+            cr.fill()
+            blob(-2, -20, 50, 19, BEAR_RGB)
+            blob(-6, -12, 40, 8, BEAR_DARK_RGB)
+            for lx in (-34, -20, 18, 32):
+                limb((lx, -8), (lx + 12, 3), 10, BEAR_DARK_RGB)
+            blob(52, -14, 14, 11, BEAR_RGB, 0.3)
+            blob(64, -9, 9, 6, BEAR_MUZZLE_RGB, 0.3)
+            cr.set_source_rgb(*SEAM_RGB)
+            cr.set_line_width(1.5)
+            cr.move_to(52, -20)
+            cr.line_to(57, -18)
+            cr.stroke()
+            cr.restore()
+            return
+
+        cr.set_source_rgba(0, 0, 0, 0.25)
+        cr.save()
+        cr.scale(52 - 18 * stand, 6)
+        cr.arc(0, 0, 1, 0, 2 * math.pi)
+        cr.restore()
+        cr.fill()
+        reach = 10 + 10 * charge
+        hip = (-24 + 8 * stand, -40 + 6 * charge)
+        # The hind legs, crouched under it when it rears.
+        for k, rgb in ((1, BEAR_DARK_RGB), (-1, BEAR_RGB)):
+            sw = k * step * reach - 8 * charge * k
+            knee = (hip[0] + 4 + sw * 0.4 - 6 * stand, -20)
+            foot = (hip[0] + 2 + sw - 4 * stand + 4 * k * stand, -2)
+            cr.set_source_rgb(*rgb)
+            cr.set_line_width(15)
+            cr.move_to(*hip)
+            cr.line_to(*knee)
+            cr.line_to(*foot)
+            cr.stroke()
+            blob(foot[0] + 3, foot[1], 9, 3.5, rgb)
+        blob(hip[0] - 6, hip[1] - 2, 22, 21, BEAR_RGB)
+        # The rest of it pivots up about the hips as it rears.
+        cr.save()
+        cr.translate(*hip)
+        cr.rotate(-1.2 * stand)
+        lift = 38 - 6 * charge
+        drop = 0 if stand else 6 * charge
+        fore = [((44, -2 + drop), (44 + step * reach + 12 * charge,
+                                   lift)),
+                ((40, 0 + drop), (40 - step * reach + 6 * charge, lift))]
+        a, b = fore[0]
+        limb(a, b, 13, BEAR_DARK_RGB)
+        blob(26, -4 + drop, 42 + 4 * charge, 21 - 3 * charge, BEAR_RGB)
+        blob(38, -16 + drop, 18, 15, BEAR_RGB)
+        cr.set_source_rgba(*BEAR_HI_RGB, 0.6)
+        cr.set_line_width(4)
+        cr.arc(36, -12 + drop, 17, math.pi * 1.1, math.pi * 1.7)
+        cr.stroke()
+        # The head, held level as it rears, lowered to the ground or the
+        # water when it feeds.
+        cr.save()
+        cr.translate(62 - 4 * head, -10 + drop + 24 * head)
+        cr.rotate(1.0 * stand + 0.9 * head - 0.15 * charge)
+        blob(0, 0, 14, 12, BEAR_RGB)
+        blob(-5, -11, 4.5, 4.5, BEAR_DARK_RGB)
+        blob(4, -12, 4.5, 4.5, BEAR_RGB)
+        blob(13, 4, 10, 6.5, BEAR_MUZZLE_RGB)
+        blob(22, 3, 3.2, 3, SEAM_RGB)
+        blob(5, -3, 1.7, 1.7, (0.02, 0.02, 0.02))
+        if stand > 0.5 or charge > 0.5:
+            cr.set_source_rgb(*DEN_MOUTH_RGB)
+            cr.move_to(10, 8)
+            cr.line_to(22, 7)
+            cr.line_to(14, 13)
+            cr.close_path()
+            cr.fill()
+        if fish:
+            blob(14, 9, 11, 3.5, FISH_RGB, 0.5)
+            cr.set_source_rgb(*FISH_RGB)
+            cr.move_to(21, 14)
+            cr.line_to(27, 12)
+            cr.line_to(25, 19)
+            cr.close_path()
+            cr.fill()
+        cr.restore()
+        # The near forepaw, swung up to strike.
+        a, b = fore[1]
+        ang = -1.9 * swipe
+        b = (a[0] + (b[0] - a[0]) * math.cos(ang) - (b[1] - a[1])
+             * math.sin(ang),
+             a[1] + (b[0] - a[0]) * math.sin(ang) + (b[1] - a[1])
+             * math.cos(ang))
+        limb(a, b, 14, BEAR_RGB)
+        cr.restore()
+        cr.restore()
+
+    @staticmethod
+    def _den(cr, x, base, s, snow, breath=-1.0, facing=1):
+        """A den dug under a bank: an earth mound with a dark mouth toward
+        facing and stones about it; snow (0..1) lies on it, and breath is
+        the phase of a sleeper's breath at the mouth, negative for none."""
+        cr.save()
+        cr.translate(x, base)
+        cr.scale(facing, 1)
+        cr.set_source_rgba(0, 0, 0, 0.25)
+        cr.save()
+        cr.scale(0.85 * s, 0.12 * s)
+        cr.arc(0, 0, 1, 0, 2 * math.pi)
+        cr.restore()
+        cr.fill()
+        cr.set_source_rgb(*DEN_RGB)
+        cr.move_to(-0.8 * s, 0)
+        cr.curve_to(-0.6 * s, -0.5 * s, 0.4 * s, -0.62 * s, 0.8 * s, 0)
+        cr.close_path()
+        cr.fill()
+        cr.set_source_rgb(*DEN_MOUTH_RGB)
+        cr.move_to(0.05 * s, 0)
+        cr.curve_to(0.08 * s, -0.36 * s, 0.5 * s, -0.36 * s, 0.52 * s, 0)
+        cr.close_path()
+        cr.fill()
+        for k, (sx, sy, r) in enumerate(((-0.55, -0.06, 0.1),
+                                         (-0.2, -0.36, 0.08),
+                                         (0.6, -0.05, 0.09))):
+            cr.set_source_rgb(*(STONE_RGB if k % 2 else STONE_DARK_RGB))
+            cr.arc(sx * s, sy * s, r * s, 0, 2 * math.pi)
+            cr.fill()
+        cr.set_source_rgb(*TRUNK_RGB)
+        cr.set_line_width(max(0.8, s * 0.03))
+        cr.move_to(0.0, -0.3 * s)
+        cr.curve_to(0.15 * s, -0.4 * s, 0.25 * s, -0.36 * s, 0.32 * s,
+                    -0.3 * s)
+        cr.stroke()
+        if snow > 0:
+            cr.set_source_rgba(*SNOW_RGB, min(1.0, snow * 1.5))
+            cr.move_to(-0.72 * s, -0.1 * s)
+            cr.curve_to(-0.55 * s, -0.5 * s, 0.35 * s, -0.6 * s,
+                        0.72 * s, -0.08 * s)
+            cr.curve_to(0.4 * s, -(0.5 - 0.12 * snow) * s,
+                        -0.4 * s, -(0.45 - 0.14 * snow) * s, -0.72 * s,
+                        -0.1 * s)
+            cr.fill()
+        if breath >= 0:
+            for j in range(2):
+                u = (breath * 0.3 + j * 0.5) % 1.0
+                cr.set_source_rgba(*SMOKE_RGB, 0.45 * (1 - u))
+                cr.arc((0.3 + 0.15 * u) * s, -(0.25 + 0.35 * u) * s,
+                       (0.05 + 0.08 * u) * s, 0, 2 * math.pi)
+                cr.fill()
+        cr.restore()
+
+    @staticmethod
+    def _hide(cr, x, y, s):
+        """A bear's hide laced to a willow frame to dry, leaning on its
+        poles, about s tall."""
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_source_rgba(0, 0, 0, 0.25)
+        cr.save()
+        cr.translate(x, y)
+        cr.scale(0.4 * s, 0.08 * s)
+        cr.arc(0, 0, 1, 0, 2 * math.pi)
+        cr.restore()
+        cr.fill()
+        top, bot = y - 1.0 * s, y - 0.12 * s
+        cr.set_source_rgb(*RIFLE_WOOD_RGB)
+        cr.set_line_width(max(1.0, s * 0.04))
+        for dx in (-0.32, 0.32):
+            cr.move_to(x + dx * s, y)
+            cr.line_to(x + dx * 0.85 * s, top - 0.06 * s)
+        cr.move_to(x - 0.36 * s, top + 0.02 * s)
+        cr.line_to(x + 0.36 * s, top + 0.02 * s)
+        cr.move_to(x - 0.34 * s, bot)
+        cr.line_to(x + 0.34 * s, bot)
+        cr.stroke()
+        cy, h = (top + bot) / 2, bot - top
+        cr.set_source_rgb(*BEAR_HIDE_RGB)
+        for dx, dy in ((-1, -1), (1, -1), (-1, 1), (1, 1)):
+            cr.save()
+            cr.translate(x + dx * 0.19 * s, cy + dy * 0.3 * h)
+            cr.rotate(dx * dy * 0.6)
+            cr.scale(0.1 * s, 0.06 * s)
+            cr.arc(0, 0, 1, 0, 2 * math.pi)
+            cr.restore()
+            cr.fill()
+        cr.save()
+        cr.translate(x, cy)
+        cr.scale(0.17 * s, 0.4 * h)
+        cr.arc(0, 0, 1, 0, 2 * math.pi)
+        cr.restore()
+        cr.fill()
+        cr.arc(x, top + 0.1 * h, 0.08 * s, 0, 2 * math.pi)
+        cr.fill()
+        cr.set_source_rgb(*BEAR_DARK_RGB)
+        cr.set_line_width(max(0.6, s * 0.015))
+        cr.move_to(x, cy - 0.3 * h)
+        cr.line_to(x, cy + 0.3 * h)
+        cr.stroke()
+        cr.set_source_rgb(*CORD_RGB)
+        for dx, dy in ((-0.3, -0.42), (0.3, -0.42), (-0.3, 0.42),
+                       (0.3, 0.42), (-0.32, 0.0), (0.32, 0.0)):
+            cr.move_to(x + dx * s, cy + dy * h)
+            cr.line_to(x + dx * 0.6 * s, cy + dy * 0.75 * h)
+        cr.stroke()
 
     def _draw_site(self, cr, args):
         """A trap at the water's edge: its stake in the bank, the chain
@@ -5504,9 +5964,10 @@ class CpuView(Gtk.DrawingArea):
         site = world.sites[f][k]
         state = site["state"]
         here = ["site", f, k]
-        working = next((tr for tr in world.trappers if tr["to"] == here
-                        and world.time >= tr["t1"]
-                        and tr["job"] in ("set", "collect")), None)
+        working = next((tr for tr in world.trappers + world.predators
+                        if tr["to"] == here and world.time >= tr["t1"]
+                        and tr["job"] in ("set", "collect", "steal")),
+                       None)
         u = 1.0
         if state == "empty":
             if working is None or working["job"] != "set":
@@ -6087,26 +6548,49 @@ class CpuView(Gtk.DrawingArea):
             self._draw_almanac(cr, height)
 
     def _almanac_text(self):
-        """The season and year, and the valley's tallies: (beavers,
-        trappers, pelts held)."""
+        """The season and year, the valley's tallies (beavers, trappers,
+        pelts held, bears), and the season's fights in words, or ""."""
         w = self.world
         title = f"{w.SEASONS[w.season()].capitalize()}, year {w.year()}"
+        tally = w.tally["bears"]
+        lost = w.tally["deaths"].get("bear", 0)
+        words = []
+        for n, one, many in ((tally["fights"], "fight", "fights"),
+                             (tally["slain"], "bear slain", "bears slain"),
+                             (lost, "man lost", "men lost")):
+            if n and (words or one == "fight"):
+                words.append(f"{n} {one if n == 1 else many}")
         return title, (len(w.beavers), len(w.trappers),
-                       sum(tr["pelts"] for tr in w.trappers))
+                       sum(tr["pelts"] for tr in w.trappers),
+                       w.stats()["bears"]), ", ".join(words)
 
     def _draw_almanac(self, cr, height):
         """A small caption in the bottom-left corner, below the pastures
-        where the land fades out: the season, and a beaver, a cap and a
-        pelt, each with its count."""
-        title, (beavers, trappers, pelts) = self._almanac_text()
+        where the land fades out: the season, and a beaver, a cap, a pelt
+        and a bear's head, each with its count; then the season's fights,
+        if it has had any."""
+        title, tallies, fights = self._almanac_text()
         size = max(9.0, min(13.0, height * 0.022))
         x, y = size * 0.8, height - size * 0.7
         x += self._text(cr, x, y, title, size, 0.7, align="left")
         x += size * 0.9
         icon = size * 0.8
-        for k, n in enumerate((beavers, trappers, pelts)):
+        for k, n in enumerate(tallies):
             cy = y - size * 0.35
-            if k == 0:
+            if k == 3:
+                cx = x + icon * 0.5
+                for ex in (-0.32, 0.32):
+                    cr.set_source_rgb(*BEAR_DARK_RGB)
+                    cr.arc(cx + ex * icon, cy - icon * 0.28, icon * 0.16,
+                           0, 2 * math.pi)
+                    cr.fill()
+                cr.set_source_rgb(*BEAR_RGB)
+                cr.arc(cx, cy, icon * 0.4, 0, 2 * math.pi)
+                cr.fill()
+                cr.set_source_rgb(*BEAR_MUZZLE_RGB)
+                cr.arc(cx, cy + icon * 0.12, icon * 0.17, 0, 2 * math.pi)
+                cr.fill()
+            elif k == 0:
                 self._beaver(cr, x + icon * 0.5, y, icon * 1.3, 1)
             elif k == 1:
                 cr.set_source_rgb(*FUR_RGB)
@@ -6126,6 +6610,8 @@ class CpuView(Gtk.DrawingArea):
             x += icon * 1.3
             x += self._text(cr, x, y, str(n), size, 0.7, align="left")
             x += size * 0.8
+        if fights:
+            self._text(cr, x, y, fights, size, 0.7, align="left")
 
     def _draw_weather(self, cr, width, height, t):
         """Leaves drifting down in autumn, snow falling in winter, each
@@ -7541,10 +8027,11 @@ def trapper_tests(view, cr, rows):
     w = World(14)
     w.run(2 * World.YEAR_S + 10)
     view.set_world(w)
-    title, tallies = view._almanac_text()
-    assert title == "Spring, year 3" and len(tallies) == 3, title
+    title, tallies, fights = view._almanac_text()
+    assert title == "Spring, year 3" and len(tallies) == 4, title
     calls = []
-    view._almanac_text = lambda: calls.append(1) or (title, tallies)
+    view._almanac_text = lambda: calls.append(1) or (title, tallies,
+                                                     "2 fights")
     view._draw(view, cr, 1024, 680)
     assert calls, "drawn while the fort is down"
     del calls[:]
@@ -7920,6 +8407,80 @@ def bear_tests(view, cr, rows):
              and e["cause"] == "bear" and e["claimant"]]
     assert all(e["after"] - e["before"] == e["moved"] for e in heirs)
     assert sum(e["moved"] > 0 for e in heirs) >= 1, heirs
+    # Drawn, in the idle picture only: a bear at every job and walking to
+    # it, a fight from the stalk to the knife, a carcass, a den in snow
+    # and a hide at a cabin, at every size, with the fort down and up.
+    w, man, b = duel(NOTICE_K=1e9, HIT_P=(0.0, 0.0), CLAW_P=0.0,
+                     KNIFE_P=0.0)
+    w.HEAR_D = 0.5
+    helper = w._trapper(1, 1, ["plot", 1, 1])
+    helper["t1"] = w.time
+    other = w._bear(0, ["edge", 0])
+    man["hide"] = w.time
+    view.set_world(w)
+    sizes = ((60, 40), (300, 220), (560, 420), (1024, 680))
+    places = {"fish": ["site", 0, 0], "steal": ["site", 0, 1],
+              "hunt": ["tree", w._bank_trees(0, None)[0]],
+              "raid": ["plot", 0, 0], "eat": ["plot", 0, 1],
+              "wander": ["tree", 2], "den": ["den", 0], "leave": ["edge", 0],
+              "flee": ["den", 0], "dead": ["site", 0, 2]}
+    for on in (False, True):
+        view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], on)
+        for size in sizes:
+            for when in (S + 10, 3 * S + 400):
+                w.time = when
+                for job, place in places.items() if not on else ():
+                    for walking in (True, False):
+                        other.update(job=job, at=["edge", 0], to=place,
+                                     t0=w.time - 2, t2=w.time + 9,
+                                     t1=w.time + (3 if walking else -1))
+                        view._draw(view, cr, *size)
+            w.time = S + 10
+            view._draw(view, cr, *size)
+            fl = [] if on else view.wild["flanks"]
+            for x, y in [p for f in fl for p in [f["den"]] + [
+                    pl["hide"] for pl in f["plots"]] if p is not None]:
+                assert 0 <= x <= size[0] and 0 <= y <= size[1], (x, y)
+    view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
+    drawn = set()
+    for _ in range(40 * 10):
+        w.run(0.1)
+        view.phase += 0.1
+        drawn.add(b["job"])
+        view._draw(view, cr, 560, 420)
+        if b["job"] == "fight" and man["fight"]["shot"] is not None:
+            b["blow"] = {"t": w.time, "on": "man", "id": man["id"]}
+            w.KNIFE_P, w.KNIFE_DMG = 1.0, 0.1
+    assert {"stalk", "fight"} <= drawn and b["job"] == "dead", drawn
+    assert any(it[2] == view._draw_bear for it in view._wild_items())
+    assert any(it[2] == view._draw_hide for it in view._wild_items())
+    for pose in ({}, {"step": 0.7}, {"charge": 1.0, "step": -0.5},
+                 {"stand": 1.0, "swipe": 1.0}, {"head": 1.0, "fish": True},
+                 {"fall": 1.0}):
+        view._bear(cr, 100, 100, 40, -1, **pose)
+    view._bear(cr, 100, 100, 1, 1)
+    for snow in (0.0, 1.0):
+        view._den(cr, 100, 100, 40, snow, 2.0, -1)
+    view._hide(cr, 100, 100, 40)
+    for knife in (0.1, 1.0):
+        view._mountain_man(cr, 100, 100, 40, 1, knife=knife)
+    # Every size and both fort states, with the bears about.
+    for on in (True, False):
+        view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], on)
+        for size in ((1, 1), (60, 40), (300, 220)):
+            for _ in range(30):
+                view.phase += 1 / 30
+                view._advance(1 / 30)
+            view._draw(view, cr, *size)
+    # The almanac counts the bears, and tells of the season's fights.
+    other.update(job="wander", t2=w.time + 1e3)
+    title, tallies, fights = view._almanac_text()
+    assert len(tallies) == 4 and tallies[3] == 1 and fights == \
+        "1 fight, 1 bear slain", (tallies, fights)
+    w.tally = w._fresh_tally()
+    assert view._almanac_text()[2] == ""
+    view._draw_almanac(cr, 680)
+
     # And in the four valleys the other tests read: fights enough to
     # matter, and neither side has them all its own way (too few fights
     # there to hold a rate to).
@@ -8131,8 +8692,8 @@ def self_test():
         assert not os.listdir(tmp), os.listdir(tmp)
     lines = buf.getvalue().splitlines()
     assert len(lines) == 5, lines
-    for word in ("season", "beavers", "dams", "lodges", "trappers",
-                 "cabins", "pelts", "trees", "deaths", "arrivals"):
+    for word in ("season", "beavers", "dams", "lodges", "trappers", "bears",
+                 "cabins", "pelts", "trees", "deaths", "arrivals", "fights"):
         assert word in lines[0], word
     assert [ln.split()[0] for ln in lines[1:]] == list(World.SEASONS)
 
@@ -8553,12 +9114,14 @@ USAGE = ("usage: fort-galgs [--time-scale <x>] | --self-test"
 
 def almanac(years, seed=1, out=None):
     """Run a fresh valley headless for so many years and print one row a
-    season: how it stands as the season ends, and what the season saw."""
+    season: how it stands as the season ends, and what the season saw;
+    fights is the season's fights with bears, then the bears slain."""
     out = out or sys.stdout
     w = World(seed)
     print(f"{'season':<14}{'beavers':>8}{'dams':>5}{'lodges':>7}"
-          f"{'trappers':>9}{'cabins':>7}{'pelts':>6}{'trees':>6}  "
-          f"{'deaths':<34}{'arrivals':>8}", file=out)
+          f"{'trappers':>9}{'bears':>6}{'cabins':>7}{'pelts':>6}"
+          f"{'trees':>6}  {'deaths':<34}{'arrivals':>8}{'fights':>7}",
+          file=out)
     for n in range(int(years) * 4):
         w.run((n + 1) * World.SEASON_S - 0.5 - w.time)
         st = w.stats()
@@ -8569,10 +9132,12 @@ def almanac(years, seed=1, out=None):
                                                         "starved")
                             if tally[k]]) or "-"
         when = f"{World.SEASONS[st['season']]} {st['year']}"
+        bears = tally["bears"]
+        fights = f"{bears['fights']}/{bears['slain']}"
         print(f"{when:<14}{st['beavers']:>8}{st['dams']:>5}"
-              f"{st['lodges']:>7}{st['trappers']:>9}{st['cabins']:>7}"
-              f"{st['pelts']:>6}{st['trees']:>6}  {died:<34}"
-              f"{tally['arrivals']:>8}", file=out)
+              f"{st['lodges']:>7}{st['trappers']:>9}{st['bears']:>6}"
+              f"{st['cabins']:>7}{st['pelts']:>6}{st['trees']:>6}  "
+              f"{died:<34}{tally['arrivals']:>8}{fights:>7}", file=out)
         w.run(0.5)
 
 

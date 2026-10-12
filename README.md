@@ -10,7 +10,8 @@ down; beside each running app, a switch to move it into or out of the fort
 now and a pin to keep it there; and one button to raise the fort or stand
 down. Mountain men stand watch on the walls while it is up. Around it a
 valley lives on through the seasons — beavers dam the river, trappers trap
-them and raise cabins against the winter — and keeps evolving across runs,
+them and raise cabins against the winter, bears come down for the fish and
+the beavers and now and then for a trapper — and keeps evolving across runs,
 kept in `$XDG_STATE_HOME/fort-galgs/world.json` (by default under
 `~/.local/state`).
 
