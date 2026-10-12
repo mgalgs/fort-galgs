@@ -326,6 +326,47 @@ class World:
     the lodge has room; no lodge, no kits. Rails: a colony left empty
     takes a pair of the other's young if it has plenty; a valley with
     no beavers at all for a season gets a pair from upstream.
+
+    Trappers. Each keeps to one flank and one cabin plot there, and his
+    body is his health and how fed he is. Whenever he is free he weighs
+    what he needs, on his own, and does the most pressing thing; every
+    choice costs the walk there and the work:
+    - trap: set a trap at one of his flank's sites (shared: a trap set is
+      its setter's until he collects it, or lifts it when the bait has
+      gone stale), worth more the more beavers
+      are about and the hungrier he is, and nothing under the ice. A set
+      trap catches with a chance that grows with the beavers out of
+      their lodge; he collects the catch and stashes it at his cabin for
+      a pelt and MEAT_PER_BEAVER meals;
+    - fire: gather wood (or burn a log, quicker), cook a meal and eat,
+      more pressing the hungrier he is; without meat he cannot;
+    - chop: fell the nearest standing tree of his flank, woods before
+      banks, for logs to build with and burn: as many as the cabin still
+      needs plus WINTER_LOGS, more urgent as winter nears;
+    - build: lay one log on his cabin, likewise more urgent toward
+      winter;
+    - shelter: sit out the cold inside his cabin, which keeps out the
+      share of it that its walls are built;
+    - rest.
+    Hunger drains his fed-ness; at none, his health drains. Cold drains
+    his health whenever he is outside in winter, less at a fire, and
+    being fed and warm heals it. At no health he dies, of whichever was
+    taking him; a grave marks the spot and weathers away. Time spent
+    trapping in autumn is time not spent on the cabin.
+    When a trapper dies, the nearest survivor (his own flank first, then
+    whoever has least) takes his pelts, meat and logs, and moves into
+    his cabin if it is further along than his own; with none left, the
+    stores are lost and the cabin stands for the next arrival. A cabin
+    with nobody in it loses a log a season. More trappers means the
+    sites, the trees and the beavers go further around; fewer, the
+    more each one gets. Newcomers arrive in spring, more the more
+    beavers the valley holds, into the free plot furthest along. Rails:
+    a spring with nobody left brings one regardless; never more than
+    TRAPPERS_MAX.
+
+    Predators. PREDATORS names the species that hunt the trappers; none
+    yet. Each tick gives them their turn before anyone else's, and a
+    trapper they kill dies (and leaves his goods) like any other.
     """
 
     # -- the world's rates --
@@ -334,11 +375,11 @@ class World:
     YEAR_S = 4 * SEASON_S
     BLEND_S = 60.0      # ...the last this many blending into the next
     TICK_S = 1.0        # the world decides once a tick
-    VERSION = 2         # of the saved state's schema
+    VERSION = 3         # of the saved state's schema
 
     # Tree slots per flank: (zone, side, count); side 1 is the near bank.
-    SLOTS = (("woods", 1, 8), ("woods", -1, 6), ("bank", 1, 4),
-             ("bank", -1, 3))
+    SLOTS = (("woods", 1, 8), ("woods", -1, 5), ("bank", 1, 6),
+             ("bank", -1, 4))
     REGROW_S = 2 * YEAR_S   # a stump stands this long before it is a tree
     STUMP_K = 0.3           # ...a bare stump for this much of that
 
@@ -359,9 +400,44 @@ class World:
     FETCH_S = 3.0
     HAUL_S = 4.0
     SWIM_S = 15.0           # seconds to swim a unit of distance
-    KIT_COST = 0.4
+    KIT_COST = 0.25
+    LODGE_REST = 0.2        # how much an idle beaver likes its lodge
+    SPRING_APPETITE = 1.5
     KIT_COND = 0.6
     RESTOCK_S = SEASON_S
+
+    TRAPPERS_MAX = 4
+    URGENCY = (0.1, 0.3)    # shelter's pull in summer, and as autumn starts
+    PLOT_U = (0.28, 0.72)   # each flank's two cabin plots, across it
+    SITE_SPOTS = ((1, 0.18), (1, 0.82), (-1, 0.5))  # (bank, u) per flank
+    CABIN_LOGS = 8          # six courses of wall, a roof, a chimney
+    LOGS_PER_TREE = 4
+    WINTER_LOGS = 10        # logs he wants in hand to burn
+    HEARTH_S = 90.0         # sheltering burns a log this often...
+    COLD_HEARTH = 0.7       # ...and keeps out this much less without one
+    THAW_LOGS = 4           # the spring thaw rots this much of any cabin
+    FED_DRAIN = 1 / 1200    # fed-ness lost a second
+    HUNGER_K = 1 / 1800     # health lost a second with nothing in him
+    COLD_K = 1 / 600        # ...and out in the full cold of winter
+    HEAL_K = 1 / 1800       # won back a second, fed and warm
+    FIRE_WARMTH = 0.5       # of the cold a fire keeps off
+    WALK_S = 20.0           # seconds to walk a unit of distance
+    SET_S = 30.0
+    COLLECT_S = 20.0
+    STASH_S = 40.0
+    CHOP_S = 80.0           # a log
+    BUILD_S = 50.0          # a log
+    FIRE_S = 40.0           # with a log to burn; twice it without
+    SHELTER_S = 40.0
+    CATCH_K = 1 / 1000      # a set trap's catches a second, per...
+    BEAVER_REF = 6          # ...this many beavers out of the lodge
+    MEAT_PER_BEAVER = 4
+    BAIT_S = 240.0          # a set trap's bait is good this long
+    TRAP_BASE = 0.15        # trapping's pull with no beavers about
+    REST_PULL = 0.08        # how much he likes an idle moment
+    ARRIVE_K = 0.8          # newcomers a spring per BEAVER_REF beavers
+    GRAVE_S = 2 * YEAR_S
+    PREDATORS = ()          # species that hunt the trappers
 
     def __init__(self, seed=1):
         self.seed = seed
@@ -378,7 +454,16 @@ class World:
             for _ in range(3):
                 self._beaver(f, 0.7)
         self.empty_since = None
+        self.sites = [[{"by": None, "state": "empty", "since": 0.0}
+                       for _ in self.SITE_SPOTS] for _ in (0, 1)]
+        self.plots = [[{"owner": None, "logs": 0} for _ in self.PLOT_U]
+                      for _ in (0, 1)]
+        self.trappers = []
+        self.graves = []
+        self.predators = []
         self.tally = self._fresh_tally()
+        for f in (0, 1):
+            self._trapper(f, 0, ["plot", f, 0])
 
     @classmethod
     def _slots(cls):
@@ -406,6 +491,21 @@ class World:
                 "arrivals": 0, "pelts": 0, "rails": {"beavers": 0,
                                                      "trappers": 0},
                 "events": []}
+
+    def _trapper(self, f, k, at):
+        tr = {"id": self.next_id, "f": f, "plot": k, "health": 1.0,
+              "fed": 1.0, "pelts": 0, "meat": 0, "logs": 0, "job": "rest",
+              "at": list(at), "to": ["plot", f, k], "t0": self.time,
+              "t1": self.time, "t2": self.time, "site": None,
+              "tree": None, "carry": None, "fuel": False, "hearth": 0.0,
+              "effort": {},
+              "effort_prev": {}, "winter": None}
+        self.next_id += 1
+        self.plots[f][k]["owner"] = tr["id"]
+        self.trappers.append(tr)
+        tr["t1"] = self.time + self.WALK_S * self.distance(at, tr["to"])
+        tr["t2"] = tr["t1"] + 2.0
+        return tr
 
     def _beaver(self, f, cond):
         b = {"id": self.next_id, "f": f, "cond": cond, "job": "lodge",
@@ -444,6 +544,13 @@ class World:
 
     def cold(self):
         return self.season_weights()[3]
+
+    def urgency(self):
+        """How pressing shelter is, 0 in spring to 1 by winter."""
+        s = self.season()
+        return (0.0, self.URGENCY[0],
+                self.URGENCY[1] + (1 - self.URGENCY[1]) * self.season_t(),
+                1.0)[s]
 
     # -- places --
 
@@ -486,6 +593,13 @@ class World:
             return self.DAM_U[place[1]] - self.POND_LEN * 0.45, 0
         if kind == "swim":
             return place[2], 0
+        if kind == "plot":
+            return self._flank_u(place[1], self.PLOT_U[place[2]]), 1
+        if kind == "site":
+            side, u = self.SITE_SPOTS[place[2]]
+            return self._flank_u(place[1], u), side
+        if kind == "edge":
+            return (0.0 if place[1] == 0 else 1.0), 1
         return 0.5, 0
 
     @staticmethod
@@ -544,15 +658,51 @@ class World:
             self.half_n = half
             if half % 8 == 1:
                 self._births()
+        self._advance_predators()
         self._advance_beavers()
+        self._catches()
+        self._advance_trappers()
         self._rails()
+        if self.graves and self.time - self.graves[0]["t"] >= self.GRAVE_S:
+            self.graves.pop(0)
+
+    def _advance_predators(self):
+        """Round 2's bears go here; there are none yet."""
 
     def _season_turn(self):
         self.tally = self._fresh_tally()
-        if self.season() == 0:
+        season = self.season()
+        if season == 0:
             for c in self.colonies:
                 c["dam"] = max(0, c["dam"] - self.FLOOD_STICKS[0])
                 c["lodge"] = max(0, c["lodge"] - self.FLOOD_STICKS[1])
+        for row in self.plots:
+            for plot in row:
+                rot = (plot["owner"] is None) + (self.THAW_LOGS
+                                                 if season == 0 else 0)
+                plot["logs"] = max(0, plot["logs"] - rot)
+        for tr in self.trappers:
+            tr["effort_prev"], tr["effort"] = tr["effort"], {}
+            win = tr["winter"]
+            if season == 3:
+                prev = tr["effort_prev"]
+                busy = sum(prev.values())
+                tr["winter"] = {
+                    "start": tr["health"], "low": tr["health"],
+                    "share": prev.get("trap", 0.0) / busy if busy else 0.0,
+                    "ready": self.plots[tr["f"]][tr["plot"]]["logs"]
+                    >= self.CABIN_LOGS}
+            elif season == 0 and win is not None:
+                self._winter_over(tr, win["start"] - win["low"])
+                tr["winter"] = None
+        if season == 0:
+            self._arrivals()
+
+    def _winter_over(self, tr, loss):
+        win = tr["winter"]
+        self.tally["events"].append(
+            {"kind": "winter", "id": tr["id"], "share": win["share"],
+             "ready": win["ready"], "loss": loss})
 
     # -- beavers --
 
@@ -627,15 +777,18 @@ class World:
         if food is None:
             food = next((i for i in trees
                          if self.tree_state(i) == "sapling"), None)
-        scores = {"feed": (2.0 * hunger * hunger + 0.05) * jit(0.85, 1.15),
-                  "lodge": 0.35 * jit(0.85, 1.15),
-                  "swim": 0.15 * jit(0.85, 1.15)}
+        # Spring is for fattening up: the kits come from what is spare.
+        fatten = self.SPRING_APPETITE * self.season_weights()[0] * hunger
+        scores = {"feed": (2.0 * hunger * hunger + 0.05 + fatten)
+                  * jit(0.85, 1.15),
+                  "lodge": self.LODGE_REST * jit(0.85, 1.15),
+                  "swim": 0.25 * jit(0.85, 1.15)}
         want = self._sticks_wanted(f)
         pile = next((i for i in self._bank_trees(f, b)
                      if self.trees[i]["pile"] > 0), None)
         fell = next((i for i in trees if self._standing(i)), None)
         if want > 0 and (pile is not None or fell is not None):
-            scores["work"] = 0.9 * min(1.0, want / 4) * b["cond"] \
+            scores["work"] = 0.9 * min(1.0, 0.4 + want / 4) * b["cond"] \
                 * jit(0.85, 1.15)
         pick = max(scores, key=scores.get)
         if pick == "feed":
@@ -658,7 +811,7 @@ class World:
             self._send(b, ["swim", f, round(jit(lo, hi), 3)], "swim",
                        jit(4.0, 10.0), self.SWIM_S)
         else:
-            self._send(b, ["lodge", f], "lodge", jit(20.0, 60.0),
+            self._send(b, ["lodge", f], "lodge", jit(15.0, 40.0),
                        self.SWIM_S)
 
     def _births(self):
@@ -702,6 +855,282 @@ class World:
             self.empty_since = None
             self.tally["rails"]["beavers"] += 1
 
+    # -- trappers --
+
+    def _flank_beavers(self, f):
+        """f's beavers out of the lodge, where a trap can take them."""
+        return [b for b in self.beavers if b["f"] == f
+                and not (b["job"] == "lodge" and self.time >= b["t1"])]
+
+    def _catches(self):
+        ice = self.cold()
+        if ice >= 1:
+            return
+        for f in (0, 1):
+            for site in self.sites[f]:
+                if site["state"] != "set" or \
+                        self.time - site["since"] >= self.BAIT_S:
+                    continue
+                out = self._flank_beavers(f)
+                p = self.CATCH_K * self.TICK_S * len(out) / self.BEAVER_REF
+                if out and self.rng.random() < p * (1 - ice):
+                    victim = min(out, key=lambda b: b["cond"])
+                    self.beavers.remove(victim)
+                    site["state"], site["since"] = "caught", self.time
+                    self.tally["trapped"] += 1
+
+    def _advance_trappers(self):
+        cold = self.cold()
+        dt = self.TICK_S
+        dead = []
+        for tr in self.trappers:
+            tr["fed"] = max(0.0, tr["fed"] - self.FED_DRAIN * dt)
+            arrived = self.time >= tr["t1"]
+            shelter = 0.0
+            if arrived and tr["job"] == "shelter":
+                plot = self.plots[tr["f"]][tr["plot"]]
+                shelter = min(1.0, plot["logs"] / self.CABIN_LOGS)
+                if cold > 0 and tr["logs"] > 0:
+                    tr["hearth"] += dt
+                    if tr["hearth"] >= self.HEARTH_S:
+                        tr["hearth"] -= self.HEARTH_S
+                        tr["logs"] -= 1
+                else:
+                    shelter *= 1 - self.COLD_HEARTH
+            elif arrived and tr["job"] == "fire":
+                shelter = self.FIRE_WARMTH
+            chill = self.COLD_K * cold * (1 - shelter) * dt
+            starve = self.HUNGER_K * dt if tr["fed"] <= 0 else 0.0
+            tr["health"] -= chill + starve
+            if chill + starve == 0 and tr["fed"] > 0.3:
+                tr["health"] = min(1.0, tr["health"] + self.HEAL_K * dt)
+            if tr["winter"] is not None:
+                tr["winter"]["low"] = min(tr["winter"]["low"],
+                                          tr["health"])
+            if tr["health"] <= 0:
+                dead.append((tr, "hunger" if starve > chill else "cold"))
+                continue
+            if self.time >= tr["t2"]:
+                self._trapper_done(tr)
+                self._trapper_next(tr, cold)
+        for tr, cause in dead:
+            self.die(tr, cause)
+
+    def _trapper_done(self, tr):
+        job = tr["job"]
+        f = tr["f"]
+        plot = self.plots[f][tr["plot"]]
+        site = self.sites[f][tr["site"]] if tr["site"] is not None \
+            else None
+        if job == "set" and site is not None \
+                and site["state"] != "caught":
+            site["state"], site["since"] = "set", self.time
+        elif job == "check" and site is not None \
+                and site["state"] != "caught":
+            # A stale trap is lifted, not rebaited: else whoever set the
+            # sites first would hold them forever and the rest starve.
+            site.update(state="empty", by=None, since=self.time)
+        elif job == "collect" and site is not None:
+            if site["state"] == "caught":
+                tr["carry"] = "beaver"
+            site.update(state="empty", by=None, since=self.time)
+        elif job == "stash" and tr["carry"] == "beaver":
+            tr["pelts"] += 1
+            tr["meat"] += self.MEAT_PER_BEAVER
+            self.tally["pelts"] += 1
+        elif job == "chop" and self._standing(tr["tree"]):
+            self.trees[tr["tree"]].update(felled=self.time, by="trapper",
+                                          pile=0)
+            tr["logs"] += self.LOGS_PER_TREE
+        elif job == "build" and tr["logs"] > 0 \
+                and plot["logs"] < self.CABIN_LOGS:
+            tr["logs"] -= 1
+            plot["logs"] += 1
+        elif job == "fire" and tr["meat"] > 0:
+            tr["meat"] -= 1
+            tr["fed"] = 1.0
+            if tr["fuel"]:
+                tr["logs"] = max(0, tr["logs"] - 1)
+        if job == "stash":
+            tr["carry"] = None
+        if job != "set":
+            tr["site"] = None
+        tr["tree"], tr["fuel"] = None, False
+
+    def _chop_tree(self, tr):
+        """The nearest standing tree on his flank nobody is bound for,
+        woods before banks."""
+        home = ["plot", tr["f"], tr["plot"]]
+        taken = {o["tree"] for o in self.trappers + self.beavers
+                 if o is not tr}
+        best = None
+        for i, slot in enumerate(self.trees):
+            if slot["f"] != tr["f"] or i in taken or slot["felled"] \
+                    is not None and not self._standing(i):
+                continue
+            key = (slot["zone"] != "woods",
+                   self.distance(home, ["tree", i]))
+            if best is None or key < best[0]:
+                best = (key, i)
+        return None if best is None else best[1]
+
+    def _trapper_next(self, tr, cold):
+        """He weighs his needs and does the most pressing thing."""
+        f, k = tr["f"], tr["plot"]
+        home = ["plot", f, k]
+        plot = self.plots[f][k]
+        jit = self.rng.uniform
+        if tr["carry"] == "beaver":
+            self._go(tr, home, "stash", self.STASH_S)
+            return
+        hunger = 1 - tr["fed"]
+        ice = cold
+        urgency = self.urgency()
+        sites = self.sites[f]
+        caught = [j for j, st in enumerate(sites)
+                  if st["by"] == tr["id"] and st["state"] == "caught"]
+        free = [j for j, st in enumerate(sites) if st["by"] is None]
+        stale = [j for j, st in enumerate(sites) if st["by"] == tr["id"]
+                 and st["state"] == "set"
+                 and self.time - st["since"] >= self.BAIT_S]
+        beavers = sum(b["f"] == f for b in self.beavers)
+        trap = (self.TRAP_BASE + beavers / self.BEAVER_REF) * (1 - ice) \
+            * (1 + 2 * hunger)
+        scores = {"rest": self.REST_PULL}
+        if caught:
+            scores["collect"] = 1 + trap
+        if free and ice < 0.9:
+            scores["set"] = trap
+        if stale and ice < 0.9:
+            scores["check"] = trap * 1.1
+        if tr["meat"] >= 1:
+            scores["fire"] = 3 * hunger * hunger
+        unbuilt = self.CABIN_LOGS - plot["logs"]
+        need = unbuilt + self.WINTER_LOGS - tr["logs"]
+        tree = None
+        if need > 0:
+            tree = self._chop_tree(tr)
+            if tree is not None:
+                scores["chop"] = min(1.0, need / 8) * (0.15 + urgency)
+                if tr["meat"] >= 1 and tr["logs"] == 0:
+                    scores["chop"] += 2 * hunger
+        if tr["logs"] >= 1 and unbuilt > 0:
+            scores["build"] = (0.15 + urgency) * 1.2
+        if plot["logs"] >= self.CABIN_LOGS / 2:
+            scores["shelter"] = 2 * cold * plot["logs"] / self.CABIN_LOGS
+        for key in scores:
+            scores[key] *= jit(0.85, 1.15)
+        pick = max(scores, key=scores.get)
+        if pick == "collect":
+            tr["site"] = caught[0]
+            self._go(tr, ["site", f, caught[0]], "collect", self.COLLECT_S)
+        elif pick == "check":
+            tr["site"] = stale[0]
+            self._go(tr, ["site", f, stale[0]], "check", self.SET_S)
+        elif pick == "set":
+            j = self.rng.choice(free)
+            sites[j]["by"] = tr["id"]
+            tr["site"] = j
+            self._go(tr, ["site", f, j], "set", self.SET_S)
+        elif pick == "fire":
+            tr["fuel"] = tr["logs"] > 0
+            self._go(tr, home, "fire",
+                     self.FIRE_S * (1 if tr["fuel"] else 2))
+        elif pick == "chop":
+            tr["tree"] = tree
+            self._go(tr, ["tree", tree], "chop",
+                     self.CHOP_S * self.LOGS_PER_TREE)
+        elif pick == "build":
+            self._go(tr, home, "build", self.BUILD_S)
+        elif pick == "shelter":
+            self._go(tr, home, "shelter", self.SHELTER_S)
+        else:
+            self._go(tr, home, "rest", jit(3.0, 8.0))
+
+    EFFORT = {"set": "trap", "check": "trap", "collect": "trap",
+              "stash": "trap"}
+
+    def _go(self, tr, to, job, work):
+        self._send(tr, to, job, work, self.WALK_S)
+        key = self.EFFORT.get(job, job)
+        tr["effort"][key] = tr["effort"].get(key, 0.0) + tr["t2"] - \
+            self.time
+
+    def die(self, tr, cause):
+        """He falls where he is; the nearest survivor takes his goods."""
+        self.trappers.remove(tr)
+        here = tr["to"] if self.time >= tr["t1"] else tr["at"]
+        self.graves.append({"place": list(here), "t": self.time,
+                            "id": tr["id"]})
+        for st in self.sites[tr["f"]]:
+            if st["by"] == tr["id"]:
+                st.update(by=None, state="empty", since=self.time)
+        self.plots[tr["f"]][tr["plot"]]["owner"] = None
+        deaths = self.tally["deaths"]
+        deaths[cause] = deaths.get(cause, 0) + 1
+        if tr["winter"] is not None:
+            self._winter_over(tr, 1.0)
+        event = {"kind": "death", "id": tr["id"], "cause": cause,
+                 "claimant": None, "moved": 0, "before": 0, "after": 0}
+        self.tally["events"].append(event)
+        heir = self._inherit(tr)
+        if heir is not None:
+            event.update(claimant=heir[0], moved=heir[1], before=heir[2],
+                         after=heir[3])
+
+    @staticmethod
+    def stores(tr):
+        return tr["pelts"] + tr["meat"] + tr["logs"]
+
+    def _inherit(self, dead):
+        if not self.trappers:
+            return None
+        heir = min(self.trappers, key=lambda o: (
+            o["f"] != dead["f"], abs(self.PLOT_U[o["plot"]]
+                                     - self.PLOT_U[dead["plot"]])
+            if o["f"] == dead["f"] else 0, o["logs"] + o["meat"]))
+        before = self.stores(heir)
+        for key in ("pelts", "meat", "logs"):
+            heir[key] += dead[key]
+        theirs = self.plots[dead["f"]][dead["plot"]]
+        mine = self.plots[heir["f"]][heir["plot"]]
+        if theirs["logs"] > mine["logs"]:
+            mine["owner"] = None
+            theirs["owner"] = heir["id"]
+            moved = heir["f"] != dead["f"]
+            heir["f"], heir["plot"] = dead["f"], dead["plot"]
+            heir["site"] = None
+            if moved:
+                # No dry route crosses the grove: he drops his errand
+                # and comes in from his new flank's edge, as newcomers do.
+                heir["tree"], heir["fuel"] = None, False
+                heir["to"] = ["edge", dead["f"]]
+                self._go(heir, ["plot", dead["f"], dead["plot"]], "rest",
+                         1.0)
+            for row in self.sites:
+                for st in row:
+                    if st["by"] == heir["id"]:
+                        st.update(by=None, state="empty", since=self.time)
+        return heir["id"], self.stores(dead), before, self.stores(heir)
+
+    def _arrivals(self):
+        """Spring: newcomers drawn by the beavers, into free plots."""
+        free = [(f, k) for f in (0, 1) for k in range(len(self.PLOT_U))
+                if self.plots[f][k]["owner"] is None]
+        x = self.ARRIVE_K * len(self.beavers) / self.BEAVER_REF
+        n = int(x) + (self.rng.random() < x % 1)
+        if not self.trappers and n == 0:
+            n = 1
+            self.tally["rails"]["trappers"] += 1
+        n = min(n, len(free), self.TRAPPERS_MAX - len(self.trappers))
+        for _ in range(n):
+            per = [sum(tr["f"] == f for tr in self.trappers) for f in (0, 1)]
+            f, k = max(free, key=lambda p: (self.plots[p[0]][p[1]]["logs"],
+                                            -per[p[0]], -p[0]))
+            free.remove((f, k))
+            self._trapper(f, k, ["edge", f])
+            self.tally["arrivals"] += 1
+
     # -- reading it --
 
     def stats(self):
@@ -714,13 +1143,20 @@ class World:
             "lodges": sum(x["lodge"] >= self.LODGE_STICKS for x in c),
             "trees": sum(self.tree_state(i) == "tree"
                          for i in range(len(self.trees))),
+            "trappers": len(self.trappers),
+            "cabins": sum(p["logs"] >= self.CABIN_LOGS
+                          for row in self.plots for p in row),
+            "pelts": sum(tr["pelts"] for tr in self.trappers),
+            "effort": {tr["id"]: dict(tr["effort"])
+                       for tr in self.trappers},
             "tally": json.loads(json.dumps(self.tally)),
         }
 
     # -- saving --
 
     STATE = ("seed", "time", "next_tick", "season_n", "half_n", "next_id",
-             "trees", "colonies", "beavers", "empty_since", "tally")
+             "trees", "colonies", "beavers", "empty_since", "sites",
+             "plots", "trappers", "graves", "predators", "tally")
 
     def to_dict(self):
         d = {k: copy.deepcopy(getattr(self, k)) for k in self.STATE}
@@ -776,18 +1212,26 @@ def save_world(world, path):
 class CpuView(Gtk.DrawingArea):
     """Every physical core as a tile, each of its threads a live load bar.
 
-    The chip sits in open country with a river running across it, where a
-    beaver swims and dives. While the fort is up, the reserved cores stand
-    inside a log stockade, embers rising in their orange tiles; mountain
-    men watch from its towers and walk its wall, redcoats march on it down
-    trails from barracks in the far corners or come down the river in
-    boats, take cover behind boulders, and the sentries and the fort's gun
-    see them off. Most boats row on by, and the one walking the wall takes
-    shots at them as they pass; now and then one puts its men ashore at a
-    ford. While it is down, a grove grows there instead and those
-    cores look like every other; woods fill the land, two trappers work a
-    trap line along the banks and stack their pelts, and loose horses
-    graze. Which state it is in never depends on telling orange from blue.
+    The chip sits in open country with a river running across it, in a
+    valley that lives on its own (World): the seasons turn over the whole
+    picture, beavers fell trees along the banks and build dams and
+    lodges, and trappers trap them, chop and build cabins, cook at their
+    fires and sit out the winter, or die of it. The world runs on whether
+    the fort is up or down; this view only draws it.
+
+    While the fort is up, the reserved cores stand inside a log stockade,
+    embers rising in their orange tiles; mountain men watch from its
+    towers and walk its wall, redcoats march on it down trails from
+    barracks in the far corners or come down the river in boats, take
+    cover behind boulders, and the sentries and the fort's gun see them
+    off. Most boats row on by, and the one walking the wall takes shots at
+    them as they pass; now and then one puts its men ashore at a ford. The
+    river still shows the beavers' dams, ponds and lodges, and the beavers
+    swimming. While it is down, a grove grows there instead and those
+    cores look like every other; around it are the valley's woods, the
+    trappers at their work, their cabins, caches and graves, loose horses
+    grazing, and a small almanac of the season in the corner. Which state
+    it is in never depends on telling orange from blue.
     """
 
     COLS = 5
@@ -836,11 +1280,8 @@ class CpuView(Gtk.DrawingArea):
         self.boats = []                   # bateaux of redcoats on the river
         self.boat_in = 30.0
         self.boats_sent = 0
-        self.rng = random.Random(7)       # the wilds' only source of chance
+        self.rng = random.Random(7)       # the horses' only source of chance
         self.wild = None                  # the idle scene's layout, per size
-        self.sites = []                   # trap sites along the banks
-        self.trappers = []
-        self.pelts = [[0, 0], [0, 0]]     # per flank: pelts stacked, bales
         self.horses = []
         self.world = World(seed=7)
         self.time_scale = 1.0             # world seconds per real second
@@ -1090,7 +1531,8 @@ class CpuView(Gtk.DrawingArea):
                 or self.potshot is not None:
             self.walker_halted += dt
         if not self.on:
-            self._advance_wilds(dt)
+            if self.wild is not None:
+                self._advance_horses(dt)
             return
         self._advance_relief()
         self._advance_potshot()
@@ -1677,15 +2119,20 @@ class CpuView(Gtk.DrawingArea):
         cr.close_path()
 
     @staticmethod
-    def _text(cr, x, y, text, size, alpha, bold=False):
+    def _text(cr, x, y, text, size, alpha, bold=False, align="center"):
+        """Text with its baseline at y, centred on x or starting there;
+        returns how far it runs."""
         cr.select_font_face("Cantarell", cairo.FONT_SLANT_NORMAL,
                             cairo.FONT_WEIGHT_BOLD if bold
                             else cairo.FONT_WEIGHT_NORMAL)
         cr.set_font_size(size)
         ext = cr.text_extents(text)
-        cr.move_to(x - ext.width / 2 - ext.x_bearing, y)
+        left = x - ext.x_bearing if align == "left" \
+            else x - ext.width / 2 - ext.x_bearing
+        cr.move_to(left, y)
         cr.set_source_rgba(1, 1, 1, alpha)
         cr.show_text(text)
+        return ext.x_advance
 
     # -- the fort ---------------------------------------------------------
 
@@ -1773,7 +2220,8 @@ class CpuView(Gtk.DrawingArea):
     @staticmethod
     def _mountain_man(cr, x, feet, s, facing, step=0.0, shouldered=False,
                       glint=0.0, kneel=0.0, aim=0.0, shot=-1.0, bugle=0.0,
-                      toot=-1.0, elev=0.04, beaver=False):
+                      toot=-1.0, elev=0.04, beaver=False, axe=0.0,
+                      log=False):
         """A buckskin-clad mountain man with a coonskin cap and a long rifle.
 
         Drawn in a 100-unit-tall model with the feet at 0; facing is +1 for
@@ -1782,7 +2230,9 @@ class CpuView(Gtk.DrawingArea):
         fired, or negative if he has not. bugle runs 0..1 from his hip to
         his lips, and toot is the seconds since he began to blow it. elev is
         how far above level, in radians, he aims. beaver slings one over
-        his shoulder, hanging down his back.
+        his shoulder, hanging down his back, and log carries one on it.
+        axe above 0 puts an axe in his hands instead, raised behind him at
+        1 and swung through at 0, with the rifle slung across his back.
         """
         cr.save()
         cr.translate(x, feet)
@@ -1867,7 +2317,20 @@ class CpuView(Gtk.DrawingArea):
             return 9 - 82 * math.cos(angle), -56 - 82 * math.sin(angle)
 
         leg(-step, BUCK_DARK_RGB, False)
-        if shouldered:
+        if axe > 0:
+            # The rifle slung across his back while his hands are busy.
+            cr.set_source_rgb(*STEEL_RGB)
+            cr.set_line_width(2.2)
+            cr.move_to(-12, -40 + drop)
+            cr.line_to(10, -118 + drop)
+            cr.stroke()
+            cr.set_source_rgb(*RIFLE_WOOD_RGB)
+            cr.set_line_width(5)
+            cr.move_to(-14, -34 + drop)
+            cr.line_to(-8, -56 + drop)
+            cr.stroke()
+            tip = (10, -118 + drop)
+        elif shouldered:
             tip = rifle_shouldered()
         if beaver:
             cr.save()
@@ -1973,18 +2436,71 @@ class CpuView(Gtk.DrawingArea):
             cr.set_source_rgb(*SKIN_RGB)
             cr.arc(*grip, 3, 0, 2 * math.pi)
             cr.fill()
-        if not shouldered:
-            tip = rifle()
-        # The arm that holds the rifle.
-        cr.set_source_rgb(*BUCK_RGB)
-        cr.set_line_width(6)
-        cr.move_to(*shoulder)
-        hand = along(pose, 61 - 47 * aim) if not shouldered else (9, -56)
-        cr.line_to(*hand)
-        cr.stroke()
-        cr.set_source_rgb(*SKIN_RGB)
-        cr.arc(*hand, 3, 0, 2 * math.pi)
-        cr.fill()
+        if axe > 0:
+            # Both hands on the haft, swung from over his shoulder down
+            # into the trunk in front of him.
+            ang = -0.5 + 2.4 * (1 - axe)
+            dx, dy = math.sin(ang), -math.cos(ang)
+            hand = (shoulder[0] + dx * 24, shoulder[1] + dy * 24)
+            head = (hand[0] + dx * 30, hand[1] + dy * 30)
+            cr.set_source_rgb(*RIFLE_WOOD_RGB)
+            cr.set_line_width(3.5)
+            cr.move_to(hand[0] - dx * 6, hand[1] - dy * 6)
+            cr.line_to(*head)
+            cr.stroke()
+            cr.save()
+            cr.translate(*head)
+            cr.rotate(ang)
+            cr.set_source_rgb(*STEEL_RGB)
+            cr.move_to(-2, 2)
+            cr.line_to(12, -2)
+            cr.line_to(12, 8)
+            cr.line_to(-2, 5)
+            cr.close_path()
+            cr.fill()
+            cr.restore()
+            for start in ((4, -73 + drop), shoulder):
+                cr.set_source_rgb(*BUCK_RGB)
+                cr.set_line_width(6)
+                cr.move_to(*start)
+                cr.line_to(*hand)
+                cr.stroke()
+            cr.set_source_rgb(*SKIN_RGB)
+            cr.arc(*hand, 3.5, 0, 2 * math.pi)
+            cr.fill()
+        else:
+            if not shouldered:
+                tip = rifle()
+            # The arm that holds the rifle.
+            cr.set_source_rgb(*BUCK_RGB)
+            cr.set_line_width(6)
+            cr.move_to(*shoulder)
+            hand = along(pose, 61 - 47 * aim) if not shouldered \
+                else (9, -56)
+            cr.line_to(*hand)
+            cr.stroke()
+            cr.set_source_rgb(*SKIN_RGB)
+            cr.arc(*hand, 3, 0, 2 * math.pi)
+            cr.fill()
+        if log:
+            # A log across his shoulder, held there by the near hand.
+            cr.save()
+            cr.translate(2, -80 + drop)
+            cr.rotate(-0.12)
+            CpuView._rounded(cr, -30, -5, 60, 10, 5)
+            cr.set_source_rgb(*WOOD_RGB)
+            cr.fill_preserve()
+            cr.set_source_rgb(*SEAM_RGB)
+            cr.set_line_width(1.4)
+            cr.stroke()
+            cr.set_source_rgb(*WOOD_HI_RGB)
+            cr.save()
+            cr.translate(29, 0)
+            cr.scale(2.5, 5)
+            cr.arc(0, 0, 1, 0, 2 * math.pi)
+            cr.restore()
+            cr.fill()
+            cr.restore()
 
         if bugle > 0:
             # The far hand brings the bugle up from his hip to his lips,
@@ -3761,13 +4277,16 @@ class CpuView(Gtk.DrawingArea):
     # -- the wilds around the grove, while the fort is down ---------------
 
     def _lay_wilds(self, key, width, height, t, die, grove):
-        """Lay out the woods and the trappers' ground once per size: each
-        trapper keeps to one flank of the grove, with a cache of pelts on
-        the near bank, traps along both banks, and stepping stones across.
-        A flank too small for any of it simply goes without."""
-        s = t * 0.58
-        mud = self.river["half"] * 0.35 + 2
+        """Lay out the woods and the trappers' ground once per size: on each
+        flank of the grove the world's tree slots, its cabin plots (cabin,
+        fire, cache and woodpile) on the near bank, its trap sites along
+        both banks, and stepping stones across. A flank too small for any
+        of it simply goes without, though its world goes on."""
         gx0, gy0, gx1, gy1 = grove
+        # Narrow flanks get smaller figures rather than none at all.
+        room = min(gx0, width - gx1) - 0.1 * t
+        s = min(t * 0.58, max(t * 0.3, room / 2.4))
+        mud = self.river["half"] * 0.35 + 2
         floor = height * 0.94
 
         def bank(x0, x1, side):
@@ -3775,9 +4294,11 @@ class CpuView(Gtk.DrawingArea):
                   for x in (x0 + (x1 - x0) * k / 16 for k in range(17))]
             return max(ys) + mud if side > 0 else min(ys) - mud
 
-        flanks, sites, pastures = [], [], []
+        flanks, pastures = [], []
+        world = self.world
         for f in (0, 1):
-            fl = {"near": None, "far": None, "ford": None, "cache": None}
+            fl = {"near": None, "far": None, "ford": None, "sites": [],
+                  "plots": [], "edge": None}
             flanks.append(fl)
             x0, x1 = (0.0, gx0 - 0.1 * t) if f == 0 \
                 else (gx1 + 0.1 * t, float(width))
@@ -3797,51 +4318,71 @@ class CpuView(Gtk.DrawingArea):
                 continue
             xf = width * (0.11 if f == 0 else 0.89)
             if fl["far"] and x0 + 0.4 * s <= xf <= x1 - 0.4 * s:
-                fl["ford"] = ((xf, self._river_edge(xf, -1) - mud),
-                              (xf, self._river_edge(xf, 1) + mud))
+                ry, rh = self._river_y(xf), self._river_half_max(xf)
+                fl["ford"] = ((xf, ry - rh - mud), (xf, ry + rh + mud))
             nx0, ny0, nx1, ny1 = fl["near"]
-            fl["cache"] = ((nx0 + nx1) / 2, ny0 + (ny1 - ny0) * 0.5)
-            if ny1 - ny0 >= 2.6 * s:
-                pastures.append((nx0 + 0.3 * s, ny0 + (ny1 - ny0) * 0.7,
+            H = ny1 - ny0
+            fl["edge"] = (nx0 + 0.15 * s if f == 0 else nx1 - 0.15 * s,
+                          ny0 + 0.45 * H)
+            if H >= 3.2 * s:
+                pastures.append((nx0 + 0.3 * s, ny0 + H * 0.84,
                                  nx1 - 0.3 * s, ny1 - 0.4 * s))
-            xf = fl["ford"][0][0] if fl["ford"] else None
-            spots = []
-            for u in (0.0, 1.0, 0.5):
-                x = nx0 + 0.4 * s + (nx1 - nx0 - 0.8 * s) * u
-                if len(spots) < 2 and all(abs(x - o) >= 0.9 * s for o in
-                                          [o for o, _ in spots] + [xf]
-                                          if o is not None):
-                    spots.append((x, 1))
-            if fl["ford"]:
-                cx0, _, cx1, _ = fl["far"]
-                x = max((cx0 + 0.4 * s + (cx1 - cx0 - 0.8 * s) * u
-                         for u in (0.15, 0.5, 0.85)),
-                        key=lambda x: abs(x - xf))
-                spots.append((x, -1))
-            for k, (x, side) in enumerate(spots):
-                face = 1 if k % 2 == 0 else -1
-                y = self._river_edge(x, side) + side * mud * 0.6
+            # A trap site at each of the world's spots on this flank; one
+            # across the river with no ford to reach it is set on this
+            # bank instead.
+            for k, (side, u) in enumerate(world.SITE_SPOTS):
+                if side < 0 and fl["ford"] is None:
+                    side = 1
+                rx0, _, rx1, _ = fl["near"] if side > 0 else fl["far"]
+                x = rx0 + 0.4 * s + (rx1 - rx0 - 0.8 * s) * u
+                if fl["ford"] and abs(x - xf) < 0.9 * s:
+                    x = xf + (0.9 * s if u >= 0.5 else -0.9 * s)
+                    x = min(rx1 - 0.4 * s, max(rx0 + 0.4 * s, x))
+                face = 1 if u < 0.5 else -1
+                y = self._river_y(x) + side * (self._river_half_max(x)
+                                               + mud * 0.6)
                 stand = x - face * 0.42 * s
-                if not (x0 + 0.2 * s <= min(x, stand)
-                        and max(x, stand) <= x1 - 0.2 * s):
+                if not rx0 + 0.2 * s <= stand <= rx1 - 0.2 * s:
                     face = -face
                     stand = x - face * 0.42 * s
-                sites.append({"flank": f, "x": x, "y": y, "bank": side,
-                              "face": face, "stand": (stand, y + side
-                                                      * 0.12 * s),
-                              "state": "empty", "since": 0.0,
-                              "catch_in": 0.0})
+                fl["sites"].append({"x": x, "y": y, "bank": side,
+                                    "face": face,
+                                    "stand": (stand, y + side * 0.12 * s)})
+            # Each cabin plot, staggered so the nearer cabin does not
+            # stand in front of the other.
+            for k, u in enumerate(world.PLOT_U):
+                cx = nx0 + 0.5 * s + (nx1 - nx0 - 1.0 * s) * u
+                cy = ny0 + H * (0.55 if k == 0 else 0.72)
+                cy = min(cy, ny1 - 0.2 * s)
+                side = 1 if cx < (nx0 + nx1) / 2 else -1
+
+                def inside(dx, dy):
+                    return (min(nx1 - 0.35 * s,
+                                max(nx0 + 0.35 * s, cx + dx * s)),
+                            cy + dy * s)
+
+                fl["plots"].append({
+                    "cabin": (cx, cy), "door": inside(0.1, 0.12),
+                    "wall": inside(-side * 0.5, 0.08),
+                    "fire": inside(side * 0.6, 0.45),
+                    "cache": inside(-side * 0.5, 0.42),
+                    "pile": inside(side * 0.78, 0.03), "side": side})
         if floor - gy1 >= 1.2 * s:
             pastures.append((gx0 + 0.3 * s, gy1 + 0.6 * s, gx1 - 0.3 * s,
                              floor - 0.1 * s))
 
         # Points the woods must leave in plain view: (x, feet, half width,
         # height) of whatever stands there.
-        keep = [(st["stand"][0], st["stand"][1], 0.5 * s, s) for st in sites]
-        keep += [(st["x"], st["y"], 0.7 * s, 0.8 * s) for st in sites]
-        keep += [(fl["cache"][0], fl["cache"][1], 0.9 * s, s)
-                 for fl in flanks if fl["cache"]]
+        keep = []
         for fl in flanks:
+            for st in fl["sites"]:
+                keep += [(st["stand"][0], st["stand"][1], 0.5 * s, s),
+                         (st["x"], st["y"], 0.7 * s, 0.8 * s)]
+            for pl in fl["plots"]:
+                keep += [(pl["cabin"][0], pl["cabin"][1], 0.75 * s,
+                          1.3 * s),
+                         (pl["fire"][0], pl["fire"][1], 0.4 * s, s),
+                         (pl["cache"][0], pl["cache"][1], 0.5 * s, s)]
             if fl["ford"]:
                 (xf, ya), (_, yb) = fl["ford"]
                 keep += [(xf, ya + (yb - ya) * k / 4, 0.6 * s, s)
@@ -3894,16 +4435,6 @@ class CpuView(Gtk.DrawingArea):
         self.wild = {"key": key, "s": s, "t": t, "mud": mud, "trees": trees,
                      "tree_at": tree_at, "flanks": flanks,
                      "pastures": pastures, "grove": grove}
-        self.sites = sites
-        self.trappers = []
-        for f, fl in enumerate(flanks):
-            if fl["near"] is not None:
-                x, y = self._cache_stand(f)
-                self.trappers.append({
-                    "flank": f, "x": x, "y": y, "facing": -1, "job": "rest",
-                    "route": [], "then": None, "began": self.phase,
-                    "until": self.phase + 1.0 + f, "carry": False,
-                    "site": None})
         self.horses = []
         if not pastures:
             return
@@ -3921,133 +4452,105 @@ class CpuView(Gtk.DrawingArea):
                 "graze": 1, "graze_k": 1.0, "dest": None,
                 "next_at": self.phase + self.rng.uniform(1.0, 6.0)})
 
-    # The trap line: how long each piece of work takes him, kneeling.
-    JOB_S = {"set": 3.0, "collect": 2.5, "stash": 2.0}
     PELT_BALE = 5       # pelts on the stack before he ties them in a bale
     BALE_MAX = 3
 
-    def _cache_stand(self, f):
-        x, y = self.wild["flanks"][f]["cache"]
-        return x + 0.75 * self.wild["s"], y + 0.05 * self.wild["s"]
+    def _spot(self, f, place, job):
+        """Where on flank f's ground a trapper stands for job at place, or
+        None if the picture has no room for it."""
+        fl = self.wild["flanks"][f]
+        if fl["near"] is None:
+            return None
+        kind = place[0]
+        if kind == "plot":
+            pl = fl["plots"][place[2]]
+            key = {"build": "wall", "stash": "cache", "fire": "fire"}.get(
+                job, "door")
+            x, y = pl[key]
+            if key == "fire":
+                return x - pl["side"] * 0.35 * self.wild["s"], y
+            if key == "cache":
+                return x + pl["side"] * 0.5 * self.wild["s"], y + 0.05 \
+                    * self.wild["s"]
+            return x, y
+        if kind == "site":
+            return fl["sites"][place[2]]["stand"]
+        if kind == "tree":
+            spot = self.wild["tree_at"].get(place[1])
+            if spot is None:
+                return None
+            x, base, h = spot[:3]
+            nx0, _, nx1, _ = fl["near"]
+            side = 1 if x < (nx0 + nx1) / 2 else -1
+            return x + side * (0.12 * h + 0.3 * self.wild["s"]), \
+                base + 0.04 * self.wild["s"]
+        if kind == "edge":
+            return fl["edge"]
+        return None
 
-    def _stash(self, f):
-        pelts, bales = self.pelts[f]
-        pelts += 1
-        if pelts >= self.PELT_BALE:
-            pelts, bales = 0, min(bales + 1, self.BALE_MAX)
-        self.pelts[f] = [pelts, bales]
-
-    def _route(self, tr, dest):
-        """Waypoints from where he stands to dest that keep to dry land:
-        along his own flank, over the river only on its stones."""
-        fl = self.wild["flanks"][tr["flank"]]
+    def _route(self, f, a, b):
+        """Waypoints from a to b that keep to dry land: along flank f, over
+        the river only on its stones."""
+        fl = self.wild["flanks"][f]
 
         def bank(x, y):
             return 1 if y > self._river_y(x) else -1
 
-        def leg(a, b, side):
+        def leg(p, q, side):
             # Above the near rect's top (below the far rect's bottom) the
             # bank curves; going straight down to it and along is dry.
-            lim = fl["near"][1] if side > 0 else fl["far"][3]
+            rect = fl["near"] if side > 0 else fl["far"]
+            if rect is None:
+                return [q]
+            lim = rect[1] if side > 0 else rect[3]
             pts = []
-            if (a[1] - lim) * side < 0:
-                pts.append((a[0], lim))
-            if (b[1] - lim) * side < 0:
-                pts.append((b[0], lim))
-            return pts + [b]
+            if (p[1] - lim) * side < 0:
+                pts.append((p[0], lim))
+            if (q[1] - lim) * side < 0:
+                pts.append((q[0], lim))
+            return pts + [q]
 
-        here = (tr["x"], tr["y"])
-        side = bank(*here)
-        if bank(*dest) == side or fl["ford"] is None:
-            return leg(here, dest, side)
+        side = bank(*a)
+        if bank(*b) == side or fl["ford"] is None:
+            return [a] + leg(a, b, side)
         mine, theirs = fl["ford"] if side < 0 else fl["ford"][::-1]
-        return leg(here, mine, side) + leg(theirs, dest, -side)
+        return [a] + leg(a, mine, side) + leg(theirs, b, -side)
 
-    def _go(self, tr, dest, then, site=None):
-        tr["route"] = self._route(tr, dest)
-        tr["then"], tr["site"] = then, site
-
-    def _trapper_next(self, tr):
-        """Pick his next errand: a pelt to stash, a beaver to collect, a
-        trap to set, or a stroll and a rest."""
-        f = tr["flank"]
-        mine = [st for st in self.sites if st["flank"] == f]
-        caught = [st for st in mine if st["state"] == "caught"]
-        empty = [st for st in mine if st["state"] == "empty"]
-        if tr["carry"]:
-            self._go(tr, self._cache_stand(f), "stash")
-        elif caught:
-            self._go(tr, caught[0]["stand"], "collect", caught[0])
-        elif empty and self.rng.random() < 0.7:
-            st = self.rng.choice(empty)
-            self._go(tr, st["stand"], "set", st)
-        elif self.rng.random() < 0.45:
-            self._start(tr, "rest")
-        else:
-            fl = self.wild["flanks"][f]
-            s = self.wild["s"]
-            rects = [fl["near"]] * 2 + ([fl["far"]] if fl["ford"] else [])
-            x0, y0, x1, y1 = self.rng.choice(rects)
-            dest = (self.rng.uniform(x0 + 0.4 * s, max(x0 + 0.4 * s,
-                                                       x1 - 0.4 * s)),
-                    self.rng.uniform(y0 + 0.1 * s, max(y0 + 0.1 * s,
-                                                       y1 - 0.1 * s)))
-            self._go(tr, dest, "rest")
-
-    def _start(self, tr, job):
-        tr["job"], tr["began"] = job, self.phase
-        tr["until"] = self.phase + self.JOB_S.get(
-            job, self.rng.uniform(3.0, 8.0))
-        st = tr["site"]
-        if st is not None and job in ("set", "collect"):
-            tr["facing"] = st["face"]
-            if job == "set":
-                st["state"], st["since"] = "setting", self.phase
-        elif job == "stash":
-            tr["facing"] = -1
-
-    def _finish(self, tr):
-        st = tr["site"]
-        if tr["job"] == "set" and st is not None:
-            st["state"], st["since"] = "set", self.phase
-            st["catch_in"] = self.rng.uniform(15.0, 35.0)
-        elif tr["job"] == "collect" and st is not None:
-            st["state"] = "empty"
-            tr["carry"] = True
-        elif tr["job"] == "stash":
-            tr["carry"] = False
-            self._stash(tr["flank"])
-        tr["site"] = None
-
-    def _advance_wilds(self, dt):
-        """Step the idle scene: traps that catch, and trappers that walk
-        their line and work it."""
-        if self.wild is None:
-            return
-        for st in self.sites:
-            if st["state"] == "set" and \
-                    self.phase - st["since"] >= st["catch_in"]:
-                st["state"], st["since"] = "caught", self.phase
-        self._advance_horses(dt)
-        speed = self.wild["t"] * 0.55
-        for tr in self.trappers:
-            if tr["route"]:
-                tx, ty = tr["route"][0]
-                dx, dy = tx - tr["x"], ty - tr["y"]
-                dist = math.hypot(dx, dy)
-                if abs(dx) > 0.5:
-                    tr["facing"] = 1 if dx > 0 else -1
-                if dist <= speed * dt:
-                    tr["x"], tr["y"] = tx, ty
-                    tr["route"].pop(0)
-                    if not tr["route"]:
-                        self._start(tr, tr["then"])
-                else:
-                    tr["x"] += dx / dist * speed * dt
-                    tr["y"] += dy / dist * speed * dt
-            elif self.phase >= tr["until"]:
-                self._finish(tr)
-                self._trapper_next(tr)
+    def _trapper_xy(self, tr):
+        """Where trapper tr is drawn now: (x, feet, facing, walking), or
+        None if he is out of the picture."""
+        f, t = tr["f"], self.world.time
+        b = self._spot(f, tr["to"], tr["job"])
+        if b is None:
+            return None
+        if t >= tr["t1"]:
+            face = self.wild["flanks"][f]["sites"][tr["to"][2]]["face"] \
+                if tr["to"][0] == "site" else 1
+            if tr["to"][0] == "plot":
+                pl = self.wild["flanks"][f]["plots"][tr["to"][2]]
+                face = pl["side"] if tr["job"] == "fire" else -pl["side"]
+            elif tr["to"][0] == "tree":
+                face = 1 if self.wild["tree_at"][tr["to"][1]][0] > b[0] \
+                    else -1
+            return b[0], b[1], face, False
+        a = self._spot(f, tr["at"], "rest")
+        if a is None:
+            a = b
+        pts = self._route(f, a, b)
+        lens = [math.hypot(q[0] - p[0], q[1] - p[1])
+                for p, q in zip(pts, pts[1:])]
+        total = sum(lens)
+        p = (t - tr["t0"]) / max(1e-9, tr["t1"] - tr["t0"])
+        go = min(1.0, max(0.0, p)) * total
+        for j, ln in enumerate(lens):
+            p0, p1 = pts[j], pts[j + 1]
+            if go <= ln or j == len(lens) - 1:
+                k = go / ln if ln > 0 else 1.0
+                face = 1 if p1[0] >= p0[0] else -1
+                return (p0[0] + (p1[0] - p0[0]) * min(1.0, k),
+                        p0[1] + (p1[1] - p0[1]) * min(1.0, k), face, True)
+            go -= ln
+        return b[0], b[1], 1, True
 
     HORSE_COATS = ((HORSE_RGB, HORSE_DARK_RGB),
                    (HORSE_GREY_RGB, HORSE_GREY_DARK_RGB),
@@ -4147,18 +4650,45 @@ class CpuView(Gtk.DrawingArea):
     def _wild_items(self):
         """Everything in the idle picture's woods and pastures, as (feet,
         layer, draw, arg), to be drawn nearest last."""
+        world = self.world
         items = [(tree[1], 0, self._draw_slot, tree)
                  for tree in self.wild["trees"]]
-        for b in self.world.beavers:
+        for b in world.beavers:
             pose = self._beaver_pose(b)
             if pose[0] == "bank":
                 items.append((pose[2], 1, self._draw_bank_beaver,
                               (b,) + pose))
-        items += [(st["y"], 1, self._draw_site, st) for st in self.sites]
-        items += [(fl["cache"][1], 1, self._draw_cache, f)
-                  for f, fl in enumerate(self.wild["flanks"]) if fl["cache"]]
-        items += [(tr["y"], 2, self._draw_trapper, tr)
-                  for tr in self.trappers]
+        for f, fl in enumerate(self.wild["flanks"]):
+            for k, st in enumerate(fl["sites"]):
+                items.append((st["y"], 1, self._draw_site, (f, k, st)))
+            for k, pl in enumerate(fl["plots"]):
+                plot = world.plots[f][k]
+                owner = next((tr for tr in world.trappers
+                              if tr["id"] == plot["owner"]), None)
+                items.append((pl["cabin"][1], 1, self._draw_cabin,
+                              (pl, plot, owner)))
+                if owner is not None:
+                    items.append((pl["cache"][1], 1, self._draw_cache,
+                                  (pl, owner)))
+                    items.append((pl["pile"][1], 1, self._draw_woodpile,
+                                  (pl, owner)))
+                    if owner["job"] == "fire" and \
+                            owner["to"] == ["plot", f, k] and \
+                            world.time >= owner["t1"]:
+                        items.append((pl["fire"][1], 1, self._draw_fire,
+                                      (pl, owner)))
+        for g in world.graves:
+            f = g["place"][1] if g["place"][0] in ("plot", "site", "edge") \
+                else world.trees[g["place"][1]]["f"] \
+                if g["place"][0] == "tree" else None
+            spot = f is not None and self._spot(f, g["place"], "rest")
+            if spot:
+                items.append((spot[1], 1, self._draw_grave, (spot, g)))
+        for tr in world.trappers:
+            at = self._trapper_xy(tr)
+            if at is not None and not (tr["job"] == "shelter"
+                                       and world.time >= tr["t1"]):
+                items.append((at[1], 2, self._draw_trapper, (tr, at)))
         items += [(hs["y"], 2, self._draw_horse, hs) for hs in self.horses]
         return items
 
@@ -4254,36 +4784,57 @@ class CpuView(Gtk.DrawingArea):
                 cr.arc(x + dx * h, base + dy * h, h * 0.15, 0, 2 * math.pi)
                 cr.fill()
 
-    def _draw_trapper(self, cr, tr):
-        walking = bool(tr["route"])
-        kneel = 0.0
-        if not walking and tr["job"] in self.JOB_S:
-            kneel = self._ramp(self.phase - tr["began"], 0.0, 0.4) \
-                - self._ramp(self.phase, tr["until"] - 0.4, tr["until"])
-        step = math.sin(self.phase * 7.0 + tr["flank"]) * 0.38 \
+    def _draw_trapper(self, cr, args):
+        """A trapper at whatever he is about: walking with his rifle on his
+        shoulder (a beaver on his back, or a log, if he carries one),
+        kneeling at a trap, his cache, his wall or his fire, swinging an
+        axe at a tree, or standing at ease looking about him."""
+        tr, (x, feet, facing, walking) = args
+        t, job = self.world.time, tr["job"]
+        kneel = axe = 0.0
+        if not walking:
+            into, left = t - tr["t1"], tr["t2"] - t
+            if job in ("set", "check", "collect", "stash", "fire", "build"):
+                kneel = self._ramp(into, 0.0, 0.6) \
+                    * (1 - self._ramp(-left, -0.6, 0.0))
+            elif job == "chop":
+                axe = 0.05 + 0.95 * (0.5 + 0.5 * math.sin(
+                    self.phase * 4.2 + tr["id"]))
+            elif job == "rest" and int(into / 2.5) % 2:
+                facing = -facing  # looks about him
+        step = math.sin(self.phase * 7.0 + tr["id"]) * 0.38 \
             if walking else 0.0
-        facing = tr["facing"]
-        if tr["job"] == "rest" and not walking and \
-                int((self.phase - tr["began"]) / 2.5) % 2:
-            facing = -facing  # looks about him
-        self._mountain_man(cr, tr["x"], tr["y"], self.wild["s"], facing,
-                           step=step, shouldered=walking, kneel=kneel,
-                           beaver=tr["carry"])
+        self._mountain_man(cr, x, feet, self.wild["s"], facing,
+                           step=step, shouldered=walking and job != "build",
+                           kneel=kneel, axe=axe,
+                           beaver=walking and job == "stash"
+                           and tr["carry"] == "beaver",
+                           log=walking and job == "build")
 
-    def _draw_site(self, cr, st):
+    def _draw_site(self, cr, args):
         """A trap at the water's edge: its stake in the bank, the chain
         running into the water and a float stick marking the jaws; once it
         has caught, the beaver thrashing on it."""
-        state = st["state"]
+        f, k, st = args
+        world = self.world
+        site = world.sites[f][k]
+        state = site["state"]
+        here = ["site", f, k]
+        working = next((tr for tr in world.trappers if tr["to"] == here
+                        and world.time >= tr["t1"]
+                        and tr["job"] in ("set", "collect")), None)
+        u = 1.0
         if state == "empty":
-            return
+            if working is None or working["job"] != "set":
+                return
+            u = min(1.0, (world.time - working["t1"])
+                    / max(1e-9, working["t2"] - working["t1"]))
         s = self.wild["s"]
         x, side = st["x"], st["bank"]
         edge = self._river_edge(x, side)
         rh = self._river_half(x)
         if state == "caught":
-            busy = any(tr["site"] is st and not tr["route"]
-                       for tr in self.trappers)
+            busy = working is not None
             fight = 0.0 if busy else math.sin(self.phase * 12 + x) * 0.35
             bx = x + st["face"] * 0.25 * s
             by = edge - side * rh * 0.25 + (0.12 * s if side > 0 else 0)
@@ -4298,8 +4849,6 @@ class CpuView(Gtk.DrawingArea):
         cr.set_line_width(max(1.0, s * 0.06))
         # While he sets it, the stake goes in a blow at a time, and the
         # jaws go out on their chain once it holds.
-        u = 1.0 if state != "setting" else min(1.0, (
-            self.phase - st["since"]) / self.JOB_S["set"])
         cr.move_to(*stake)
         cr.line_to(stake[0] - st["face"] * 0.08 * s,
                    stake[1] - 0.32 * s * (1.6 - 0.6 * math.floor(u * 4) / 4))
@@ -4307,11 +4856,11 @@ class CpuView(Gtk.DrawingArea):
         if u < 0.6:
             return
         cr.set_source_rgb(*IRON_RGB)
-        for k in range(1, 5):
-            u = k / 5
-            sag = math.sin(u * math.pi) * 0.04 * s
-            cr.arc(stake[0] + (jaws[0] - stake[0]) * u,
-                   stake[1] + (jaws[1] - stake[1]) * u + sag,
+        for j in range(1, 5):
+            v = j / 5
+            sag = math.sin(v * math.pi) * 0.04 * s
+            cr.arc(stake[0] + (jaws[0] - stake[0]) * v,
+                   stake[1] + (jaws[1] - stake[1]) * v + sag,
                    max(0.5, s * 0.025), 0, 2 * math.pi)
             cr.fill()
         if state != "caught":
@@ -4331,9 +4880,242 @@ class CpuView(Gtk.DrawingArea):
             cr.restore()
             cr.stroke()
 
-    def _draw_cache(self, cr, f):
-        x, y = self.wild["flanks"][f]["cache"]
-        self._cache(cr, x, y, self.wild["s"], *self.pelts[f])
+    def _draw_cabin(self, cr, args):
+        """A cabin as far as it is built, smoke from its chimney while its
+        owner sits by the hearth inside."""
+        pl, plot, owner = args
+        world = self.world
+        inside = owner is not None and owner["job"] == "shelter" \
+            and world.time >= owner["t1"]
+        x, base = pl["cabin"]
+        self._cabin(cr, x, base, self.wild["s"], plot["logs"],
+                    world.CABIN_LOGS, self.phase if inside else -1.0,
+                    self.look["winter"])
+
+    def _draw_cache(self, cr, args):
+        pl, owner = args
+        x, y = pl["cache"]
+        pelts = owner["pelts"]
+        bales = min(self.BALE_MAX, pelts // self.PELT_BALE)
+        loose = pelts - bales * self.PELT_BALE
+        self._cache(cr, x, y, self.wild["s"] * 0.8,
+                    min(loose, self.PELT_BALE * 2), bales)
+
+    def _draw_woodpile(self, cr, args):
+        """His logs in hand, stacked by the cabin."""
+        pl, owner = args
+        n = min(owner["logs"], 10)
+        if n <= 0:
+            return
+        x, y = pl["pile"]
+        s = self.wild["s"]
+        r = s * 0.07
+        k = 0
+        row = 0
+        while k < n:
+            across = max(1, 4 - row)
+            for j in range(across):
+                if k >= n:
+                    break
+                cx = x + (j - (across - 1) / 2) * r * 2.1
+                cy = y - r - row * r * 1.8
+                cr.set_source_rgb(*WOOD_RGB)
+                cr.arc(cx, cy, r, 0, 2 * math.pi)
+                cr.fill()
+                cr.set_source_rgb(*WOOD_HI_RGB)
+                cr.arc(cx, cy, r * 0.55, 0, 2 * math.pi)
+                cr.fill()
+                k += 1
+            row += 1
+
+    def _draw_fire(self, cr, args):
+        pl, owner = args
+        x, y = pl["fire"]
+        t = self.world.time
+        e = (t - owner["t1"]) / max(1e-9, owner["t2"] - owner["t1"])
+        self._campfire(cr, x, y, self.wild["s"], self.phase,
+                       cooking=e < 0.8, lit=min(1.0, e * 6, (1 - e) * 4))
+
+    def _draw_grave(self, cr, args):
+        (x, y), g = args
+        age = (self.world.time - g["t"]) / self.world.GRAVE_S
+        self._grave(cr, x, y, self.wild["s"], age)
+
+    @staticmethod
+    def _cabin(cr, x, base, s, logs, total, smoke, snow):
+        """A log cabin about 1.1s wide, raised a log at a time: courses of
+        wall to total - 2, then the roof, then the stone chimney. smoke is
+        the phase to draw chimney smoke at, or negative for none; snow
+        (0..1) lies on the roof."""
+        if logs <= 0:
+            # The plot pegged out, waiting.
+            cr.set_source_rgba(*PATH_RGB, 0.6)
+            cr.save()
+            cr.translate(x, base)
+            cr.scale(0.6 * s, 0.12 * s)
+            cr.arc(0, 0, 1, 0, 2 * math.pi)
+            cr.restore()
+            cr.fill()
+            return
+        walls = total - 2
+        w, wall_h = 1.1 * s, 0.5 * s
+        lh = wall_h / walls
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_source_rgba(0, 0, 0, 0.25)
+        cr.save()
+        cr.translate(x, base)
+        cr.scale(0.62 * s, 0.1 * s)
+        cr.arc(0, 0, 1, 0, 2 * math.pi)
+        cr.restore()
+        cr.fill()
+        courses = min(logs, walls)
+        for j in range(courses):
+            y = base - (j + 1) * lh
+            CpuView._rounded(cr, x - w / 2 - lh * 0.3, y, w + lh * 0.6, lh,
+                             lh / 2)
+            cr.set_source_rgb(*(WOOD_RGB if j % 2 else WOOD_HI_RGB))
+            cr.fill_preserve()
+            cr.set_source_rgb(*SEAM_RGB)
+            cr.set_line_width(max(0.6, lh * 0.12))
+            cr.stroke()
+        if courses >= 3:
+            # The door, and a window once the walls are up.
+            cr.set_source_rgb(*SEAM_RGB)
+            dh = min(courses, 5) * lh
+            cr.rectangle(x - w * 0.08, base - dh, w * 0.2, dh)
+            cr.fill()
+        if courses >= walls:
+            lit = smoke >= 0
+            cr.set_source_rgb(*(WINDOW_RGB if lit else SEAM_RGB))
+            cr.rectangle(x + w * 0.22, base - wall_h * 0.72, w * 0.16,
+                         wall_h * 0.28)
+            cr.fill()
+        top = base - courses * lh
+        if logs >= total - 1:
+            cr.move_to(x - w / 2 - s * 0.12, top)
+            cr.line_to(x, top - s * 0.42)
+            cr.line_to(x + w / 2 + s * 0.12, top)
+            cr.close_path()
+            cr.set_source_rgb(*ROOF_RGB)
+            cr.fill_preserve()
+            cr.set_source_rgb(*SEAM_RGB)
+            cr.set_line_width(max(0.6, s * 0.02))
+            cr.stroke()
+            if snow > 0.01:
+                cr.move_to(x - w / 2 - s * 0.12, top)
+                cr.line_to(x, top - s * 0.42)
+                cr.line_to(x + w / 2 + s * 0.12, top)
+                cr.line_to(x + w / 2 + s * 0.02, top - s * 0.05)
+                cr.line_to(x, top - s * 0.34)
+                cr.line_to(x - w / 2 - s * 0.02, top - s * 0.05)
+                cr.close_path()
+                cr.set_source_rgba(*SNOW_RGB, 0.95 * snow)
+                cr.fill()
+        if logs >= total:
+            cx, cw = x + w * 0.3, s * 0.13
+            for j in range(4):
+                cr.set_source_rgb(*(STONE_RGB if j % 2 else STONE_DARK_RGB))
+                cr.rectangle(cx - cw / 2, top - s * 0.12 * (j + 2),
+                             cw, s * 0.12)
+                cr.fill()
+            if smoke >= 0:
+                cy = top - s * 0.5
+                for j in range(4):
+                    u = (smoke * 0.35 + j / 4) % 1.0
+                    cr.set_source_rgba(*SMOKE_RGB, 0.55 * (1 - u))
+                    cr.arc(cx + math.sin(u * 3 + j) * s * 0.08 + u * s * 0.2,
+                           cy - u * s * 0.9, s * (0.06 + 0.12 * u), 0,
+                           2 * math.pi)
+                    cr.fill()
+
+    @staticmethod
+    def _campfire(cr, x, y, s, phase, cooking=True, lit=1.0):
+        """A ring of stones, crossed sticks and flickering flames, with a
+        haunch roasting on a spit over it when cooking; lit (0..1) is how
+        well it is burning."""
+        r = s * 0.22
+        CpuView._glow(cr, x, y - r * 0.4, s * 0.9 * lit, FLASH_RGB,
+                      0.35 * lit)
+        for j in range(7):
+            a = j / 7 * 2 * math.pi
+            cr.set_source_rgb(*(STONE_RGB if j % 2 else STONE_DARK_RGB))
+            cr.arc(x + math.cos(a) * r, y + math.sin(a) * r * 0.35,
+                   r * 0.22, 0, 2 * math.pi)
+            cr.fill()
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_source_rgb(*TRUNK_RGB)
+        cr.set_line_width(max(1.0, s * 0.05))
+        for d in (-1, 1):
+            cr.move_to(x - d * r * 0.7, y + r * 0.1)
+            cr.line_to(x + d * r * 0.7, y - r * 0.25)
+            cr.stroke()
+        if lit > 0.02:
+            for j in range(3):
+                flick = 0.75 + 0.25 * math.sin(phase * 11 + j * 2.1)
+                fh = s * 0.32 * lit * flick * (1 - 0.25 * abs(j - 1))
+                fx = x + (j - 1) * r * 0.35
+                cr.move_to(fx - r * 0.3, y - r * 0.1)
+                cr.curve_to(fx - r * 0.3, y - fh * 0.5, fx, y - fh * 0.7,
+                            fx + math.sin(phase * 7 + j) * r * 0.15,
+                            y - fh)
+                cr.curve_to(fx, y - fh * 0.6, fx + r * 0.3, y - fh * 0.4,
+                            fx + r * 0.3, y - r * 0.1)
+                cr.close_path()
+                cr.set_source_rgba(*(FLASH_RGB if j == 1 else FORT_RGB),
+                                   0.9)
+                cr.fill()
+        if cooking:
+            # Forked sticks either side and the spit across.
+            sy = y - s * 0.42
+            cr.set_source_rgb(*RIFLE_WOOD_RGB)
+            cr.set_line_width(max(0.8, s * 0.03))
+            for d in (-1, 1):
+                cr.move_to(x + d * r * 1.3, y + r * 0.1)
+                cr.line_to(x + d * r * 1.3, sy)
+                cr.line_to(x + d * r * 1.45, sy - s * 0.06)
+                cr.move_to(x + d * r * 1.3, sy)
+                cr.line_to(x + d * r * 1.15, sy - s * 0.06)
+            cr.move_to(x - r * 1.6, sy)
+            cr.line_to(x + r * 1.6, sy)
+            cr.stroke()
+            cr.save()
+            cr.translate(x, sy + s * 0.02)
+            cr.rotate(phase * 1.5)
+            cr.scale(s * 0.13, s * 0.08)
+            cr.arc(0, 0, 1, 0, 2 * math.pi)
+            cr.restore()
+            cr.set_source_rgb(*PELT_DARK_RGB)
+            cr.fill()
+
+    @staticmethod
+    def _grave(cr, x, base, s, age):
+        """A mound and a wooden cross where a trapper fell; age runs 0..1
+        over the years it takes to lean, grey and fade away."""
+        if age >= 1:
+            return
+        fade = 1 - age * age
+        cr.set_source_rgba(*MUD_RGB, 0.8 * fade)
+        cr.save()
+        cr.translate(x, base)
+        cr.scale(0.4 * s, 0.1 * s)
+        cr.arc(0, 0, 1, math.pi, 2 * math.pi)
+        cr.restore()
+        cr.fill()
+        cr.save()
+        cr.translate(x, base - 0.05 * s)
+        cr.rotate(0.35 * age)
+        grey = (WOOD_RGB[0] + (STONE_RGB[0] - WOOD_RGB[0]) * age,
+                WOOD_RGB[1] + (STONE_RGB[1] - WOOD_RGB[1]) * age,
+                WOOD_RGB[2] + (STONE_RGB[2] - WOOD_RGB[2]) * age)
+        cr.set_source_rgba(*grey, fade)
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_line_width(max(1.0, s * 0.07))
+        cr.move_to(0, 0)
+        cr.line_to(0, -0.55 * s)
+        cr.move_to(-0.17 * s, -0.4 * s)
+        cr.line_to(0.17 * s, -0.4 * s)
+        cr.stroke()
+        cr.restore()
 
     @staticmethod
     def _cache(cr, x, y, s, pelts, bales):
@@ -4617,6 +5399,49 @@ class CpuView(Gtk.DrawingArea):
         else:
             self._draw_wilds(cr)
         self._draw_weather(cr, width, height, t)
+        if not self.on and height >= 260 and width >= 420:
+            self._draw_almanac(cr, height)
+
+    def _almanac_text(self):
+        """The season and year, and the valley's tallies: (beavers,
+        trappers, pelts held)."""
+        w = self.world
+        title = f"{w.SEASONS[w.season()].capitalize()}, year {w.year()}"
+        return title, (len(w.beavers), len(w.trappers),
+                       sum(tr["pelts"] for tr in w.trappers))
+
+    def _draw_almanac(self, cr, height):
+        """A small caption in the bottom-left corner, below the pastures
+        where the land fades out: the season, and a beaver, a cap and a
+        pelt, each with its count."""
+        title, (beavers, trappers, pelts) = self._almanac_text()
+        size = max(9.0, min(13.0, height * 0.022))
+        x, y = size * 0.8, height - size * 0.7
+        x += self._text(cr, x, y, title, size, 0.7, align="left")
+        x += size * 0.9
+        icon = size * 0.8
+        for k, n in enumerate((beavers, trappers, pelts)):
+            cy = y - size * 0.35
+            if k == 0:
+                self._beaver(cr, x + icon * 0.5, y, icon * 1.3, 1)
+            elif k == 1:
+                cr.set_source_rgb(*FUR_RGB)
+                cr.arc(x + icon * 0.5, cy + icon * 0.15, icon * 0.45,
+                       math.pi, 2 * math.pi)
+                cr.fill()
+                cr.set_source_rgb(*STRIPE_RGB)
+                cr.set_line_width(max(1.0, icon * 0.18))
+                cr.move_to(x + icon * 0.1, cy + icon * 0.1)
+                cr.line_to(x - icon * 0.1, cy + icon * 0.55)
+                cr.stroke()
+            else:
+                self._rounded(cr, x, cy - icon * 0.3, icon, icon * 0.6,
+                              icon * 0.2)
+                cr.set_source_rgb(*PELT_RGB)
+                cr.fill()
+            x += icon * 1.3
+            x += self._text(cr, x, y, str(n), size, 0.7, align="left")
+            x += size * 0.8
 
     def _draw_weather(self, cr, width, height, t):
         """Leaves drifting down in autumn, snow falling in winter, each
@@ -5524,8 +6349,8 @@ def envelope(seeds, years):
 def beaver_tests(view, cr):
     """The trees, the beavers and their works, headless and drawn."""
     w = World(1)
-    assert len(w.trees) == 42 and all(w.tree_state(i) == "tree"
-                                      for i in range(42))
+    assert len(w.trees) == 46 and all(w.tree_state(i) == "tree"
+                                      for i in range(46))
     assert [sum(b["f"] == f for b in w.beavers) for f in (0, 1)] == [3, 3]
     assert w.colonies == [{"dam": 0, "lodge": 0}] * 2
 
@@ -5548,13 +6373,15 @@ def beaver_tests(view, cr):
     w.beavers = []
     for _ in range(4):
         w._beaver(0, 0.9)
+    w._beaver(1, 0.4)
     w._births()
-    assert len(w.beavers) == 4, "no lodge, no kits"
+    assert len(w.beavers) == 5, "no lodge, no kits"
     w.colonies[0]["lodge"] = w.LODGE_STICKS
     w._births()
-    assert len(w.beavers) == 6 and w.tally["kits"][0] == 2, w.tally
-    assert sorted(round(b["cond"], 2) for b in w.beavers) == \
-        [0.5, 0.5, 0.6, 0.6, 0.9, 0.9]
+    assert len(w.beavers) == 7 and w.tally["kits"][0] == 2, w.tally
+    mothers = round(0.9 - w.KIT_COST, 2)
+    assert sorted(round(b["cond"], 2) for b in w.beavers if b["f"] == 0) \
+        == sorted([mothers] * 2 + [w.KIT_COND] * 2 + [0.9] * 2)
 
     # A valley empty of beavers for a season gets a pair from upstream,
     # at the colony with the bigger dam.
@@ -5572,6 +6399,14 @@ def beaver_tests(view, cr):
         b["cond"] = 1.0
     w.run(w.SEASON_S / 2 - 120)
     assert w.beavers and all(b["job"] == "lodge" for b in w.beavers)
+    # ...where no trap can take them, however keen.
+    w.trappers, w.CATCH_K, n = [], 1.0, len(w.beavers)
+    for row in w.sites:
+        for site in row:
+            site.update(by=0, state="set", since=w.time)
+    w.run(200)
+    assert len(w.beavers) == n and w.tally["trapped"] == 0
+    assert all(st["state"] == "set" for row in w.sites for st in row)
 
     # The pond above a finished dam widens the river, never past the most
     # the layout allows for.
@@ -5655,11 +6490,351 @@ def beaver_tests(view, cr):
             undammed += len(w.beavers)
         dammed += sum(r["beavers"] for r in rows[seed][4:])
     assert dammed > undammed, (dammed, undammed)
-    for seed, seasons in rows.items():
-        n = next(n for n, r in enumerate(seasons) if r["lodges"])
-        before = [r["beavers"] for r in seasons[:n + 1]]
-        after = [r["beavers"] for r in seasons[n + 1:]]
-        assert sum(after) / len(after) > sum(before) / len(before), seed
+
+
+def _set_clock(w, t):
+    """Put world w's clock at t as if it had run there."""
+    w.time = float(t)
+    w.next_tick = math.floor(t) + w.TICK_S
+    w.season_n = int(t // w.SEASON_S)
+    w.half_n = int(t // (w.SEASON_S / 2))
+
+
+def trapper_tests(view, cr):
+    """The trappers' needs, deaths and newcomers, headless and drawn."""
+    S = World.SEASON_S
+
+    def staged(t, beavers=True):
+        w = World(11)
+        _set_clock(w, t)
+        if not beavers:
+            w.beavers = []
+            w.RESTOCK_S = 1e9
+        for tr in w.trappers:
+            tr["t0"] = tr["t1"] = tr["t2"] = w.time
+        return w
+
+    def busy_sites(w):
+        for row in w.sites:
+            for st in row:
+                st.update(by=-1)  # all taken, by nobody in particular
+
+    def fell_all(w):
+        for slot in w.trees:
+            slot["felled"], slot["by"] = w.time, "trapper"
+
+    # He does what he needs most: eats when hungry, chops and builds as
+    # winter nears, and shelters in the cold; time spent is tallied.
+    w = staged(100)
+    tr = w.trappers[0]
+    busy_sites(w)
+    tr.update(fed=0.2, meat=1, logs=1)
+    w._trapper_next(tr, w.cold())
+    assert tr["job"] == "fire" and tr["fuel"], tr["job"]
+    assert tr["t2"] - tr["t1"] == w.FIRE_S
+    w._trapper_done(tr)
+    assert (tr["meat"], tr["logs"], tr["fed"]) == (0, 0, 1.0), tr
+    tr.update(fed=0.2, meat=1, logs=0)
+    fell_all(w)
+    w._trapper_next(tr, w.cold())
+    assert tr["job"] == "fire" and not tr["fuel"], tr["job"]
+    assert tr["t2"] - tr["t1"] == 2 * w.FIRE_S
+    w = staged(2.5 * S)
+    busy_sites(w)
+    tr = w.trappers[0]
+    w._trapper_next(tr, w.cold())
+    assert tr["job"] == "chop", tr["job"]
+    fell_all(w)
+    tr["logs"] = 2
+    w._trapper_next(tr, w.cold())
+    assert tr["job"] == "build", tr["job"]
+    w = staged(3.5 * S)
+    tr = w.trappers[0]
+    w.plots[0][0]["logs"] = w.CABIN_LOGS
+    tr["logs"] = 20
+    w._trapper_next(tr, w.cold())
+    assert tr["job"] == "shelter", tr["job"]
+    w = staged(10)
+    w.run(S)
+    assert all(sum(tr["effort_prev"].values()) > 0 for tr in w.trappers)
+
+    # A set trap takes a beaver out of the water; he collects it and
+    # stashes it at his cabin for a pelt and meat.
+    w = staged(10)
+    w.CATCH_K = 10.0  # a sure catch
+    tr = w.trappers[0]
+    for b in w.beavers:
+        b.update(job="swim", t2=1e9)
+    busy_sites(w)
+    for st in w.sites[0]:
+        st.update(by=None, state="empty")
+    w.sites[0][0].update(by=tr["id"], state="set", since=w.time)
+    tr.update(job="rest", t2=1e9)
+    w.trappers[1]["t2"] = 1e9
+    before = sum(b["f"] == 0 for b in w.beavers)
+    w.run(1)
+    assert w.sites[0][0]["state"] == "caught" and w.tally["trapped"] == 1
+    assert sum(b["f"] == 0 for b in w.beavers) == before - 1
+    tr["site"] = 0
+    w._go(tr, ["site", 0, 0], "collect", w.COLLECT_S)
+    w.run(tr["t2"] - w.time + 1)
+    assert tr["job"] == "stash" and tr["carry"] == "beaver", tr["job"]
+    w.run(tr["t2"] - w.time + 1)
+    assert (tr["pelts"], tr["meat"]) == (1, w.MEAT_PER_BEAVER), tr
+
+    # An axe fells the nearest tree for logs, flat to the ground; eight
+    # logs laid make a cabin.
+    w = staged(10)
+    tr = w.trappers[0]
+    i = w._chop_tree(tr)
+    assert w.trees[i]["zone"] == "woods" and w.trees[i]["f"] == 0
+    tr.update(job="chop", tree=i)
+    w._trapper_done(tr)
+    assert w.trees[i]["by"] == "trapper" and tr["logs"] == w.LOGS_PER_TREE
+    assert w.tree_state(i) == "stump"
+    tr["logs"] = w.CABIN_LOGS
+    for _ in range(w.CABIN_LOGS):
+        tr["job"] = "build"
+        w._trapper_done(tr)
+    assert w.plots[0][0]["logs"] == w.CABIN_LOGS and tr["logs"] == 0
+    assert w.stats()["cabins"] == 1
+
+    # Out in the winter with no cabin he dies of the cold, and his grave
+    # weathers away; inside a finished one with wood to burn, he is fine.
+    w = staged(3 * S + 100, beavers=False)
+    cold_one, snug = w.trappers
+    w.plots[1][0]["logs"] = w.CABIN_LOGS
+    snug["logs"] = 20
+    fell_all(w)  # and no wood to start one
+    w.run(S - 200)
+    assert cold_one not in w.trappers and w.tally["deaths"] == {"cold": 1}
+    assert snug in w.trappers and snug["health"] > 0.97, snug["health"]
+    assert len(w.graves) == 1
+    t = w.graves[0]["t"]
+    w.run(t + w.GRAVE_S + 1 - w.time)
+    assert all(g["t"] != t for g in w.graves), "gone in two years"
+
+    # With nothing to eat, he starves (by autumn, before any cold).
+    w = staged(4 * S + 10, beavers=False)
+    busy_sites(w)
+    for tr in w.trappers:
+        tr.update(fed=0.0, meat=0)
+    w.run(1900)
+    assert not w.trappers and w.tally["deaths"] == {"hunger": 2}, \
+        w.tally["deaths"]
+
+    # Whoever is nearest takes a dead man's goods: his own flank first,
+    # else whoever has least; and moves into his cabin if it is further
+    # along. With nobody left, the goods are lost and the cabin stands,
+    # rotting a log a season while it is empty.
+    def heirs(plots, stores):
+        w = staged(2 * S + 10)
+        w.trappers = []
+        for row in w.plots:
+            for p in row:
+                p["owner"] = None
+        for (f, k), (logs, meat) in zip(plots, stores):
+            tr = w._trapper(f, k, ["plot", f, k])
+            tr.update(logs=logs, meat=meat, pelts=1)
+        return w, list(w.trappers)
+
+    w, (dead, near, far) = heirs([(0, 0), (0, 1), (1, 0)],
+                                 [(3, 2), (9, 9), (0, 0)])
+    w.plots[0][0]["logs"], w.plots[0][1]["logs"] = 5, 2
+    w.die(dead, "cold")
+    e = w.tally["events"][-1]
+    assert e["claimant"] == near["id"] and e["moved"] == 6, e
+    assert e["after"] - e["before"] == e["moved"]
+    assert (near["f"], near["plot"]) == (0, 0), "he moves in"
+    assert w.plots[0][0]["owner"] == near["id"]
+    assert w.plots[0][1]["owner"] is None
+    w, (dead, other) = heirs([(0, 0), (1, 1)], [(3, 2), (1, 1)])
+    w.die(dead, "cold")
+    assert w.tally["events"][-1]["claimant"] == other["id"]
+    assert (other["f"], other["plot"]) == (1, 1), "his own is as good"
+    w, (dead, rich, poor) = heirs([(0, 0), (1, 0), (1, 1)],
+                                  [(3, 2), (4, 1), (1, 1)])
+    w.die(dead, "hunger")
+    assert w.tally["events"][-1]["claimant"] == poor["id"]
+    assert poor["logs"] == 4 and poor["meat"] == 3
+    # Moving across, he drops his errand on the old flank and comes in
+    # from the new one's edge, never through the grove.
+    w, (dead, heir) = heirs([(0, 0), (1, 1)], [(0, 0), (0, 0)])
+    w.plots[0][0]["logs"] = 6
+    heir["tree"] = w._chop_tree(heir)
+    w._go(heir, ["tree", heir["tree"]], "chop", w.CHOP_S)
+    w.die(dead, "cold")
+    assert (heir["f"], heir["plot"]) == (0, 0), "he moves across"
+    assert heir["at"] == ["edge", 0] and heir["to"] == ["plot", 0, 0]
+    assert heir["tree"] is None and heir["job"] == "rest", heir
+    w, (dead,) = heirs([(0, 0)], [(3, 2)])
+    w.plots[0][0]["logs"] = 5
+    w.die(dead, "cold")
+    assert w.tally["events"][-1]["claimant"] is None
+    assert w.plots[0][0]["logs"] == 5 and w.plots[0][0]["owner"] is None
+    w.RESTOCK_S = 1e9
+    w.run(S)
+    assert w.plots[0][0]["logs"] == 4, "an empty cabin rots"
+
+    # Newcomers come in spring, more of them the more beavers there are,
+    # into the free plot furthest along, walking in from the edge.
+    counts = set()
+    for seed in range(12):
+        w = staged(10)
+        w.rng.seed(seed)
+        while len(w.beavers) < 12:
+            w._beaver(seed % 2, 0.7)
+        w._arrivals()
+        counts.add(w.tally["arrivals"])
+    assert counts == {1, 2}, counts
+    w = staged(10, beavers=False)
+    w.trappers = []
+    for row in w.plots:
+        for p in row:
+            p["owner"] = None
+    w.plots[1][1]["logs"] = 5
+    w._arrivals()
+    assert w.tally["arrivals"] == 1 and w.tally["rails"]["trappers"] == 1
+    tr = w.trappers[0]
+    assert (tr["f"], tr["plot"], tr["at"]) == (1, 1, ["edge", 1]), tr
+
+    # Over several seeds and years: the trappers hold on in numbers, some
+    # die and some come; they trap harder when beavers are plenty; those
+    # who trap through the autumn come out of the winter worse, most but
+    # not all winters find the cabins ready, the unready suffer for it,
+    # and a death leaves the others richer.
+    rows = envelope((1, 2, 3, 4), 4)
+    later = [r for seed in rows for r in rows[seed][4:]]
+    every = [r for seed in rows for r in rows[seed]]
+    mean = sum(r["trappers"] for r in later) / len(later)
+    assert 1 <= mean <= 4, mean
+    assert max(r["trappers"] for r in every) <= 4
+    rails = sum(r["tally"]["rails"]["trappers"] for r in every)
+    arrivals = sum(r["tally"]["arrivals"] for r in every)
+    deaths = sum(sum(r["tally"]["deaths"].values()) for r in every)
+    assert rails <= 4 and deaths >= 1 and arrivals > rails, \
+        (rails, arrivals, deaths)
+    shares = []
+    for r in every:
+        if r["season"] == 3:
+            continue
+        for effort in r["effort"].values():
+            busy = sum(effort.values())
+            if busy:
+                shares.append((r["beavers"], effort.get("trap", 0) / busy))
+    mid = sorted(n for n, _ in shares)[len(shares) // 2]
+    rich = [k for n, k in shares if n > mid]
+    poor = [k for n, k in shares if n <= mid]
+    assert sum(rich) / len(rich) > sum(poor) / len(poor), (rich, poor)
+    events = [e for r in every for e in r["tally"]["events"]]
+    winters = [e for e in events if e["kind"] == "winter"]
+    mid = sorted(e["share"] for e in winters)[len(winters) // 2]
+    hard = [e["loss"] for e in winters if e["share"] > mid]
+    soft = [e["loss"] for e in winters if e["share"] <= mid]
+    assert sum(hard) / len(hard) > sum(soft) / len(soft), (hard, soft)
+    ready = sum(e["ready"] for e in winters)
+    assert 0.6 * len(winters) <= ready < len(winters), (ready, winters)
+    cold = [e["loss"] for e in winters if not e["ready"]]
+    snug = [e["loss"] for e in winters if e["ready"]]
+    assert sum(cold) / len(cold) > sum(snug) / len(snug), (cold, snug)
+    heirs = [e for e in events if e["kind"] == "death" and e["claimant"]]
+    assert all(e["after"] - e["before"] == e["moved"] for e in heirs)
+    assert sum(e["after"] - e["before"] for e in heirs) > 0, heirs
+
+    # Drawn: every job, a cabin at every stage, fire, grave, axe and log.
+    view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
+    w = World(12)
+    w.run(2 * World.YEAR_S + 2 * S)
+    view.set_world(w)
+    while len(w.trappers) < 2:
+        w._arrivals()
+    w.graves.append({"place": ["plot", 0, 1], "t": w.time, "id": 0})
+    w.graves.append({"place": ["site", 1, 0],
+                     "t": w.time - 1.9 * w.YEAR_S, "id": 0})
+    tr = w.trappers[0]
+    home = ["plot", tr["f"], tr["plot"]]
+    jobs = [("set", ["site", tr["f"], 0]), ("check", ["site", tr["f"], 1]),
+            ("collect", ["site", tr["f"], 2]), ("stash", home),
+            ("chop", ["tree", w._chop_tree(tr) or 0]), ("build", home),
+            ("fire", home), ("rest", home), ("shelter", home)]
+    for size in ((300, 220), (1024, 680), (560, 420)):
+        for job, place in jobs:
+            for walking in (True, False):
+                tr.update(job=job, at=home, to=place, t0=w.time - 2,
+                          t1=w.time + (3 if walking else -1),
+                          t2=w.time + 9, carry="beaver")
+                view._draw(view, cr, *size)
+        for x, y in [p for fl in view.wild["flanks"]
+                     for p in [fl["edge"]] + [st["stand"]
+                                              for st in fl["sites"]]
+                     + [pl[k] for pl in fl["plots"]
+                        for k in ("cabin", "fire", "cache", "pile")]
+                     if p is not None]:
+            assert 0 <= x <= size[0] and 0 <= y <= size[1], (x, y, size)
+    for logs in range(w.CABIN_LOGS + 1):
+        for smoke in (-1.0, 3.0):
+            view._cabin(cr, 100, 100, 40, logs, w.CABIN_LOGS, smoke, 1.0)
+    view._campfire(cr, 100, 100, 40, 2.0, cooking=True)
+    view._campfire(cr, 100, 100, 40, 2.0, cooking=False, lit=0.0)
+    for age in (0.0, 0.5, 0.95):
+        view._grave(cr, 100, 100, 40, age)
+    for bales in range(view.BALE_MAX + 1):
+        view._cache(cr, 100, 100, 40, 3, bales)
+    for axe in (0.05, 0.5, 1.0):
+        view._mountain_man(cr, 100, 100, 40, 1, axe=axe, kneel=0.5)
+    view._mountain_man(cr, 100, 100, 40, -1, shouldered=True, log=True)
+
+    # Four idle minutes at the window's size: the trappers go about their
+    # business keeping out of the grove and off the water but for their
+    # stepping stones; the horses graze, look up and amble about.
+    view.set_world(World(13))
+    view._draw(view, cr, 1024, 680)
+    s = view.wild["s"]
+    assert view.horses, "horses at pasture"
+    start = [(hs["x"], hs["y"]) for hs in view.horses]
+    grazed, roamed, walked = set(), 0.0, 0
+    for frame in range(240 * 30):
+        view.phase += 1 / 30
+        view._advance(1 / 30)
+        if frame % 30 == 0:
+            view._draw(view, cr, 1024, 680)
+        for hs, (x, y) in zip(view.horses, start):
+            grazed.add(hs["graze"])
+            roamed = max(roamed, abs(hs["x"] - x))
+            x0, y0, x1, y1 = view.wild["pastures"][hs["pasture"]]
+            assert x0 <= hs["x"] <= x1 and y0 <= hs["y"] <= y1, hs
+        for tr in view.world.trappers:
+            at = view._trapper_xy(tr)
+            if at is None:
+                continue
+            x, y, _, walking = at
+            walked += walking
+            assert not view._in_box(view.wild["grove"], x, y), (x, y)
+            if abs(y - view._river_y(x)) < view._river_half(x):
+                ford = view.wild["flanks"][tr["f"]]["ford"]
+                assert ford and abs(x - ford[0][0]) < s, (x, y)
+    assert walked and grazed == {0, 1} and roamed > 0.25 * s, \
+        (walked, grazed, roamed)
+
+    # The almanac in the idle picture's corner, not the siege's, nor in
+    # one too small for it.
+    w = World(14)
+    w.run(2 * World.YEAR_S + 10)
+    view.set_world(w)
+    title, tallies = view._almanac_text()
+    assert title == "Spring, year 3" and len(tallies) == 3, title
+    calls = []
+    view._almanac_text = lambda: calls.append(1) or (title, tallies)
+    view._draw(view, cr, 1024, 680)
+    assert calls, "drawn while the fort is down"
+    del calls[:]
+    view._draw(view, cr, 60, 40)
+    view._draw(view, cr, 300, 220)
+    view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], True)
+    view._draw(view, cr, 1024, 680)
+    assert not calls, "not while it is up, nor where there is no room"
+    del view._almanac_text
+    view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
 
 
 def self_test():
@@ -5822,59 +6997,7 @@ def self_test():
         assert abs(base - view._river_y(x)) > view._river_half_max(x), \
             (x, base)
 
-    # Four idle minutes: the trappers set traps, collect what they catch,
-    # and stash the pelts, keeping out of the grove and off the water but
-    # for their stepping stones. The horses graze, look up, and amble
-    # about their pastures.
-    seen, carried = set(), False
-    s = view.wild["s"]
-    assert view.horses, "horses at pasture"
-    start = [(hs["x"], hs["y"]) for hs in view.horses]
-    grazed, roamed = set(), 0.0
-    for frame in range(240 * 30):
-        view.phase += 1 / 30
-        view._advance(1 / 30)
-        if frame % 30 == 0:
-            view._draw(view, cr, 1024, 680)
-        seen |= {st["state"] for st in view.sites}
-        for hs, (x, y) in zip(view.horses, start):
-            grazed.add(hs["graze"])
-            roamed = max(roamed, abs(hs["x"] - x))
-            x0, y0, x1, y1 = view.wild["pastures"][hs["pasture"]]
-            assert x0 <= hs["x"] <= x1 and y0 <= hs["y"] <= y1, hs
-        for tr in view.trappers:
-            carried |= tr["carry"]
-            x, y = tr["x"], tr["y"]
-            assert not view._in_box(view.wild["grove"], x, y), (x, y)
-            if abs(y - view._river_y(x)) < view._river_half(x):
-                ford = view.wild["flanks"][tr["flank"]]["ford"]
-                assert ford and abs(x - ford[0][0]) < s, (x, y)
-    assert {"set", "caught"} <= seen and carried, (seen, carried)
-    assert sum(sum(p) for p in view.pelts) >= 1, view.pelts
-    assert grazed == {0, 1} and roamed > 0.25 * s, (grazed, roamed)
-    pelts = [list(p) for p in view.pelts]
-    where = [(tr["x"], tr["y"]) for tr in view.trappers]
-
-    # A stack of pelts becomes a bale, and the bales stop piling up.
-    keep = [list(p) for p in view.pelts]
-    view.pelts[0] = [view.PELT_BALE - 1, 0]
-    view._stash(0)
-    assert view.pelts[0] == [0, 1], view.pelts
-    view.pelts[0] = [view.PELT_BALE - 1, view.BALE_MAX]
-    view._stash(0)
-    assert view.pelts[0] == [0, view.BALE_MAX], view.pelts
-    view.pelts = keep
-
-    # Raising the fort freezes the trap line; standing down picks it up.
-    view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], True)
-    for _ in range(5 * 30):
-        view.phase += 1 / 30
-        view._advance(1 / 30)
-    view._draw(view, cr, 1024, 680)
-    view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
-    view._draw(view, cr, 1024, 680)
-    assert [(tr["x"], tr["y"]) for tr in view.trappers] == where
-    assert view.pelts == pelts, (view.pelts, pelts)
+    trapper_tests(view, cr)
 
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], True)
     view.boats, view.potshot, view.walker_halted = [], None, 0.0
