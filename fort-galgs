@@ -2183,6 +2183,7 @@ class Siege:
         self.roof = [1.0, 1.0]            # each tower roof's, likewise
         self.quiet_since = None           # phase the last redcoat left range
         self.trail_quiet_since = None     # the same, of those on the trails
+        self.side_quiet_since = [None, None]  # and of each side alone
         self.men = [self._new_man("post"), self._new_man("post"),
                     self._new_man("patrol")]
         self.patrol_u = 0.0               # the walker's patrol, 0..2
@@ -2210,7 +2211,7 @@ class Siege:
                       "shot": 0, "reached": 0, "blasted": 0, "calls": 0,
                       "hurt": [0.0, 0.0], "mended": [0.0, 0.0],
                       "breaches": 0, "meals": 0, "eating_s": 0.0,
-                      "repairs": 0, "repairs_done": 0, "caught": 0,
+                      "repairs": 0, "repairs_done": 0, "caught": 0, "repairs_out": 0,
                       "out_s": 0.0, "retreats": 0, "driven": 0, "rc_shots": 0,
                       "climbs": 0, "pushes": 0, "raises": 0, "fell": 0,
                       "top": 0, "gun_kills": 0, "guns": 0,
@@ -2539,6 +2540,22 @@ class Siege:
             - self.quiet_since >= (self.QUIET_S if seconds is None
                                    else seconds)
 
+    def _side_busy(self, side):
+        """Something is up on one side alone: a redcoat close to its wall
+        or on its trail within range, on its ladder or up on its walk,
+        or out of the trail to drive the man in the woods back."""
+        return any(rc["side"] == side and rc["hit"] is None and (
+            self.trail_p(rc["d"]) >= self.CLOSE_P or rc["at_wall"] is not None
+            or rc.get("drive") or rc.get("climb") is not None)
+            for rc in self.redcoats) or bool(self.stormers_on(side))
+
+    def side_lull(self, side):
+        """THE LULL ON ONE SIDE: none of that side's business has been
+        about for QUIET_S seconds. The man in the woods judges by this, not
+        by the far side."""
+        since = self.side_quiet_since[side]
+        return since is not None and self.phase - since >= self.QUIET_S
+
     def pace(self, i):
         """How fast man i works, 1 fed and HUNGER_SLOW less starving."""
         return 1.0 - self.HUNGER_SLOW * self.men[i]["hunger"]
@@ -2660,7 +2677,11 @@ class Siege:
         elif mode == "mend":
             if self.wall[side] >= 1.0:
                 self.tally["repairs_done"] += 1
-                m["mode"] = "ascend"
+                if m["g"] > 0.0:
+                    self.tally["repairs_out"] += 1
+                    m["mode"] = "home"  # from out in the grass, on foot
+                else:
+                    m["mode"] = "ascend"
             else:
                 self._ladder_alarm(i)
                 if m["mode"] == "mend":
@@ -2685,7 +2706,7 @@ class Siege:
         under him, from where he is, at his pace."""
         m, lad = self.men[i], self.ladder
         t = 0.0
-        if m["mode"] in ("home", "run", "hide"):
+        if m["mode"] in ("home", "run", "hide", "mend"):
             t += m["g"] * self.HOME_S
         if lad["state"] in ("fallen", "falling") and m["mode"] != "ascend":
             t += self.RAISE_ALONE_S * (1.0 - lad["raised"])
@@ -2709,7 +2730,7 @@ class Siege:
             return
         if slack >= 0:
             if m["mode"] in ("descend", "mend"):
-                m["mode"] = "ascend"
+                m["mode"] = "home" if m["g"] > 0.0 else "ascend"
             return
         self._break_for_woods(i)
 
@@ -2799,11 +2820,16 @@ class Siege:
                 and self._pot_target(i) is not None:
             m.update(shot_t=0.0, fired=False)
             return
-        if self.lull() and self.phase - m["t0"] >= self.HIDE_MIN_S \
+        if self.side_lull(side) and self.phase - m["t0"] >= self.HIDE_MIN_S \
                 and not m["pinned"] \
                 and self._slack(i) > self.SAFE_S + self.CATCH_MARGIN:
-            m["mode"] = "home"
             self._call_off(side)
+            if self.wall[side] < self.MEND_BELOW:
+                # He is already outside: the cheapest moment to mend it.
+                m.update(mode="mend", t0=self.phase, h=0.0, up=None)
+                self.tally["repairs"] += 1
+            else:
+                m["mode"] = "home"
 
     def _call_off(self, side):
         """The redcoats who left the trail to drive him off go back to it."""
@@ -2900,6 +2926,11 @@ class Siege:
             self.trail_quiet_since = None
         elif self.trail_quiet_since is None:
             self.trail_quiet_since = self.phase
+        for side in (0, 1):
+            if self._side_busy(side):
+                self.side_quiet_since[side] = None
+            elif self.side_quiet_since[side] is None:
+                self.side_quiet_since[side] = self.phase
         for m in self.men:
             if m["mode"] != "eat":
                 m["hunger"] = min(1.0, m["hunger"] + dt / (
@@ -11331,6 +11362,7 @@ SIEGE_PICTURES = (
     ("men-eating", _stage_eating),
     ("walker-descending", _stage_out("descend", h=0.55)),
     ("walker-mending", _stage_out("mend")),
+    ("walker-mending-from-outside", _stage_out("mend", g=2.0, rock=2)),
     ("walker-running", _stage_out("run", g=0.5)),
     ("walker-behind-rock-1", _stage_out("hide", g=1.0, rock=1, fire=True)),
     ("walker-behind-rock-2", _stage_out("hide", g=2.0, rock=2)),
@@ -11607,6 +11639,60 @@ def siege_tests(view, cr):
     assert _until(siege, lambda: walker["mode"] == "patrol", 30)
     assert siege.ladder["state"] == "up" and not siege.out(2)
     assert siege.tally["out_s"] > 5
+
+    # He judges by his own side: with a redcoat at the far wall, and his
+    # own side clear, he comes out from behind his rock. If his wall is
+    # damaged he mends it from out in the grass, and then goes home; if it
+    # is whole he goes straight home. The far side stays busy throughout.
+    for wall in (0.5, 1.0):
+        siege = _quiet_siege()
+        siege.drill_start = [None, None]
+        siege.wall = [wall, 1.0]
+        walker = _walker_out(siege)
+        walker.update(mode="hide", g=2.0, rock=2, shot_t=None, pinned=[],
+                      next_shot=1e9)
+        far = _at_the_foot(siege, "foot", 1)
+        far["hp"] = 99
+        modes = []
+        for _ in range(120 * 30):
+            siege.run(1 / 30)
+            if far["at_wall"] is not None:
+                far["d"] = Siege.MARCH_NEAR
+            if not modes or modes[-1] != walker["mode"]:
+                modes.append(walker["mode"])
+            if walker["mode"] == "patrol":
+                break
+            assert not siege.lull(), "the far side is never quiet"
+            if walker["mode"] == "mend":
+                assert walker["g"] == 2.0, "he mends from where he is"
+        if wall < 1.0:
+            assert modes == ["hide", "mend", "home", "ascend", "haul", "patrol"], modes
+            assert siege.wall[0] >= 1.0 and siege.tally["repairs_out"] == 1
+        else:
+            assert modes == ["hide", "home", "ascend", "haul", "patrol"], modes
+            assert siege.tally["repairs_out"] == 0
+    # With a redcoat on his own trail, close enough to matter, he stays.
+    siege = _quiet_siege()
+    siege.drill_start = [None, None]
+    siege.wall = [0.5, 1.0]
+    walker = _walker_out(siege)
+    walker.update(mode="hide", g=2.0, rock=2, shot_t=None, pinned=[],
+                  next_shot=1e9)
+    near = _foe(siege, "foot", 0.2)
+    near["hp"] = 99
+    for _ in range(30 * 20):
+        siege.run(1 / 30)
+        near["d"] = Siege.trail_d(0.52)
+        assert walker["mode"] in ("hide", "run"), walker["mode"]
+    # And mending outside, a horseman on his side catches him again.
+    siege = _quiet_siege()
+    siege.drill_start = [None, None]
+    siege.wall = [0.5, 1.0]
+    walker = _walker_out(siege)
+    walker.update(mode="mend", g=2.0, rock=2, h=0.0, shot_t=None, pinned=[])
+    _foe(siege, "horse", 0.55)
+    siege.run(0.2)
+    assert walker["mode"] == "hide" and siege.tally["caught"] == 1, walker
 
     # A standing ladder is the redcoats' too: a man at its foot climbs it
     # instead of pounding, one at a time, slowly; at the top he steps onto
