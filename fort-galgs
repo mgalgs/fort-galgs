@@ -1940,6 +1940,416 @@ def save_world(world, path):
 # The picture: the chip, with the fort's cores fenced off
 # --------------------------------------------------------------------------
 
+class Siege:
+    """The redcoats' siege of the fort, apart from any picture of it.
+
+    Redcoats set out from the barracks in the far corners and march down
+    their trails, take cover behind a boulder when fired on, queue at the
+    wall and beat on it; the two tower sentries pick whom to shoot, the
+    walker's bugle calls one to fire, and a sentry with men at the foot of
+    his wall calls for the fort's gun, whose ball takes them all. Nothing
+    here draws, and nothing is in pixels: a redcoat's place on his trail is
+    his distance d, or the screen fraction p that goes with it. Like World,
+    it runs headless; CpuView advances it each frame and draws from it.
+
+    The picture tells it a few facts that only its geometry can know:
+    boulders[side] (a boulder stands beside that trail), has_walker (room
+    on the wall for him to walk), and, as arguments, whether he is busy
+    shooting at a boat. In return it takes men stepping ashore from a boat
+    (land) and lets the view run the boats in the middle of a frame (the
+    afloat hook of advance). Randomness is the seeded rng, so far unused:
+    today's siege runs on fixed cycles.
+    """
+
+    MARCH_FAR = 6.0     # a new redcoat is this many times farther than...
+    MARCH_NEAR = 1.0    # ...one at the near end of the trail
+    MARCH_S = 26.0      # seconds to walk the whole trail
+    ENGAGE_P = 0.5      # how far down the trail a sentry opens fire
+    FALL_S = 1.6        # a shot redcoat topples and fades over this long
+    FLEE_S = 3.5        # a riderless horse is off the picture within this
+    DOOR_GAP = 0.3      # how far one must march before the next comes out
+    DOOR_OPEN_S = 1.2   # the barracks door stands open this long for each
+    CALLED_MAX = 16     # most a barracks will hold on call
+    FILE = ("foot",) * 3
+    WAVE = ("horse", "horse", "horse", "cannon")
+    PACE = {"foot": 1.0, "horse": 2.6, "cannon": 0.45}
+    HP = {"foot": 1, "horse": 1, "cannon": 5}
+    WAVE_EVERY = (75.0, 105.0, 90.0)
+    COVER_P = 0.64      # where on the trail a boulder offers cover
+    HIDE_S = 9.5        # how long a man crouches behind it, at least...
+    LULL_S = 5.0        # ...and until he has not been shot at for this long
+    AT_WALL = 2         # how many beat on the wall at once
+    QUEUE_P = 0.08      # trail between each in the queue behind them
+
+    # The call for relief, in seconds from the tower sentry's first note:
+    # the walker hears it, runs to the gun, cranks it up and fires, then
+    # runs back while the ball flies.
+    HEARD_AT = 0.6
+    RUN_S = 1.0
+    WHEEL_AT = HEARD_AT + RUN_S
+    WHEEL_S = 1.2
+    CRANK_AT = WHEEL_AT + WHEEL_S
+    FIRE_AT = CRANK_AT + 1.2
+    FLIGHT_S = 1.4
+    RELIEF_LEN = FIRE_AT + FLIGHT_S + 1.0
+    GUN_POST = (0.2, 0.8)   # where on the wall walk he wheels it, per side
+    BLAST_P = 0.85      # the blast takes queued redcoats this near the wall
+
+    DRILL_LEN = 4.6     # from kneeling to the last of the smoke
+    SHOT_AT = 2.0       # he fires this far into it
+
+    BUGLE_LEN = 2.0     # from raising the bugle to lowering it
+    BUGLE_HEARD = 1.2   # the tower sentry starts his drill this far in
+
+    def __init__(self, seed=1):
+        self.rng = random.Random(seed)    # not drawn on yet
+        self.phase = 0.0                  # its own clock, moved by tick()
+        self.boulders = [True, True]      # one beside each trail, if laid
+        self.has_walker = True            # room on the wall for him to walk
+        self.drill_start = [None, None]   # phase each tower sentry knelt
+        self.drill_target = [None, None]  # the redcoat he is aiming at
+        self.drill_fired = [False, False]
+        self.redcoats = []
+        self.spawned = 0
+        self.spawn_in = 1.0
+        self.called = [[], []]            # kinds waiting at each barracks
+        self.pending_call = None          # (side, phase, wait) of a lone click
+        self.wave_in = 45.0
+        self.waves = 0
+        self.relief = None                # a tower's call for the gun
+        self.gun_at = 0.5                 # along the wall walk, 0..1
+        self.bugle_at = None              # phase the walker last sounded
+        self.chipped = [None, None]       # phase a shot last struck each rock
+        self.tally = {"sent": {"foot": 0, "horse": 0, "cannon": 0},
+                      "shot": 0, "reached": 0, "blasted": 0, "calls": 0}
+
+    @staticmethod
+    def ramp(tau, a, b):
+        u = min(1.0, max(0.0, (tau - a) / (b - a)))
+        return u * u * (3 - 2 * u)
+
+    @classmethod
+    def trail_p(cls, d):
+        """Screen position along the trail, 0 far to 1 near, for a redcoat
+        at distance d. Size goes as 1/d, and so does the trail on screen,
+        so a steady march seems to speed up as he comes closer."""
+        far = 1 / cls.MARCH_FAR
+        return (1 / d - far) / (1 / cls.MARCH_NEAR - far)
+
+    @classmethod
+    def trail_d(cls, p):
+        """The distance at which a redcoat stands at screen position p."""
+        far = 1 / cls.MARCH_FAR
+        return 1 / (far + p * (1 / cls.MARCH_NEAR - far))
+
+    # -- the clock and the calls ------------------------------------------
+
+    def tick(self, dt):
+        """Move the clock on dt seconds; advance() then runs the rules."""
+        self.phase += dt
+
+    def run(self, seconds, step=1 / 30):
+        """Run the siege on this long, a frame at a time, with no picture."""
+        for _ in range(int(seconds / step + 1e-9)):
+            self.tick(step)
+            self.advance(step)
+
+    def call(self, side, kinds):
+        q = self.called[side]
+        q.extend(kinds[:max(0, self.CALLED_MAX - len(q))])
+
+    def click_barracks(self, side, n, wait):
+        """A click on a barracks: a double click calls a wave, a single one
+        a file of foot, held until wait seconds have passed with no second
+        click, so a double click does not also send the file."""
+        if n >= 2:
+            self.pending_call = None
+            self.call(side, self.WAVE)
+        else:
+            self.pending_call = (side, self.phase, wait)
+
+    def sound_bugle(self, side, walker_busy=False):
+        """The walker sounds his bugle, and the tower sentry on side kneels
+        and fires, at a redcoat if one is in sight. Not while he is
+        sounding it, working the gun or (walker_busy) shooting at a boat."""
+        if self.bugling() or self.relief is not None or walker_busy:
+            return False
+        self.bugle_at = self.phase
+        if not self.busy(side):
+            self.drill_start[side] = self.phase + self.BUGLE_HEARD
+            self.drill_target[side] = None
+            self.drill_fired[side] = False
+        return True
+
+    # -- the tower sentries -----------------------------------------------
+
+    def drill_t(self, i):
+        """Seconds into tower sentry i's drill; negative while he waits on
+        the bugle, DRILL_LEN or more once he is done."""
+        start = self.drill_start[i]
+        return self.DRILL_LEN if start is None else self.phase - start
+
+    def busy(self, i):
+        return self.drill_t(i) < self.DRILL_LEN
+
+    def drilling(self, i):
+        return 0 <= self.drill_t(i) < self.DRILL_LEN
+
+    def drill(self, i):
+        """Tower sentry i kneels, takes aim and fires. Returns (kneel, aim,
+        seconds since the shot or -1)."""
+        return self.drill_pose(self.drill_t(i))
+
+    @classmethod
+    def drill_pose(cls, tau):
+        """The same, tau seconds into a drill."""
+        kneel = cls.ramp(tau, 0.0, 0.6) - cls.ramp(tau, 3.2, 3.8)
+        aim = cls.ramp(tau, 0.4, 1.1) - cls.ramp(tau, 2.8, 3.4)
+        shot = tau - cls.SHOT_AT if cls.SHOT_AT <= tau < cls.DRILL_LEN \
+            else -1.0
+        return kneel, aim, shot
+
+    def bugle_t(self):
+        if self.bugle_at is None:
+            return self.BUGLE_LEN
+        return self.phase - self.bugle_at
+
+    def bugling(self):
+        return self.bugle_t() < self.BUGLE_LEN
+
+    # -- the gun ----------------------------------------------------------
+
+    def relief_t(self):
+        r = self.relief
+        return None if r is None else self.phase - r["t0"]
+
+    def calling(self, i):
+        """Tower sentry i is blowing his horn for the gun."""
+        t = self.relief_t()
+        return t is not None and self.relief["side"] == i \
+            and t < self.BUGLE_LEN
+
+    def gun_frac(self):
+        """Where the fort's gun stands, as a fraction of the wall walk."""
+        r = self.relief
+        if r is None:
+            return self.gun_at
+        k = self.ramp(self.phase - r["t0"], self.WHEEL_AT,
+                      self.WHEEL_AT + self.WHEEL_S)
+        return r["from"] + (self.GUN_POST[r["side"]] - r["from"]) * k
+
+    def _advance_relief(self, walker_busy):
+        """A tower sentry with redcoats at the foot of his wall calls for
+        the gun; when the ball lands, it takes them all."""
+        r = self.relief
+        if r is None:
+            # Called while the walker shoots at a boat, it waits for him.
+            if not self.has_walker or self.bugling() or walker_busy:
+                return
+            for i in (0, 1):
+                if not self.busy(i) and any(
+                        rc["side"] == i and rc["hit"] is None
+                        and self.at_wall(rc) for rc in self.redcoats):
+                    self.relief = {"side": i, "t0": self.phase,
+                                   "landed": False, "from": self.gun_at}
+                    self.tally["calls"] += 1
+                    return
+            return
+        t = self.phase - r["t0"]
+        if not r["landed"] and t >= self.FIRE_AT + self.FLIGHT_S:
+            r["landed"] = True
+            for rc in self.redcoats:
+                if rc["side"] == r["side"] and rc["hit"] is None and (
+                        self.at_wall(rc)
+                        or self.trail_p(rc["d"]) >= self.BLAST_P):
+                    rc["hp"] = 0
+                    rc["hit"] = self.phase
+                    self.tally["blasted"] += 1
+        if t >= self.RELIEF_LEN:
+            self.gun_at = self.GUN_POST[r["side"]]
+            self.relief = None
+
+    # -- the redcoats -----------------------------------------------------
+
+    def at_wall(self, rc):
+        """At the wall itself, rather than waiting in the queue behind."""
+        return rc["at_wall"] is not None and rc["slot"] < self.AT_WALL
+
+    def cover(self, rc):
+        """How far a redcoat has stepped off the trail behind his boulder,
+        0..1: he ducks in quickly and steps out again more slowly."""
+        if "rock" not in rc or not self.boulders[rc["rock"]]:
+            return 0.0
+        if rc["hid"] is not None:
+            return self.ramp(self.phase - rc["hid"], 0.0, 0.35)
+        return 1.0 - self.ramp(self.phase - rc["rose"], 0.0, 0.6)
+
+    def door_open(self, i):
+        """Someone has just come out of barracks i (not off a boat)."""
+        return any(rc["side"] == i and not rc.get("boat")
+                   and self.phase - rc["born"] < self.DOOR_OPEN_S
+                   for rc in self.redcoats)
+
+    def send(self, side, kind, d=None, boat=None):
+        """A redcoat sets out from the barracks on trail side, or, given d
+        and a place to hop from, steps ashore from a boat there."""
+        self.redcoats.append({"side": side, "d": d or self.MARCH_FAR,
+                              "hit": None, "n": self.spawned,
+                              "born": self.phase, "kind": kind,
+                              "hp": self.HP[kind], "struck": None,
+                              "at_wall": None, "slot": 0, "boat": boat})
+        self.spawned += 1
+        self.tally["sent"][kind] += 1
+
+    def land(self, side, d, bow):
+        """A man from a boat steps ashore on trail side at distance d, to
+        hop from bow, wherever the view has it."""
+        self.send(side, "foot", d, bow)
+
+    def advance(self, dt, walker_busy=False, afloat=None):
+        """Step the siege dt seconds: the gun, the redcoats' march, the
+        barracks' calls and the sentries choosing whom to shoot. The
+        clock is moved first, by tick(). walker_busy says he is shooting
+        at a boat; afloat, if given, is called between the barracks' calls
+        and the new arrivals, to run the boats and let men land from them."""
+        self._advance_relief(walker_busy)
+        speed = (self.MARCH_FAR - self.MARCH_NEAR) / self.MARCH_S
+        for side in (0, 1):
+            # Two at a time beat on the wall; the rest wait in a queue back
+            # up the trail, and all of it shuffles forward when a place at
+            # the wall comes free.
+            halted = [rc for rc in self.redcoats if rc["side"] == side
+                      and rc["hit"] is None and rc["at_wall"] is not None]
+            front = {rc["slot"] for rc in halted if rc["slot"] < self.AT_WALL}
+            if len(front) < self.AT_WALL:
+                for rc in halted:
+                    if rc["slot"] >= self.AT_WALL:
+                        rc["at_wall"] = None
+                halted = [rc for rc in halted if rc["at_wall"] is not None]
+            moving = sorted((rc for rc in self.redcoats
+                             if rc["side"] == side and rc["hit"] is None
+                             and rc["at_wall"] is None),
+                            key=lambda rc: rc["d"])
+            rock = self.boulders[side]
+            nearest = min((rc for rc in self.redcoats if rc["side"] == side
+                           and rc["hit"] is None), key=lambda rc: rc["d"],
+                          default=None)
+            for rc in moving:
+                if rc.get("hid") is not None:
+                    # Not until the fire on him slackens: under steady fire
+                    # he stays down until the third shot finds him.
+                    if self.phase - rc["hid"] < self.HIDE_S or \
+                            self.phase - rc["shot_at"] < self.LULL_S:
+                        continue
+                    rc["hid"], rc["rose"] = None, self.phase
+                was = self.trail_p(rc["d"])
+                rc["d"] = max(self.MARCH_NEAR,
+                              rc["d"] - speed * self.PACE[rc["kind"]] * dt)
+                # A man on foot who reaches the boulder with a rifle on him
+                # drops behind it, once.
+                if rock and rc["kind"] == "foot" and "rock" not in rc \
+                        and was < self.COVER_P <= self.trail_p(rc["d"]) \
+                        and (self.drill_target[side] is rc
+                             or rc is nearest) \
+                        and not any(o.get("hid") is not None
+                                    and o["side"] == side
+                                    and o["hit"] is None
+                                    for o in self.redcoats):
+                    rc.update(d=self.trail_d(self.COVER_P), hid=self.phase,
+                              rock=side, ducked=0, shot_at=self.phase)
+                    continue
+                k = len(halted)
+                stop = 1.0 if k < self.AT_WALL \
+                    else 1.0 - self.QUEUE_P * (k - self.AT_WALL + 1)
+                if self.trail_p(rc["d"]) >= stop - 1e-9:
+                    rc["at_wall"] = self.phase
+                    taken = {o["slot"] for o in halted}
+                    rc["slot"] = min(set(range(k + 1)) - taken) \
+                        if k < self.AT_WALL else k
+                    halted.append(rc)
+                    if rc["slot"] < self.AT_WALL and not rc.get("reached"):
+                        rc["reached"] = True
+                        self.tally["reached"] += 1
+        self.redcoats = [rc for rc in self.redcoats if rc["hit"] is None
+                         or self.phase - rc["hit"] < (
+                             self.FLEE_S if rc["kind"] == "horse"
+                             else self.FALL_S)]
+
+        if self.pending_call is not None and \
+                self.phase - self.pending_call[1] > self.pending_call[2]:
+            self.call(self.pending_call[0], self.FILE)
+            self.pending_call = None
+        self.wave_in -= dt
+        if self.wave_in <= 0:
+            self.call(self.waves % 2, self.WAVE)
+            self.wave_in = self.WAVE_EVERY[self.waves % 3]
+            self.waves += 1
+
+        def door_clear(side):
+            return all(rc["d"] < self.MARCH_FAR - self.DOOR_GAP
+                       for rc in self.redcoats if rc["side"] == side)
+
+        for side in (0, 1):
+            if self.called[side] and door_clear(side):
+                self.send(side, self.called[side].pop(0))
+
+        if afloat is not None:
+            afloat()
+        self.spawn_in -= dt
+        if self.spawn_in <= 0:
+            n = self.spawned
+            side = (0, 1, 1, 0, 1, 0, 0, 1)[n % 8]
+            marching = sum(rc["side"] == side and rc["hit"] is None
+                           for rc in self.redcoats)
+            if marching < 2 and door_clear(side):
+                self.send(side, "foot")
+                self.spawn_in = (6.0, 4.5, 7.5, 5.0)[n % 4]
+            else:
+                self.spawn_in = 1.0
+
+        for i in (0, 1):
+            targets = [rc for rc in self.redcoats
+                       if rc["side"] == i and rc["hit"] is None]
+            nearest = min(targets, key=lambda rc: rc["d"], default=None)
+            if not self.busy(i):
+                self.drill_target[i] = None
+                if self.calling(i):
+                    continue  # his hands are on the horn
+                # He fires on men in the open before one behind a rock.
+                near = [rc for rc in targets
+                        if self.trail_p(rc["d"]) >= self.ENGAGE_P]
+                open_ = [rc for rc in near if rc.get("hid") is None]
+                pick = min(open_ or near, key=lambda rc: rc["d"],
+                           default=None)
+                if pick:
+                    self.drill_start[i] = self.phase
+                    self.drill_target[i] = pick
+                    self.drill_fired[i] = False
+                continue
+            tau = self.drill_t(i)
+            target = self.drill_target[i]
+            if target is None and 0 <= tau < self.SHOT_AT:
+                # Called by the bugle: he takes whoever is closest.
+                self.drill_target[i] = target = nearest
+            if tau >= self.SHOT_AT and not self.drill_fired[i]:
+                self.drill_fired[i] = True
+                if target is not None and target["hit"] is None \
+                        and target.get("hid") is not None:
+                    # Behind the boulder, only every third shot finds him.
+                    target["ducked"] += 1
+                    target["shot_at"] = self.phase
+                    if target["ducked"] % 3:
+                        if self.boulders[target["rock"]]:
+                            self.chipped[target["rock"]] = self.phase
+                        continue
+                if target is not None and target["hit"] is None:
+                    target["hp"] -= 1
+                    target["struck"] = self.phase
+                    if target["hp"] <= 0:
+                        target["hit"] = self.phase
+                        self.tally["shot"] += 1
+
+
 class CpuView(Gtk.DrawingArea):
     """Every physical core as a tile, each of its threads a live load bar.
 
@@ -1979,31 +2389,20 @@ class CpuView(Gtk.DrawingArea):
         self.phase = 0.0
         self.last_draw = -1.0
         self._t0 = None
-        self.drill_start = [None, None]   # phase each tower sentry knelt
-        self.drill_target = [None, None]  # the redcoat he is aiming at
-        self.drill_fired = [False, False]
-        self.redcoats = []
-        self.spawned = 0
-        self.spawn_in = 1.0
-        self.called = [[], []]            # kinds waiting at each barracks
-        self.pending_call = None          # (side, phase) of a lone click
-        self.relief = None                # a tower's call for the gun
-        self.has_walker = False           # room on the wall for him to walk
+        self.siege = Siege(seed=7)        # the rules; this view draws them
+        self.siege.boulders = [False, False]  # none laid until drawn
+        self.siege.has_walker = False
         self.gun_facing = 1
-        self.gun_at = 0.5                 # along the wall walk, 0..1
         self.stains = []                  # (x, y, size, phase) of the fallen
-        self.wave_in = 45.0
-        self.waves = 0
         self.barracks_box = [None, None]  # (x0, y0, x1, y1) as last drawn
         self.trails = None                # each side's trail, as last drawn
         self.redcoat_s = 14.0             # a redcoat's size at the near end
-        self.bugle_at = None              # phase the walker last sounded
         self.walker_halted = 0.0          # seconds he has stood still
         self.walker_facing = 1            # as last drawn
         self.walker_at = None             # (x, feet) as last drawn
         self.sentries_at = None           # (towers, floor, size) as drawn
         self.potshot = None               # his shot at a boat, if taking one
-        self.potshot_after = 0.0          # phase he may next shoot at one
+        self.potshot_after = 0.0          # siege time he may next shoot
         self.overboard = []               # men shot out of the boats
         self.fort_box = None              # (x0, y0, x1, y1) as last drawn
         self.river = None                 # its course, as last laid out
@@ -2035,17 +2434,14 @@ class CpuView(Gtk.DrawingArea):
         self.reserved = set(reserved)
         if not on:
             # Standing down sends everyone home; the next siege starts fresh.
-            self.redcoats = []
             self.boats = []
             self.potshot = None
             self.overboard = []
-            self.called = [[], []]
-            self.pending_call = None
-            self.relief = None
-            self.gun_at = 0.5
+            self.potshot_after = 0.0
             self.stains = []
-            self.drill_start = [None, None]
-            self.drill_target = [None, None]
+            old, self.siege = self.siege, Siege(seed=7)
+            self.siege.boulders = old.boulders
+            self.siege.has_walker = old.has_walker
         self.on = on
         self.queue_draw()
 
@@ -2076,7 +2472,7 @@ class CpuView(Gtk.DrawingArea):
         prev = self.phase
         self.phase = (now - self._t0) / 1_000_000.0
         dt = max(0.0, self.phase - prev)
-        self._advance(min(dt, 0.1))
+        self._advance(min(dt, 0.1), dt)
         self.world_at = GLib.get_monotonic_time() / 1_000_000.0
         # Frame-rate independent easing: the same glide at 30 Hz or 144 Hz.
         k = 1.0 - math.exp(-dt * 7.0)
@@ -2123,294 +2519,47 @@ class CpuView(Gtk.DrawingArea):
         sends a boatload of redcoats down it, to the nearer ford."""
         i = self._barracks_at(x, y)
         if i is not None:
-            if n >= 2:
-                self.pending_call = None
-                self._call(i, self.WAVE)
-            else:
-                # Held until a second click could no longer come, so a
-                # double click does not also send the file.
-                self.pending_call = (i, self.phase)
+            self.siege.click_barracks(i, n, self._double_click_s())
             return
         if not self._on_fort(x, y):
             if self.on and self._on_river(x, y):
                 self._launch_boat(0 if x < self.river["w"] / 2 else 1)
             return
-        if self._bugling() or self.relief is not None \
-                or self.potshot is not None:
-            return
-        self.bugle_at = self.phase
-        i = 1 if self.walker_facing > 0 else 0
-        if not self._busy(i):
-            self.drill_start[i] = self.phase + self.BUGLE_HEARD
-            self.drill_target[i] = None
-            self.drill_fired[i] = False
-
-    # -- the siege --------------------------------------------------------
-
-    MARCH_FAR = 6.0     # a new redcoat is this many times farther than...
-    MARCH_NEAR = 1.0    # ...one at the near end of the trail
-    MARCH_S = 26.0      # seconds to walk the whole trail
-    ENGAGE_P = 0.5      # how far down the trail a sentry opens fire
-    FALL_S = 1.6        # a shot redcoat topples and fades over this long
-    FLEE_S = 3.5        # a riderless horse is off the picture within this
-    DOOR_GAP = 0.3      # how far one must march before the next comes out
-    DOOR_OPEN_S = 1.2   # the barracks door stands open this long for each
-    CALLED_MAX = 16     # most a barracks will hold on call
-    FILE = ("foot",) * 3
-    WAVE = ("horse", "horse", "horse", "cannon")
-    PACE = {"foot": 1.0, "horse": 2.6, "cannon": 0.45}
-    HP = {"foot": 1, "horse": 1, "cannon": 5}
-    WAVE_EVERY = (75.0, 105.0, 90.0)
-    COVER_P = 0.64      # where on the trail a boulder offers cover
-    HIDE_S = 9.5        # how long a man crouches behind it, at least...
-    LULL_S = 5.0        # ...and until he has not been shot at for this long
-    AT_WALL = 2         # how many beat on the wall at once
-    QUEUE_P = 0.08      # trail between each in the queue behind them
-
-    def _call(self, side, kinds):
-        q = self.called[side]
-        q.extend(kinds[:max(0, self.CALLED_MAX - len(q))])
+        self.siege.sound_bugle(1 if self.walker_facing > 0 else 0,
+                               self.potshot is not None)
 
     def _double_click_s(self):
         settings = self.get_settings()
         ms = settings.props.gtk_double_click_time if settings else 400
         return ms / 1000.0
 
-    @classmethod
-    def _trail_p(cls, d):
-        """Screen position along the trail, 0 far to 1 near, for a redcoat
-        at distance d. Size goes as 1/d, and so does the trail on screen,
-        so a steady march seems to speed up as he comes closer."""
-        far = 1 / cls.MARCH_FAR
-        return (1 / d - far) / (1 / cls.MARCH_NEAR - far)
-
-    @classmethod
-    def _trail_d(cls, p):
-        """The distance at which a redcoat stands at screen position p."""
-        far = 1 / cls.MARCH_FAR
-        return 1 / (far + p * (1 / cls.MARCH_NEAR - far))
-
-    # The call for relief, in seconds from the tower sentry's first note:
-    # the walker hears it, runs to the gun, cranks it up and fires, then
-    # runs back while the ball flies.
-    HEARD_AT = 0.6
-    RUN_S = 1.0
-    WHEEL_AT = HEARD_AT + RUN_S
-    WHEEL_S = 1.2
-    CRANK_AT = WHEEL_AT + WHEEL_S
-    FIRE_AT = CRANK_AT + 1.2
-    FLIGHT_S = 1.4
-    RELIEF_LEN = FIRE_AT + FLIGHT_S + 1.0
-    GUN_POST = (0.2, 0.8)   # where on the wall walk he wheels it, per side
-    BLAST_P = 0.85      # the blast takes queued redcoats this near the wall
-
-    def _relief_t(self):
-        r = self.relief
-        return None if r is None else self.phase - r["t0"]
-
-    def _calling(self, i):
-        """Tower sentry i is blowing his horn for the gun."""
-        t = self._relief_t()
-        return t is not None and self.relief["side"] == i \
-            and t < self.BUGLE_LEN
-
-    def _advance_relief(self):
-        """A tower sentry with redcoats at the foot of his wall calls for
-        the gun; when the ball lands, it takes them all."""
-        r = self.relief
-        if r is None:
-            # Called while the walker shoots at a boat, it waits for him.
-            if not self.has_walker or self._bugling() \
-                    or self.potshot is not None:
-                return
-            for i in (0, 1):
-                if not self._busy(i) and any(
-                        rc["side"] == i and rc["hit"] is None
-                        and self._at_wall(rc) for rc in self.redcoats):
-                    self.relief = {"side": i, "t0": self.phase,
-                                   "landed": False, "from": self.gun_at}
-                    return
-            return
-        t = self.phase - r["t0"]
-        if not r["landed"] and t >= self.FIRE_AT + self.FLIGHT_S:
-            r["landed"] = True
-            for rc in self.redcoats:
-                if rc["side"] == r["side"] and rc["hit"] is None and (
-                        self._at_wall(rc)
-                        or self._trail_p(rc["d"]) >= self.BLAST_P):
-                    rc["hp"] = 0
-                    rc["hit"] = self.phase
-        if t >= self.RELIEF_LEN:
-            self.gun_at = self.GUN_POST[r["side"]]
-            self.relief = None
-
-    def _gun_frac(self):
-        """Where the fort's gun stands, as a fraction of the wall walk."""
-        r = self.relief
-        if r is None:
-            return self.gun_at
-        k = self._ramp(self.phase - r["t0"], self.WHEEL_AT,
-                       self.WHEEL_AT + self.WHEEL_S)
-        return r["from"] + (self.GUN_POST[r["side"]] - r["from"]) * k
-
-    def _advance(self, dt):
-        """Step the scene: the walker's halts, the redcoats' march, and the
-        sentries choosing whom to shoot. The valley's clock runs on
-        whether the fort is up or down."""
+    def _advance(self, dt, elapsed=None):
+        """Step the scene: the walker's halts, and the siege, which runs
+        the redcoats, the sentries and the gun while the fort is up. The
+        valley's clock runs on whether the fort is up or down. elapsed is
+        how long the clock really moved, if a stalled frame is stepped by
+        only dt."""
         self.world.advance(dt * self.time_scale)
         # The current slows under the winter ice.
         self.current += dt * 0.035 * (1 - 0.7 * self.look["winter"])
-        if self._bugling() or self.relief is not None \
+        siege = self.siege
+        if self.on:
+            siege.tick(dt if elapsed is None else elapsed)
+        if siege.bugling() or siege.relief is not None \
                 or self.potshot is not None:
             self.walker_halted += dt
         if not self.on:
             if self.wild is not None:
                 self._advance_horses(dt)
             return
-        self._advance_relief()
+        siege.advance(dt, self.potshot is not None,
+                      lambda: self._advance_afloat(dt))
+
+    def _advance_afloat(self, dt):
+        """Between the barracks' calls and the new arrivals: the walker's
+        shots at the boats, and the boats themselves."""
         self._advance_potshot()
-        speed = (self.MARCH_FAR - self.MARCH_NEAR) / self.MARCH_S
-        for side in (0, 1):
-            # Two at a time beat on the wall; the rest wait in a queue back
-            # up the trail, and all of it shuffles forward when a place at
-            # the wall comes free.
-            halted = [rc for rc in self.redcoats if rc["side"] == side
-                      and rc["hit"] is None and rc["at_wall"] is not None]
-            front = {rc["slot"] for rc in halted if rc["slot"] < self.AT_WALL}
-            if len(front) < self.AT_WALL:
-                for rc in halted:
-                    if rc["slot"] >= self.AT_WALL:
-                        rc["at_wall"] = None
-                halted = [rc for rc in halted if rc["at_wall"] is not None]
-            moving = sorted((rc for rc in self.redcoats
-                             if rc["side"] == side and rc["hit"] is None
-                             and rc["at_wall"] is None),
-                            key=lambda rc: rc["d"])
-            rock = self.rocks[side]
-            nearest = min((rc for rc in self.redcoats if rc["side"] == side
-                           and rc["hit"] is None), key=lambda rc: rc["d"],
-                          default=None)
-            for rc in moving:
-                if rc.get("hid") is not None:
-                    # Not until the fire on him slackens: under steady fire
-                    # he stays down until the third shot finds him.
-                    if self.phase - rc["hid"] < self.HIDE_S or \
-                            self.phase - rc["shot_at"] < self.LULL_S:
-                        continue
-                    rc["hid"], rc["rose"] = None, self.phase
-                was = self._trail_p(rc["d"])
-                rc["d"] = max(self.MARCH_NEAR,
-                              rc["d"] - speed * self.PACE[rc["kind"]] * dt)
-                # A man on foot who reaches the boulder with a rifle on him
-                # drops behind it, once.
-                if rock and rc["kind"] == "foot" and "rock" not in rc \
-                        and was < self.COVER_P <= self._trail_p(rc["d"]) \
-                        and (self.drill_target[side] is rc
-                             or rc is nearest) \
-                        and not any(o.get("hid") is not None
-                                    and o["side"] == side
-                                    and o["hit"] is None
-                                    for o in self.redcoats):
-                    rc.update(d=rock["d"], hid=self.phase, rock=side,
-                              ducked=0, shot_at=self.phase)
-                    continue
-                k = len(halted)
-                stop = 1.0 if k < self.AT_WALL \
-                    else 1.0 - self.QUEUE_P * (k - self.AT_WALL + 1)
-                if self._trail_p(rc["d"]) >= stop - 1e-9:
-                    rc["at_wall"] = self.phase
-                    taken = {o["slot"] for o in halted}
-                    rc["slot"] = min(set(range(k + 1)) - taken) \
-                        if k < self.AT_WALL else k
-                    halted.append(rc)
-        self.redcoats = [rc for rc in self.redcoats if rc["hit"] is None
-                         or self.phase - rc["hit"] < (
-                             self.FLEE_S if rc["kind"] == "horse"
-                             else self.FALL_S)]
-
-        if self.pending_call is not None and \
-                self.phase - self.pending_call[1] > self._double_click_s():
-            self._call(self.pending_call[0], self.FILE)
-            self.pending_call = None
-        self.wave_in -= dt
-        if self.wave_in <= 0:
-            self._call(self.waves % 2, self.WAVE)
-            self.wave_in = self.WAVE_EVERY[self.waves % 3]
-            self.waves += 1
-
-        def door_clear(side):
-            return all(rc["d"] < self.MARCH_FAR - self.DOOR_GAP
-                       for rc in self.redcoats if rc["side"] == side)
-
-        send = self._send
-        for side in (0, 1):
-            if self.called[side] and door_clear(side):
-                send(side, self.called[side].pop(0))
-
         self._advance_boats(dt)
-        self.spawn_in -= dt
-        if self.spawn_in <= 0:
-            n = self.spawned
-            side = (0, 1, 1, 0, 1, 0, 0, 1)[n % 8]
-            marching = sum(rc["side"] == side and rc["hit"] is None
-                           for rc in self.redcoats)
-            if marching < 2 and door_clear(side):
-                send(side, "foot")
-                self.spawn_in = (6.0, 4.5, 7.5, 5.0)[n % 4]
-            else:
-                self.spawn_in = 1.0
-
-        for i in (0, 1):
-            targets = [rc for rc in self.redcoats
-                       if rc["side"] == i and rc["hit"] is None]
-            nearest = min(targets, key=lambda rc: rc["d"], default=None)
-            if not self._busy(i):
-                self.drill_target[i] = None
-                if self._calling(i):
-                    continue  # his hands are on the horn
-                # He fires on men in the open before one behind a rock.
-                near = [rc for rc in targets
-                        if self._trail_p(rc["d"]) >= self.ENGAGE_P]
-                open_ = [rc for rc in near if rc.get("hid") is None]
-                pick = min(open_ or near, key=lambda rc: rc["d"],
-                           default=None)
-                if pick:
-                    self.drill_start[i] = self.phase
-                    self.drill_target[i] = pick
-                    self.drill_fired[i] = False
-                continue
-            tau = self._drill_t(i)
-            target = self.drill_target[i]
-            if target is None and 0 <= tau < self.SHOT_AT:
-                # Called by the bugle: he takes whoever is closest.
-                self.drill_target[i] = target = nearest
-            if tau >= self.SHOT_AT and not self.drill_fired[i]:
-                self.drill_fired[i] = True
-                if target is not None and target["hit"] is None \
-                        and target.get("hid") is not None:
-                    # Behind the boulder, only every third shot finds him.
-                    target["ducked"] += 1
-                    target["shot_at"] = self.phase
-                    if target["ducked"] % 3:
-                        rock = self.rocks[target["rock"]]
-                        if rock:
-                            rock["chip"] = self.phase
-                        continue
-                if target is not None and target["hit"] is None:
-                    target["hp"] -= 1
-                    target["struck"] = self.phase
-                    if target["hp"] <= 0:
-                        target["hit"] = self.phase
-
-    def _send(self, side, kind, d=None, boat=None):
-        """A redcoat sets out from the barracks on trail side, or, given d
-        and the boat's bow, steps ashore from it there."""
-        self.redcoats.append({"side": side, "d": d or self.MARCH_FAR,
-                              "hit": None, "n": self.spawned,
-                              "born": self.phase, "kind": kind,
-                              "hp": self.HP[kind], "struck": None,
-                              "at_wall": None, "slot": 0, "boat": boat})
-        self.spawned += 1
 
     # -- the boats --------------------------------------------------------
 
@@ -2476,10 +2625,10 @@ class CpuView(Gtk.DrawingArea):
         m = self._boat_m(b["side"])
         stop = self._boat_stop(b)
         if b["left"] is not None:
-            pull = 1.0 - self._ramp(self.phase - b["left"], 0.0, 2.5)
+            pull = 1.0 - self._ramp(self.siege.phase - b["left"], 0.0, 2.5)
         elif b["adrift"] is not None:
             t, pull = b["adrift"]
-            pull *= 1.0 - self._ramp(self.phase - t, 0.0, 2.5)
+            pull *= 1.0 - self._ramp(self.siege.phase - t, 0.0, 2.5)
         elif stop is None:
             pull = 0.0
         else:
@@ -2520,20 +2669,19 @@ class CpuView(Gtk.DrawingArea):
                 v *= max(0.2, min(1.0, (stop - b["x"]) / m))
                 b["x"] = min(stop, b["x"] + v * dt)
                 if b["x"] >= stop - 0.5:
-                    b["landed"] = self.phase
-                    b["next_at"] = self.phase + 0.5
+                    b["landed"] = self.siege.phase
+                    b["next_at"] = self.siege.phase + 0.5
             elif b["landed"] is not None and b["men"] > 0:
-                if self.phase >= b["next_at"]:
-                    self._send(b["side"], "foot",
-                               self._trail_d(self._landing_p(b["side"])),
-                               self._bow(b))
+                if self.siege.phase >= b["next_at"]:
+                    self.siege.land(b["side"], Siege.trail_d(
+                        self._landing_p(b["side"])), self._bow(b))
                     b["men"] -= 1
                     b["next_at"] += self.LAND_GAP_S
                     if b["men"] == 0:
-                        b["left"] = self.phase
+                        b["left"] = self.siege.phase
             else:
                 if b["left"] is not None:
-                    v *= 0.3 + 0.7 * self._ramp(self.phase - b["left"],
+                    v *= 0.3 + 0.7 * self._ramp(self.siege.phase - b["left"],
                                                 0.0, 3.0)
                 elif b["adrift"] is not None:
                     v *= 0.6
@@ -2542,10 +2690,10 @@ class CpuView(Gtk.DrawingArea):
                       if b["x"] < self.river["w"] + 2 * self._boat_m(
                           b["side"])]
         for f in self.overboard:
-            if f["at"] is None and self.phase - f["t0"] >= self.SLUMP_S:
+            if f["at"] is None and self.siege.phase - f["t0"] >= self.SLUMP_S:
                 f["at"] = self._aboard(f["boat"], f["slot"])
         self.overboard = [f for f in self.overboard
-                          if self.phase - f["t0"] < self.STAIN_S]
+                          if self.siege.phase - f["t0"] < self.STAIN_S]
 
     # -- the walker's shots at the boats ----------------------------------
 
@@ -2559,14 +2707,14 @@ class CpuView(Gtk.DrawingArea):
         a man out of it."""
         ps = self.potshot
         if ps is None:
-            if not self.has_walker or self.walker_at is None \
-                    or self._bugling() or self.relief is not None \
-                    or self.phase < self.potshot_after:
+            if not self.siege.has_walker or self.walker_at is None \
+                    or self.siege.bugling() or self.siege.relief is not None \
+                    or self.siege.phase < self.potshot_after:
                 return
             wx, wy = self.walker_at
             # Only a boat whose man to be hit will still be in sight when
             # he fires and goes over: no boat rows faster than full speed.
-            ahead = self.redcoat_s * 0.45 * (self.SHOT_AT + self.SLUMP_S)
+            ahead = self.redcoat_s * 0.45 * (Siege.SHOT_AT + self.SLUMP_S)
             afloat = [b for b in self.boats if b["men"] > 0
                       and b["landed"] is None and 0 <= b["x"]
                       and self._aboard(b, b["men"] - 1)[0] + ahead
@@ -2575,15 +2723,15 @@ class CpuView(Gtk.DrawingArea):
             b = min(afloat, key=lambda b: math.hypot(
                 b["x"] - wx, self._boat_at(b)[1] - wy), default=None)
             if b is not None:
-                self.potshot = {"t0": self.phase, "boat": b, "fired": False}
+                self.potshot = {"t0": self.siege.phase, "boat": b, "fired": False}
             return
-        tau = self.phase - ps["t0"]
-        if tau >= self.SHOT_AT and not ps["fired"]:
+        tau = self.siege.phase - ps["t0"]
+        if tau >= Siege.SHOT_AT and not ps["fired"]:
             ps["fired"] = True
             self._shoot_aboard(ps["boat"])
-        if tau >= self.DRILL_LEN or tau < 0:
+        if tau >= Siege.DRILL_LEN or tau < 0:
             self.potshot = None
-            self.potshot_after = self.phase + self.POTSHOT_REST
+            self.potshot_after = self.siege.phase + self.POTSHOT_REST
 
     def _clear_shot(self, b):
         """Whether the walker's line of fire at b, as he draws it, passes
@@ -2611,13 +2759,13 @@ class CpuView(Gtk.DrawingArea):
         pull = self._boat_at(b)[2]
         b["men"] -= 1
         self.overboard.append({"boat": b, "slot": b["men"], "s":
-                               self._boat_m(b["side"]), "t0": self.phase,
+                               self._boat_m(b["side"]), "t0": self.siege.phase,
                                "at": None, "n": b["n"] * 4 + b["men"]})
         if b["men"] == 0:
             if b["landed"] is None:
-                b["adrift"] = (self.phase, pull)
+                b["adrift"] = (self.siege.phase, pull)
             else:
-                b["left"] = self.phase
+                b["left"] = self.siege.phase
 
     @staticmethod
     def _bateau(cr, x, y, s, men, stroke, tilt, flag):
@@ -2763,7 +2911,7 @@ class CpuView(Gtk.DrawingArea):
     def _draw_overboard(self, cr, f):
         """The man slumps where he sat, then tips forward over the near
         gunwale, in front of the hull, and down into the water."""
-        e = self.phase - f["t0"]
+        e = self.siege.phase - f["t0"]
         over = self._ramp(e, self.SLUMP_S, self.SLUMP_S + self.OVER_S)
         if over >= 1.0:
             return
@@ -2789,7 +2937,7 @@ class CpuView(Gtk.DrawingArea):
         on the water and drifting downstream."""
         if f["at"] is None:
             return
-        e = self.phase - f["t0"] - self.SLUMP_S - self.OVER_S * 0.6
+        e = self.siege.phase - f["t0"] - self.SLUMP_S - self.OVER_S * 0.6
         if e < 0:
             return
         x, y = f["at"]
@@ -3751,50 +3899,7 @@ class CpuView(Gtk.DrawingArea):
                          X + W + tower_w * 0.35, Y + H)
         return towers, floor, (X + tower_w, X + W - tower_w), Y - wall * 0.9
 
-    DRILL_LEN = 4.6     # from kneeling to the last of the smoke
-    SHOT_AT = 2.0       # he fires this far into it
-
-    BUGLE_LEN = 2.0     # from raising the bugle to lowering it
-    BUGLE_HEARD = 1.2   # the tower sentry starts his drill this far in
-
-    @staticmethod
-    def _ramp(tau, a, b):
-        u = min(1.0, max(0.0, (tau - a) / (b - a)))
-        return u * u * (3 - 2 * u)
-
-    def _drill_t(self, i):
-        """Seconds into tower sentry i's drill; negative while he waits on
-        the bugle, DRILL_LEN or more once he is done."""
-        start = self.drill_start[i]
-        return self.DRILL_LEN if start is None else self.phase - start
-
-    def _busy(self, i):
-        return self._drill_t(i) < self.DRILL_LEN
-
-    def _drilling(self, i):
-        return 0 <= self._drill_t(i) < self.DRILL_LEN
-
-    def _drill(self, i):
-        """Tower sentry i kneels, takes aim and fires. Returns (kneel, aim,
-        seconds since the shot or -1)."""
-        return self._drill_pose(self._drill_t(i))
-
-    @classmethod
-    def _drill_pose(cls, tau):
-        """The same, tau seconds into a drill."""
-        kneel = cls._ramp(tau, 0.0, 0.6) - cls._ramp(tau, 3.2, 3.8)
-        aim = cls._ramp(tau, 0.4, 1.1) - cls._ramp(tau, 2.8, 3.4)
-        shot = tau - cls.SHOT_AT if cls.SHOT_AT <= tau < cls.DRILL_LEN \
-            else -1.0
-        return kneel, aim, shot
-
-    def _bugle_t(self):
-        if self.bugle_at is None:
-            return self.BUGLE_LEN
-        return self.phase - self.bugle_at
-
-    def _bugling(self):
-        return self._bugle_t() < self.BUGLE_LEN
+    _ramp = staticmethod(Siege.ramp)
 
     def _horn(self, tau):
         """A call tau seconds in. Returns (how far the horn is raised,
@@ -3805,7 +3910,7 @@ class CpuView(Gtk.DrawingArea):
 
     def _bugle(self):
         """The walker's call."""
-        return self._horn(self._bugle_t())
+        return self._horn(self.siege.bugle_t())
 
     @staticmethod
     def _bezier(pts, p):
@@ -3817,7 +3922,7 @@ class CpuView(Gtk.DrawingArea):
 
     def _depth_scale(self, p):
         """Size at screen position p on a trail, 1 at the near end."""
-        far = self.MARCH_NEAR / self.MARCH_FAR
+        far = Siege.MARCH_NEAR / Siege.MARCH_FAR
         return far + (1 - far) * p
 
     # How far from the wall each kind stands to reach it, and how much room
@@ -3826,36 +3931,23 @@ class CpuView(Gtk.DrawingArea):
     BREADTH = {"foot": 0.5, "horse": 0.95, "cannon": 0.8}
     CHEST = {"foot": 0.6, "horse": 0.75, "cannon": 0.2}
 
-    def _at_wall(self, rc):
-        """At the wall itself, rather than waiting in the queue behind."""
-        return rc["at_wall"] is not None and rc["slot"] < self.AT_WALL
-
-    def _cover(self, rc):
-        """How far a redcoat has stepped off the trail behind his boulder,
-        0..1: he ducks in quickly and steps out again more slowly."""
-        if "rock" not in rc or not self.rocks[rc["rock"]]:
-            return 0.0
-        if rc["hid"] is not None:
-            return self._ramp(self.phase - rc["hid"], 0.0, 0.35)
-        return 1.0 - self._ramp(self.phase - rc["rose"], 0.0, 0.6)
-
     def _redcoat_at(self, rc):
         """Where a redcoat stands: (x, feet, size)."""
-        p = self._trail_p(rc["d"])
+        p = Siege.trail_p(rc["d"])
         x, y = self._bezier(self.trails[rc["side"]], p)
         size = self.redcoat_s * self._depth_scale(p)
-        ashore = self.phase - rc["born"]
+        ashore = self.siege.phase - rc["born"]
         if rc.get("boat") and ashore < self.ASHORE_S:
             # A hop from the bow up onto the bank.
             u = self._ramp(ashore, 0.0, self.ASHORE_S)
             bx, by = rc["boat"]
             x, y = bx + (x - bx) * u, by + (y - by) * u \
                 - math.sin(u * math.pi) * size * 0.25
-        cover = self._cover(rc)
+        cover = self.siege.cover(rc)
         if cover > 0:
             rock = self.rocks[rc["rock"]]
             x += (rock["x"] + rock["inward"] * rock["w"] * 0.08 - x) * cover
-        if self._at_wall(rc):
+        if self.siege.at_wall(rc):
             outward = -1 if rc["side"] == 0 else 1
             x += outward * size * (self.STANDOFF[rc["kind"]]
                                    + rc["slot"] * 0.7)
@@ -3912,7 +4004,7 @@ class CpuView(Gtk.DrawingArea):
         for fx in (0.1, 0.27, 0.61, 0.78):
             cr.rectangle(x0 + fx * B, top + 0.1 * B, 0.11 * B, 0.12 * B)
         cr.fill()
-        opening = self._door_open(i)
+        opening = self.siege.door_open(i)
         cr.set_source_rgb(*((0.05, 0.03, 0.03) if opening else WOOD_RGB))
         cr.rectangle(x - 0.08 * B, y - 0.27 * B, 0.16 * B, 0.27 * B)
         cr.fill()
@@ -3931,12 +4023,6 @@ class CpuView(Gtk.DrawingArea):
         cr.fill()
         self.barracks_box[i] = (x0 - 3, peak - 0.36 * B - 3, x0 + B + 3,
                                 y + 3)
-
-    def _door_open(self, i):
-        """Someone has just come out of barracks i (not off a boat)."""
-        return any(rc["side"] == i and not rc.get("boat")
-                   and self.phase - rc["born"] < self.DOOR_OPEN_S
-                   for rc in self.redcoats)
 
     STAIN_S = 8.0       # a pool of blood fades out over this long
 
@@ -3975,12 +4061,11 @@ class CpuView(Gtk.DrawingArea):
         """A boulder at the outer edge of each trail at COVER_P, unless
         the trail is in the river there. Between the fort's wall and the
         trail there is no room for one."""
-        old = self.rocks
         self.rocks = [None, None]
         mud = self.river["half"] * 0.35 + 1
         for side, pts in enumerate(self.trails):
-            x, y = self._bezier(pts, self.COVER_P)
-            size = self.redcoat_s * self._depth_scale(self.COVER_P)
+            x, y = self._bezier(pts, Siege.COVER_P)
+            size = self.redcoat_s * self._depth_scale(Siege.COVER_P)
             inward = 1 if side == 0 else -1
             x -= inward * size * 0.75
             base, h = y + 0.12 * size, 0.55 * size
@@ -3988,8 +4073,9 @@ class CpuView(Gtk.DrawingArea):
                 continue
             self.rocks[side] = {
                 "x": x, "base": base, "w": 1.1 * size, "h": h,
-                "inward": inward, "d": self._trail_d(self.COVER_P),
-                "chip": old[side]["chip"] if old[side] else None}
+                "inward": inward, "d": Siege.trail_d(Siege.COVER_P),
+                "side": side}
+        self.siege.boulders = [bool(r) for r in self.rocks]
 
     @staticmethod
     def _rock(cr, x, base, w, h, seed):
@@ -4061,46 +4147,47 @@ class CpuView(Gtk.DrawingArea):
     def _draw_rock(self, cr, rock):
         self._rock(cr, rock["x"], rock["base"], rock["w"], rock["h"],
                    rock["inward"])
-        if rock["chip"] is not None:
+        chip = self.siege.chipped[rock["side"]]
+        if chip is not None:
             # The ball comes in from the fort's side of the boulder.
             self._chips(cr, rock["x"] + rock["inward"] * rock["w"] * 0.15,
                         rock["base"] - rock["h"] * 0.85, rock["h"] * 1.6,
-                        self.phase - rock["chip"])
+                        self.siege.phase - chip)
 
     def _draw_redcoats(self, cr):
         self._draw_stains(cr)
         # Each boulder is drawn just after anyone crouched behind it, and
         # before anyone nearer the fort.
-        items = [(-rc["d"], 0, rc) for rc in self.redcoats]
+        items = [(-rc["d"], 0, rc) for rc in self.siege.redcoats]
         items += [(-rock["d"], 1, rock) for rock in self.rocks if rock]
         for _, is_rock, rc in sorted(items, key=lambda it: it[:2]):
             if is_rock:
                 self._draw_rock(cr, rc)
                 continue
             x, feet, size = self._redcoat_at(rc)
-            p = self._trail_p(rc["d"])
+            p = Siege.trail_p(rc["d"])
             pts = self.trails[rc["side"]]
             toward = 1 if rc["side"] == 0 else -1
             ahead = self._bezier(pts, min(1.0, p + 0.02))[0] - x
             facing = (1 if ahead > 0 else -1) \
-                if abs(ahead) > 0.3 and not self._at_wall(rc) else toward
+                if abs(ahead) > 0.3 and not self.siege.at_wall(rc) else toward
             alive = rc["hit"] is None
             marching = alive and rc["at_wall"] is None
-            fall = 0.0 if alive else (self.phase - rc["hit"]) / self.FALL_S
-            pound = self.phase - rc["at_wall"] \
-                if alive and self._at_wall(rc) else -1.0
+            fall = 0.0 if alive else (self.siege.phase - rc["hit"]) / Siege.FALL_S
+            pound = self.siege.phase - rc["at_wall"] \
+                if alive and self.siege.at_wall(rc) else -1.0
             kind = rc["kind"]
             if kind == "horse" and not alive:
                 # The rider drops from the saddle and dies where he lands;
                 # his horse bolts riderless off the side of the picture.
-                e = self.phase - rc["hit"]
+                e = self.siege.phase - rc["hit"]
                 away = -toward
                 self._cavalry(cr, x + away * size * 2.4 * e ** 1.4, feet,
                               size, away, self.phase * 16 + rc["n"], 0.0,
                               rider=False)
                 drop = size * 0.55 * (1 - min(1.0, e / 0.35))
                 self._redcoat(cr, x, feet - drop, size, facing, 0.0,
-                              min(1.0, e / self.FALL_S))
+                              min(1.0, e / Siege.FALL_S))
             elif kind == "horse":
                 self._cavalry(cr, x, feet, size, facing,
                               self.phase * 11 + rc["n"], fall, pound,
@@ -4112,13 +4199,13 @@ class CpuView(Gtk.DrawingArea):
                 self._redcoat(cr, x - facing * size * 0.55, feet,
                               size * 0.95, facing, step, fall)
                 struck = -1.0 if rc["struck"] is None \
-                    else self.phase - rc["struck"]
+                    else self.siege.phase - rc["struck"]
                 boom = pound % 4.0 if pound >= 0 else -1.0
                 self._cannon(cr, x, feet, size, facing,
-                             (self.MARCH_FAR - rc["d"]) * 9, fall, struck,
+                             (Siege.MARCH_FAR - rc["d"]) * 9, fall, struck,
                              boom)
             else:
-                cover = self._cover(rc)
+                cover = self.siege.cover(rc)
                 step = math.sin(self.phase * 6.5 + rc["n"] * 1.7) * 0.35 \
                     if marching and rc.get("hid") is None else 0.0
                 if cover > 0:
@@ -4134,7 +4221,7 @@ class CpuView(Gtk.DrawingArea):
                     self.stains.append((bx - toward * size * 0.35, feet, size,
                                         self.phase))
                 self._spray(cr, bx, feet - size * chest, size, -toward,
-                            self.phase - rc["hit"], rc["n"] * 0.37)
+                            self.siege.phase - rc["hit"], rc["n"] * 0.37)
 
     def _draw_sentries(self, cr, towers, floor, walk, walk_y, t):
         if not self.on:
@@ -4143,16 +4230,16 @@ class CpuView(Gtk.DrawingArea):
         self.sentries_at = (towers, floor, s)
         for i, tx in enumerate(towers):
             outward = -1 if i == 0 else 1
-            if self._calling(i):
+            if self.siege.calling(i):
                 # Turned toward the middle, blowing for the gun.
-                raised, toot = self._horn(self._relief_t())
+                raised, toot = self._horn(self.siege.relief_t())
                 self._mountain_man(cr, tx, floor, s, -outward, bugle=raised,
                                    toot=toot)
                 continue
-            kneel, aim, shot = self._drill(i)
-            if self._drilling(i):
+            kneel, aim, shot = self.siege.drill(i)
+            if self.siege.drilling(i):
                 elev = 0.04
-                target = self.drill_target[i]
+                target = self.siege.drill_target[i]
                 if target is not None and self.trails:
                     rx, feet, size = self._redcoat_at(target)
                     chest = feet - size * self.CHEST[target["kind"]]
@@ -4168,8 +4255,8 @@ class CpuView(Gtk.DrawingArea):
             self._mountain_man(cr, tx, floor, s, -outward if glance
                                else outward, glint=glint)
         x0, x1 = walk
-        self.has_walker = x1 - x0 > s * 0.6
-        if not self.has_walker:
+        self.siege.has_walker = x1 - x0 > s * 0.6
+        if not self.siege.has_walker:
             self.walker_at = None
             return
         # One more walks the wall from tower to tower and back, and stands
@@ -4183,15 +4270,15 @@ class CpuView(Gtk.DrawingArea):
         self.walker_at = (patrol, walk_y)
 
         # The fort's gun stands on the wall walk where it was last wheeled.
-        gun_x, gs = x0 + (x1 - x0) * self._gun_frac(), s * 1.25
-        rt = self._relief_t()
+        gun_x, gs = x0 + (x1 - x0) * self.siege.gun_frac(), s * 1.25
+        rt = self.siege.relief_t()
         if rt is not None:
-            self.gun_facing = -1 if self.relief["side"] == 0 else 1
+            self.gun_facing = -1 if self.siege.relief["side"] == 0 else 1
         gf = self.gun_facing
         pivot = (gun_x - gf * 2 * gs / 100, walk_y - 27 * gs / 100)
         elev, crank, boom, ball = 0.12, None, -1.0, None
         if rt is not None:
-            side = self.relief["side"]
+            side = self.siege.relief["side"]
             nx, ny = self.trails[side][3]
             land = (nx + gf * self.redcoat_s * 0.4, ny)
             # A high lob, steep enough that coming down it still clears the
@@ -4226,13 +4313,13 @@ class CpuView(Gtk.DrawingArea):
                         else (lo, mid)
                 lift = lo
             aim = math.atan2(4 * lift - drop, reach)
-            cranked = self._ramp(rt, self.CRANK_AT, self.FIRE_AT)
-            lowered = self._ramp(rt, self.RELIEF_LEN - 0.8, self.RELIEF_LEN)
+            cranked = self._ramp(rt, Siege.CRANK_AT, Siege.FIRE_AT)
+            lowered = self._ramp(rt, Siege.RELIEF_LEN - 0.8, Siege.RELIEF_LEN)
             elev = 0.12 + (aim - 0.12) * (cranked - lowered)
-            if self.CRANK_AT <= rt < self.FIRE_AT:
+            if Siege.CRANK_AT <= rt < Siege.FIRE_AT:
                 crank = rt * 9.0
-            boom = rt - self.FIRE_AT
-            fly = (rt - self.FIRE_AT) / self.FLIGHT_S
+            boom = rt - Siege.FIRE_AT
+            fly = (rt - Siege.FIRE_AT) / Siege.FLIGHT_S
             if 0 <= fly < 1:
                 ball = (pivot[0] + (land[0] - pivot[0]) * fly,
                         pivot[1] + (land[1] - pivot[1]) * fly
@@ -4241,7 +4328,7 @@ class CpuView(Gtk.DrawingArea):
         if crank is not None:
             handle = (gun_x + gf * (-10 + math.cos(crank) * 9) * gs / 100,
                       walk_y + (-34 + math.sin(crank) * 9) * gs / 100)
-        elif rt is not None and self.WHEEL_AT <= rt < self.CRANK_AT:
+        elif rt is not None and Siege.WHEEL_AT <= rt < Siege.CRANK_AT:
             # Both hands on the end of the trail, pushing.
             handle = (gun_x - gf * 34 * gs / 100, walk_y - 9 * gs / 100)
         self._cannon(cr, gun_x, walk_y, gs, gf, gf * gun_x / (0.14 * gs),
@@ -4251,7 +4338,7 @@ class CpuView(Gtk.DrawingArea):
         if rt is None and self.potshot is not None:
             # Halted, he kneels and fires up at the boat.
             ps = self.potshot
-            kneel, aim, shot = self._drill_pose(self.phase - ps["t0"])
+            kneel, aim, shot = Siege.drill_pose(self.siege.phase - ps["t0"])
             bx, by, _ = self._boat_at(ps["boat"])
             by -= self._boat_m(ps["boat"]["side"]) * 0.3
             rise = (walk_y - ws * 0.52) - by
@@ -4262,7 +4349,7 @@ class CpuView(Gtk.DrawingArea):
                                aim=aim, shot=shot, elev=elev)
         elif rt is None:
             raised, toot = self._bugle()
-            step = 0.0 if self._bugling() \
+            step = 0.0 if self.siege.bugling() \
                 else math.sin(walked * 7.0) * 0.38
             self._mountain_man(cr, patrol, walk_y, ws, self.walker_facing,
                                step=step, shouldered=True, bugle=raised,
@@ -4272,24 +4359,24 @@ class CpuView(Gtk.DrawingArea):
             # wall in trouble, kneels to crank it up, and once it has fired
             # runs back to where he left off.
             station = gun_x - gf * gs * (
-                0.45 - 0.15 * self._ramp(rt, self.CRANK_AT,
-                                         self.CRANK_AT + 0.3))
-            there = self.WHEEL_AT
-            back = self.FIRE_AT + 0.5
-            pushing = there <= rt < self.CRANK_AT
-            if rt < self.HEARD_AT or rt >= back + self.RUN_S:
+                0.45 - 0.15 * self._ramp(rt, Siege.CRANK_AT,
+                                         Siege.CRANK_AT + 0.3))
+            there = Siege.WHEEL_AT
+            back = Siege.FIRE_AT + 0.5
+            pushing = there <= rt < Siege.CRANK_AT
+            if rt < Siege.HEARD_AT or rt >= back + Siege.RUN_S:
                 wx, facing, run = patrol, self.walker_facing, False
             elif rt < there:
-                k = self._ramp(rt, self.HEARD_AT, there)
+                k = self._ramp(rt, Siege.HEARD_AT, there)
                 wx, run = patrol + (station - patrol) * k, True
                 facing = 1 if station >= patrol else -1
             elif rt < back:
                 wx, facing, run = station, gf, False
             else:
-                k = self._ramp(rt, back, back + self.RUN_S)
+                k = self._ramp(rt, back, back + Siege.RUN_S)
                 wx, run = station + (patrol - station) * k, True
                 facing = 1 if patrol >= station else -1
-            kneel = self._ramp(rt, self.CRANK_AT, self.CRANK_AT + 0.3) \
+            kneel = self._ramp(rt, Siege.CRANK_AT, Siege.CRANK_AT + 0.3) \
                 - self._ramp(rt, back - 0.3, back)
             step = math.sin(self.phase * 14.0) * 0.55 if run \
                 else math.sin(self.phase * 8.0) * 0.35 if pushing else 0.0
@@ -4327,8 +4414,8 @@ class CpuView(Gtk.DrawingArea):
             cr.set_source_rgb(*HAT_RGB)
             cr.set_line_width(max(0.8, r * 0.3))
             cr.stroke()
-        if rt is not None and 0 <= rt - self.FIRE_AT - self.FLIGHT_S < 1.0:
-            self._blast(cr, land, rt - self.FIRE_AT - self.FLIGHT_S)
+        if rt is not None and 0 <= rt - Siege.FIRE_AT - Siege.FLIGHT_S < 1.0:
+            self._blast(cr, land, rt - Siege.FIRE_AT - Siege.FLIGHT_S)
 
     def _blast(self, cr, at, e):
         """The ball landing at the foot of the wall, e seconds on."""
@@ -8791,27 +8878,48 @@ def self_test():
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], True)
     view.boats, view.potshot, view.walker_halted = [], None, 0.0
     for facing, phase in ((1, 0.0), (-1, 10.0)):
-        view.bugle_at = None
-        view.phase = phase
+        view.siege.bugle_at = None
+        view.phase = view.siege.phase = phase
         view._draw(view, cr, 1024, 680)
         assert view.walker_facing == facing, (facing, view.walker_facing)
         view._on_click(None, 1, 0, 0)  # empty sky
-        assert not view._bugling()
+        assert not view.siege.bugling()
         x0, y0, x1, y1 = view.fort_box
         view._on_click(None, 1, (x0 + x1) / 2, (y0 + y1) / 2)
-        assert view._bugling(), "a click on the fort sounds the bugle"
+        assert view.siege.bugling(), "a click on the fort sounds the bugle"
         for view.phase in (phase + 0.2, phase + 0.9, phase + 1.8):
+            view.siege.phase = view.phase
             view._draw(view, cr, 1024, 680)
-        view.phase = phase + view.BUGLE_HEARD + 2.05
+        view.phase = view.siege.phase = phase + Siege.BUGLE_HEARD + 2.05
         side = 1 if facing > 0 else 0
-        assert view._drill(side)[2] >= 0, "the sentry he faces fires"
+        assert view.siege.drill(side)[2] >= 0, "the sentry he faces fires"
 
-    # Some minutes of siege: redcoats come, the sentries shoot each one well
-    # before he reaches the fort, and nobody is left standing at its foot.
+    # Some minutes of siege, with no picture: redcoats come, the sentries
+    # shoot each one well before he reaches the fort, and nobody is left
+    # standing at its foot.
+    siege = Siege()
+    siege.wave_in = 1e9  # foot alone; the rest come below
+    hits, closest, hid = set(), 0.0, False
+    for frame in range(150 * 30):
+        siege.run(1 / 30)
+        for rc in siege.redcoats:
+            hid |= rc.get("hid") is not None
+            if rc["hit"] is None:
+                closest = max(closest, Siege.trail_p(rc["d"]))
+            else:
+                hits.add(rc["n"])
+    assert len(hits) >= 10, hits
+    assert hid, "a redcoat under fire takes cover"
+    assert closest < 0.9, f"a redcoat got to {closest:.2f} of the trail"
+    assert siege.tally["shot"] >= 10 and siege.tally["sent"]["foot"] >= 10
+    assert sum(siege.tally["sent"].values()) == siege.spawned
+    assert siege.tally["reached"] == 0, "none got to the wall"
+
+    # The same siege drawn: the picture runs the rules and draws what it
+    # finds, the redcoats, their blood and the boulders among them.
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], True)
-    view.bugle_at = None
-    view.wave_in = view.boat_in = 1e9  # foot alone; the rest come below
+    view.siege.wave_in = view.boat_in = 1e9
 
     def run(seconds, every=15):
         for frame in range(int(seconds * 30)):
@@ -8820,69 +8928,97 @@ def self_test():
             if frame % every == 0:
                 view._draw(view, cr, 1024, 680)
 
-    view.phase, hits, closest, hid = 0.0, set(), 0.0, False
-    for frame in range(150 * 30):
-        run(1 / 30, 1 if frame % 15 == 0 else 2)
-        for rc in view.redcoats:
-            hid |= rc.get("hid") is not None
-            if rc["hit"] is None:
-                closest = max(closest, view._trail_p(rc["d"]))
-            else:
-                hits.add(rc["n"])
-    assert len(hits) >= 10, hits
-    assert hid, "a redcoat under fire takes cover"
-    assert closest < 0.9, f"a redcoat got to {closest:.2f} of the trail"
+    run(60, 15)
+    assert view.siege.spawned >= 5 and view.siege.phase > 59, view.siege.phase
 
     # A click on a barracks sends out a file, once a double click could no
     # longer come; a double click sends a wave and no file.
-    x0, y0, x1, y1 = view.barracks_box[0]
-    mid = ((x0 + x1) / 2, (y0 + y1) / 2)
-    before = view.spawned
-    view._on_click(None, 1, *mid)
-    assert not view.called[0], "a lone click waits out the double click"
-    run(12)
-    assert not view.called[0] and view.spawned - before >= 3
-    view._on_click(None, 1, *mid)
-    view._on_click(None, 2, *mid)
-    assert view.called[0] == list(view.WAVE) and view.pending_call is None
+    siege = Siege()
+    siege.wave_in = siege.spawn_in = 1e9
+    before = siege.spawned
+    siege.click_barracks(0, 1, 0.4)
+    siege.run(0.3)
+    assert not siege.called[0], "a lone click waits out the double click"
+    siege.run(12)
+    assert not siege.called[0] and siege.spawned - before == 3
+    siege.click_barracks(0, 1, 0.4)
+    siege.click_barracks(0, 2, 0.4)
+    assert siege.called[0] == list(Siege.WAVE) and siege.pending_call is None
     cannons = []
     for _ in range(150):
-        run(1, 10)
-        cannons += [rc for rc in view.redcoats
+        siege.run(1)
+        cannons += [rc for rc in siege.redcoats
                     if rc["kind"] != "foot" and rc not in cannons]
     assert not any("rock" in rc for rc in cannons), "only foot take cover"
     cannons = [rc for rc in cannons if rc["kind"] == "cannon"]
-    assert not view.called[0] and len(cannons) == 1, cannons
+    assert not siege.called[0] and len(cannons) == 1, cannons
     assert cannons[0]["hp"] == 0, "the cannon takes five hits"
-    assert not any(rc["kind"] != "foot" for rc in view.redcoats
+    assert not any(rc["kind"] != "foot" for rc in siege.redcoats
                    if rc["hit"] is None), "the sentries see off the wave"
+    assert siege.tally["sent"]["horse"] == 3
+    assert siege.tally["sent"]["cannon"] == 1
+    # The view only translates the click.
+    view.siege.pending_call = None
+    x0, y0, x1, y1 = view.barracks_box[0]
+    mid = ((x0 + x1) / 2, (y0 + y1) / 2)
+    view._on_click(None, 1, *mid)
+    assert view.siege.pending_call and view.siege.pending_call[0] == 0
+    view._on_click(None, 2, *mid)
+    assert view.siege.called[0][-4:] == list(Siege.WAVE)
+    assert view.siege.pending_call is None
 
-    # Whoever reaches the wall beats on it, and is drawn doing so.
-    for kind in ("foot", "horse", "cannon"):
-        view.redcoats.append({"side": 0, "d": 1.05, "hit": None, "n": 99,
-                              "born": 0.0, "kind": kind, "hp": 1,
-                              "struck": None, "at_wall": None, "slot": 0})
-    view.drill_start = [view.phase, view.phase]  # hold fire a moment
-    run(1.5, 3)
-    assert all(rc["at_wall"] is not None for rc in view.redcoats
-               if rc["n"] == 99), "they reach the wall"
-    slots = sorted(rc["slot"] for rc in view.redcoats if rc["n"] == 99)
+    # Whoever reaches the wall beats on it.
+    def stand(kind, n=99, d=1.05, at_wall=None, hp=1):
+        return {"side": 0, "d": d, "hit": None, "n": n, "born": siege.phase,
+                "kind": kind, "hp": hp, "struck": None, "at_wall": at_wall,
+                "slot": 0}
+
+    siege = Siege()
+    siege.wave_in = siege.spawn_in = 1e9
+    siege.redcoats = [stand(kind) for kind in ("foot", "horse", "cannon")]
+    siege.drill_start = [siege.phase, siege.phase]  # hold fire a moment
+    siege.run(1.5)
+    assert all(rc["at_wall"] is not None for rc in siege.redcoats), "wall"
+    slots = sorted(rc["slot"] for rc in siege.redcoats)
     assert slots == sorted(set(slots)), f"one place each: {slots}"
+    assert siege.tally["reached"] == 2, "two beat on it, one waits"
 
     # With redcoats at his wall, the tower sentry calls for the gun, and
     # its ball clears them off.
-    view.redcoats = [rc for rc in view.redcoats if rc["n"] == 99]
-    view.called = [[], []]
-    view.spawn_in = view.wave_in = 1e9
-    view.drill_start = [None, None]
-    view.relief = None
-    run(0.2, 1)
-    assert view.relief and view.relief["side"] == 0 and view._calling(0)
-    run(view.RELIEF_LEN, 3)
-    assert view.relief is None
-    assert not any(view._at_wall(rc) for rc in view.redcoats
+    siege.drill_start = [None, None]
+    siege.run(0.2)
+    assert siege.relief and siege.relief["side"] == 0 and siege.calling(0)
+    assert siege.tally["calls"] == 1
+    siege.run(Siege.RELIEF_LEN)
+    assert siege.relief is None
+    assert not any(siege.at_wall(rc) for rc in siege.redcoats
                    if rc["hit"] is None), "the gun clears the wall"
-    assert view.gun_at == view.GUN_POST[0], "the gun stays where wheeled"
+    assert siege.gun_at == Siege.GUN_POST[0], "the gun stays where wheeled"
+    assert siege.tally["blasted"] >= 2
+    # He waits on the walker if the walker is busy, and on nobody if there
+    # is no room on the wall for him.
+    siege.redcoats = [stand("cannon", at_wall=siege.phase, hp=99)]
+    siege.drill_start = [None, None]
+    siege.has_walker = False
+    siege.run(1)
+    assert siege.relief is None, "no walker to hear the call"
+    siege.has_walker = True
+    for _ in range(30):
+        siege.tick(1 / 30)
+        siege.advance(1 / 30, walker_busy=True)
+    assert siege.relief is None, "the gun waits on the walker"
+    siege.run(Siege.DRILL_LEN)  # his sentry's rifle is busy a while yet
+    assert siege.relief, "then the gun"
+
+    # In the picture the fallen leave blood where they fall.
+    view.siege.redcoats = [stand("cannon", at_wall=view.siege.phase)]
+    view.siege.relief = None
+    view.siege.drill_start = [None, None]
+    view.siege.spawn_in = 1e9
+    run(0.2, 1)
+    assert view.siege.relief and view.siege.relief["side"] == 0
+    run(Siege.RELIEF_LEN, 3)
+    assert view.siege.relief is None
     assert view.stains, "the fallen leave blood"
 
     # A boulder beside each trail; a man on foot under fire ducks behind
@@ -8890,45 +9026,61 @@ def self_test():
     # strike the rock instead.
     view._draw(view, cr, 1024, 680)
     for side, rock in enumerate(view.rocks):
-        assert rock and rock["d"] == view._trail_d(view.COVER_P), rock
-        x = view._bezier(view.trails[side], view.COVER_P)[0]
+        assert rock and rock["d"] == Siege.trail_d(Siege.COVER_P), rock
+        x = view._bezier(view.trails[side], Siege.COVER_P)[0]
         assert (rock["x"] - x) * rock["inward"] < 0, "beside the trail"
-    view.relief = None
-    view.spawn_in = view.wave_in = 1e9
+    assert view.siege.boulders == [True, True]
 
     def foot(n):
-        view.redcoats.append({"side": 0, "d": view._trail_d(0.6),
-                              "hit": None, "n": n, "born": view.phase,
-                              "kind": "foot", "hp": 1, "struck": None,
-                              "at_wall": None, "slot": 0})
-        return view.redcoats[-1]
+        siege.redcoats.append({"side": 0, "d": Siege.trail_d(0.6),
+                               "hit": None, "n": n, "born": siege.phase,
+                               "kind": "foot", "hp": 1, "struck": None,
+                               "at_wall": None, "slot": 0})
+        return siege.redcoats[-1]
 
-    view.redcoats = []
-    view.drill_start = [None, None]
+    siege = Siege()
+    siege.wave_in = siege.spawn_in = 1e9
     rc = foot(7)
-    run(1.5, 3)
-    assert rc["hid"] is not None and rc["d"] == view.rocks[0]["d"], rc
+    siege.run(1.5)
+    assert rc["hid"] is not None and rc["d"] == Siege.trail_d(Siege.COVER_P)
     shots = []
-    for _ in range(int((3 * view.DRILL_LEN + 3) * 30)):
-        fired = view.drill_fired[0]
-        run(1 / 30, 1)
-        if view.drill_fired[0] and not fired:
-            shots.append((rc["hp"], view.rocks[0]["chip"], view.phase))
+    for _ in range(int((3 * Siege.DRILL_LEN + 3) * 30)):
+        fired = siege.drill_fired[0]
+        siege.run(1 / 30)
+        if siege.drill_fired[0] and not fired:
+            shots.append((rc["hp"], siege.chipped[0], siege.phase))
         if len(shots) == 3:
             break
     assert [hp for hp, _, _ in shots] == [1, 1, 0], shots
     assert all(abs(chip - at) < 0.1 for _, chip, at in shots[:2]), shots
     assert rc["hit"] is not None and rc["hid"] is not None, "shot in cover"
+    # No boulder beside the trail, no cover.
+    bare = Siege()
+    bare.wave_in = bare.spawn_in = 1e9
+    bare.boulders = [False, False]
+    siege = bare
+    rc = foot(7)
+    siege.run(1.5)
+    assert rc.get("hid") is None and "rock" not in rc, rc
 
     # Left alone there, he moves on in a while.
-    view.redcoats = []
-    view.drill_start = [view.phase + 1e9, None]  # holding his fire
+    siege = Siege()
+    siege.wave_in = siege.spawn_in = 1e9
+    siege.drill_start = [siege.phase + 1e9, None]  # holding his fire
     rc = foot(8)
-    run(1.5, 3)
+    siege.run(1.5)
     assert rc["hid"] is not None, "he ducks"
-    run(view.HIDE_S + 0.5, 5)
-    assert rc["hid"] is None and view._trail_p(rc["d"]) > view.COVER_P, rc
-    view.drill_start = [None, None]
+    siege.run(Siege.HIDE_S + 0.5)
+    assert rc["hid"] is None and Siege.trail_p(rc["d"]) > Siege.COVER_P, rc
+    # Whatever the seed, the same siege: the rules draw on no chance yet.
+    a, b = Siege(seed=1), Siege(seed=2)
+    a.run(90)
+    b.run(90)
+    assert a.tally == b.tally and a.spawned == b.spawned
+
+    view.siege.redcoats, view.siege.drill_start = [], [None, None]
+    view.siege.relief = None
+    view.siege.spawn_in = view.siege.wave_in = 1e9
 
     # The siege's woods keep off the trails, the fort, the barracks and
     # the river.
@@ -8947,7 +9099,7 @@ def self_test():
     # Boats come down the river on their own, to one ford and then the
     # other; one in five pulls in at its ford and its men step ashore one
     # by one, never sooner, as ordinary foot, and it drifts away empty.
-    view.redcoats, view.boats, view.boats_sent = [], [], 0
+    view.siege.redcoats, view.boats, view.boats_sent = [], [], 0
     view.potshot, view.potshot_after = None, 1e9  # the walker holds fire
     view.boat_in = 0.01
     run(0.1, 1)
@@ -8967,15 +9119,15 @@ def self_test():
     boat, landed, aboard = view.boats[0], [], True
     boat["lands"] = True
     for _ in range(360):
-        before = {rc["n"] for rc in view.redcoats}
+        before = {rc["n"] for rc in view.siege.redcoats}
         run(1 / 3, 5)
-        fresh = [rc for rc in view.redcoats
+        fresh = [rc for rc in view.siege.redcoats
                  if rc.get("boat") and rc["n"] not in before]
         if boat["landed"] is None:
             assert not fresh, "nobody leaves the boat afloat"
         elif fresh and not landed:
-            assert not view._door_open(0), "not out of the barracks"
-        landed += [(rc, view._trail_p(rc["d"])) for rc in fresh]
+            assert not view.siege.door_open(0), "not out of the barracks"
+        landed += [(rc, Siege.trail_p(rc["d"])) for rc in fresh]
         if not view.boats:
             break
     assert not view.boats, "the empty boat drifts off"
@@ -8985,7 +9137,7 @@ def self_test():
         assert view.fords[0] - 0.1 < p <= view.fords[0], (p, view.fords)
 
     def afloat(side, lands, men=view.BOAT_MEN):
-        view.redcoats, view.boats, view.overboard = [], [], []
+        view.siege.redcoats, view.boats, view.overboard = [], [], []
         view._launch_boat(side)
         view.boats[0].update(lands=lands, men=men)
         return view.boats[0]
@@ -9002,7 +9154,7 @@ def self_test():
         out = set()
         for _ in range(int(seconds * 3)):
             run(1 / 3, 5)
-            out |= {rc["n"] for rc in view.redcoats if rc.get("boat")}
+            out |= {rc["n"] for rc in view.siege.redcoats if rc.get("boat")}
             if not any(o is b for o in view.boats):
                 return len(out)
         assert False, "the boat never left"
@@ -9020,17 +9172,17 @@ def self_test():
     assert until(lambda: view.potshot is not None, 30), "he shoots"
     assert view.potshot["boat"] is boat and view._clear_shot(boat)
     halted = view.walker_halted
-    assert until(lambda: view.potshot["fired"], view.SHOT_AT + 0.5)
+    assert until(lambda: view.potshot["fired"], Siege.SHOT_AT + 0.5)
     assert boat["men"] == view.BOAT_MEN - 1, boat
     assert len(view.overboard) == 1, view.overboard
-    assert until(lambda: view.potshot is None, view.DRILL_LEN)
-    assert view.walker_halted - halted > view.DRILL_LEN - 0.5, "he halts"
+    assert until(lambda: view.potshot is None, Siege.DRILL_LEN)
+    assert view.walker_halted - halted > Siege.DRILL_LEN - 0.5, "he halts"
     view.potshot_after = 1e9
     assert ashore(boat) == view.BOAT_MEN - 1
     view.potshot_after = 0.0
     boat = afloat(1, True)
     assert until(lambda: view.potshot is not None, 30)
-    run(view.DRILL_LEN + 0.1, 3)
+    run(Siege.DRILL_LEN + 0.1, 3)
     assert view.potshot is None and boat["men"] == view.BOAT_MEN - 1
     run(view.POTSHOT_REST - 0.5, 3)
     assert view.potshot is None, "he patrols between shots"
@@ -9043,7 +9195,7 @@ def self_test():
     # He does not take aim at a boat that will be out of sight before he
     # fires; the man he hits goes over in the picture.
     boat = afloat(1, False)
-    boat["x"] = view.river["w"] - view.redcoat_s * 0.45 * view.SHOT_AT
+    boat["x"] = view.river["w"] - view.redcoat_s * 0.45 * Siege.SHOT_AT
     view.potshot, view.potshot_after = None, 0.0
     run(1 / 30, 1)
     assert view.potshot is None, "not at a boat about to leave"
@@ -9061,33 +9213,33 @@ def self_test():
     view.potshot = None
     x0, y0, x1, y1 = view.fort_box
     view._on_click(None, 1, (x0 + x1) / 2, (y0 + y1) / 2)
-    assert view._bugling()
-    while view._bugling():
+    assert view.siege.bugling()
+    while view.siege.bugling():
         run(1 / 30, 3)
         assert view.potshot is None or view.potshot["t0"] \
-            >= view.bugle_at + view.BUGLE_LEN, "not during the bugle"
+            >= view.siege.bugle_at + Siege.BUGLE_LEN, "not during the bugle"
     assert until(lambda: view.potshot is not None, 20)
     view._on_click(None, 1, (x0 + x1) / 2, (y0 + y1) / 2)
-    assert not view._bugling(), "nor the bugle during his shot"
-    view.redcoats = [{"side": 0, "d": view.MARCH_NEAR, "hit": None, "n": 98,
+    assert not view.siege.bugling(), "nor the bugle during his shot"
+    view.siege.redcoats = [{"side": 0, "d": Siege.MARCH_NEAR, "hit": None, "n": 98,
                       "born": view.phase, "kind": "cannon", "hp": 99,
                       "struck": None, "at_wall": view.phase, "slot": 0}]
     while view.potshot is not None:
         run(1 / 30, 3)
-        assert view.relief is None, "the gun waits on his shot"
-    assert until(lambda: view.relief, 5), "then the gun"
-    assert view.relief["side"] == 0, view.relief
+        assert view.siege.relief is None, "the gun waits on his shot"
+    assert until(lambda: view.siege.relief, 5), "then the gun"
+    assert view.siege.relief["side"] == 0, view.siege.relief
     view.potshot_after = 0.0
-    while view.relief is not None:
+    while view.siege.relief is not None:
         run(1 / 30, 3)
-        assert view.potshot is None or view.relief is None, \
+        assert view.potshot is None or view.siege.relief is None, \
             "not while he works the gun"
-    assert view.redcoats[0]["hit"] is not None, "the gun fired"
+    assert view.siege.redcoats[0]["hit"] is not None, "the gun fired"
 
     # With no room on the wall for him, nobody shoots at the boats.
     boat = afloat(1, False)
     view.potshot, view.potshot_after = None, 0.0
-    view.has_walker = False
+    view.siege.has_walker = False
     for _ in range(10 * 30):
         view.phase += 1 / 30
         view._advance(1 / 30)
@@ -9096,8 +9248,8 @@ def self_test():
 
     # A click on the river sends a boat, while the fort is up; the pointer
     # shows there.
-    view.redcoats, view.boats = [], []
-    view.bugle_at, view.pending_call = None, None
+    view.siege.redcoats, view.boats = [], []
+    view.siege.bugle_at, view.siege.pending_call = None, None
     view._draw(view, cr, 1024, 680)
     spot = None
     for x in range(8, 1024, 8):
@@ -9109,11 +9261,11 @@ def self_test():
     assert not view._on_river(spot[0], spot[1]
                               + 3 * view._river_half(spot[0]) + 10)
     view._on_click(None, 1, *spot)
-    assert len(view.boats) == 1 and not view._bugling() \
-        and view.pending_call is None, view.boats
+    assert len(view.boats) == 1 and not view.siege.bugling() \
+        and view.siege.pending_call is None, view.boats
 
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
-    assert not view.redcoats and not view.called[0], "standing down clears"
+    assert not view.siege.redcoats and not view.siege.called[0], "standing down clears"
     assert not view.boats, "and sinks the boats"
     view._draw(view, cr, 1024, 680)
     view._on_click(None, 1, *spot)
