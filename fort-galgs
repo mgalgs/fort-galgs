@@ -2043,7 +2043,7 @@ class Siege:
     CATCH_MARGIN = 0.5  # spare seconds he wants over the nearest redcoat
     MEND_FED = 0.3      # at his meal, with a wall to mend, he gets up at this
     HEAVY = ("lower", "descend", "mend", "ascend", "haul", "run", "hide",
-             "home", "raise")
+             "home", "raise", "gun")
 
     # Caught outside. Three hiding rocks stand in the woods outside each
     # side wall, 1 to 3 each farther from the fort, at ground distance g
@@ -2082,6 +2082,25 @@ class Siege:
     RAISE_BY_S = 6.0
     RUN_X_S = 4.0       # the walker runs the whole wall walk in this long
 
+    # The wall top. A redcoat who gets up onto the wall walk, by the ladder
+    # or through a gap, is a stormer, and keeps a place along the walk, x,
+    # from 0 at the west tower to 1 at the east. Men on the walk turn the
+    # fort's gun on him: the walker runs to it, wheels it to face them,
+    # takes aim and fires along the walk, then reloads; whoever stands in
+    # front of it within FIRE_RANGE may be taken. The stormers meanwhile
+    # advance on the gun, and a man who reaches it, with the gun not ready
+    # to fire, takes it.
+    TOP_MAX = 3         # most stormers on one side's wall walk at once
+    THROUGH_S = 2.0     # a redcoat at a gap goes through after this long
+    STORM_S = 20.0      # a stormer crosses the whole wall walk in this
+    FIRE_RANGE = 0.3    # along the walk, how far in front of it the gun reaches
+    AIM_S = 0.8         # from the walker sighting along the walk to the shot
+    RELOAD_S = 6.0      # and he cannot fire again for this long
+    TURN_S = 1.0        # turning the gun round to the other way takes this
+    BLAST_KILL = 0.9    # a man in the blast is taken with this chance
+    STATION_DX = 0.035  # he stands this far behind the gun
+    STAND_S = 2.0       # he keeps to his gun this long with nobody left
+    TAKE_X = 0.04       # a stormer this near the gun lays hands on it
     DRILL_LEN = 4.6     # from kneeling to the last of the smoke
     SHOT_AT = 2.0       # he fires this far into it
 
@@ -2122,13 +2141,20 @@ class Siege:
         self.ladder = {"side": 0, "state": "up", "ext": 0.0, "t0": 0.0,
                        "raised": 0.0}
         self.rock_chip = [[None] * 4 for _ in (0, 1)]  # phase each was hit
+        self.stormers = []                # redcoats on the wall walk, or past
+        # The fort's gun, for the fight on the wall walk: which way it
+        # points (+1 east), from when it may fire, when the walker began to
+        # sight along the walk, when it last fired, and whether it is taken.
+        self.gun = {"facing": 1, "ready": 0.0, "aim": None, "fired": None,
+                    "turned": None, "taken": False}
         self.tally = {"sent": {"foot": 0, "horse": 0, "cannon": 0},
                       "shot": 0, "reached": 0, "blasted": 0, "calls": 0,
                       "hurt": [0.0, 0.0], "mended": [0.0, 0.0],
                       "breaches": 0, "meals": 0, "eating_s": 0.0,
                       "repairs": 0, "repairs_done": 0, "caught": 0,
                       "out_s": 0.0, "retreats": 0, "driven": 0, "rc_shots": 0,
-                      "climbs": 0, "pushes": 0, "raises": 0, "fell": 0}
+                      "climbs": 0, "pushes": 0, "raises": 0, "fell": 0,
+                      "top": 0, "gun_kills": 0}
 
     def vary(self, spread):
         """A factor near 1, up to spread either side of it: the siege's
@@ -2271,15 +2297,45 @@ class Siege:
         return 0.0
 
     def top_of_ladder(self, rc):
-        """THE TOP OF THE LADDER: a redcoat who has climbed all the way is
-        stopped there, held a moment and shoved back off by whoever is on
-        that side, and falls and dies. The next round replaces this, with
-        the fort's gun and what stands on the wall walk to be got past."""
-        if rc.get("top_at") is None:
-            rc["top_at"] = self.phase
-        elif self.phase - rc["top_at"] >= self.TOP_HOLD_S:
-            rc.update(hit=self.phase, fell=True, hp=0)
-            self.tally["fell"] += 1
+        """THE TOP OF THE LADDER: a redcoat who has climbed all the way
+        steps off it onto the wall walk, if there is room for him there,
+        and is a stormer from then on. A sentry may still shove the ladder
+        off under the men who come after him; one already on top stays."""
+        if self._room_on_top(rc["side"]):
+            self._step_onto(rc)
+
+    def _room_on_top(self, side):
+        return sum(1 for st in self.stormers if st["side"] == side
+                   and st["hit"] is None) < self.TOP_MAX
+
+    def _step_onto(self, rc):
+        """A redcoat steps up onto the wall walk at his side's end of it:
+        out of the trail's men and into the stormers."""
+        self.redcoats.remove(rc)
+        for k in ("climb", "drive", "hid", "rock"):
+            rc.pop(k, None)
+        rc.update(kind="foot", mode="walk", at_wall=None, since=self.phase,
+                  x=self.LADDER_X[rc["side"]],
+                  stride=1.0 + 0.2 * (self.vary(1.0) - 1.0))
+        self.stormers.append(rc)
+        self.tally["top"] += 1
+
+    def stormers_on(self, side=None, mode=None):
+        """The stormers alive, on one side and in one place if asked."""
+        return [st for st in self.stormers if st["hit"] is None
+                and (side is None or st["side"] == side)
+                and (mode is None or st["mode"] == mode)]
+
+    def _advance_stormers(self, dt):
+        """Redcoats on the wall walk advance on the fort's gun."""
+        gx = self.gun_at
+        for st in self.stormers_on(mode="walk"):
+            stop = gx + (-1 if st["side"] == 0 else 1) * self.STATION_DX * 0.7
+            step = dt * st["stride"] / self.STORM_S
+            st["x"] += max(-step, min(step, stop - st["x"]))
+        self.stormers = [st for st in self.stormers
+                         if st["hit"] is None
+                         or self.phase - st["hit"] < self.FALL_S]
 
     def _foot_men(self, side):
         return [rc for rc in self.redcoats if rc["side"] == side
@@ -2316,7 +2372,7 @@ class Siege:
                         rc["climb"] = self.phase
                         self.tally["climbs"] += 1
                         break
-        for rc in self.redcoats:
+        for rc in list(self.redcoats):
             if rc["hit"] is None and rc.get("climb") is not None \
                     and self.climb_u(rc) >= 1.0:
                 self.top_of_ladder(rc)
@@ -2373,7 +2429,7 @@ class Siege:
     def in_range(self):
         """Some redcoat is close to a wall: within the sentries' range."""
         return any(rc["hit"] is None and self.trail_p(rc["d"]) >= self.CLOSE_P
-                   for rc in self.redcoats)
+                   for rc in self.redcoats) or bool(self.stormers_on())
 
     def lull(self, seconds=None):
         """THE LULL: no redcoat close to either wall for QUIET_S seconds.
@@ -2438,6 +2494,8 @@ class Siege:
         its wall, by the pace he is marching now; 0 if one is there."""
         speed = (self.MARCH_FAR - self.MARCH_NEAR) / self.MARCH_S
         best = math.inf
+        if self.stormers_on(side):
+            return 0.0
         for rc in self.redcoats:
             if rc["side"] != side or rc["hit"] is not None:
                 continue
@@ -2753,6 +2811,8 @@ class Siege:
                 self.tally["out_s"] += dt
         self._advance_drivers(dt)
         self._advance_shoves(dt, walker_busy)
+        self._advance_gunnery(dt)
+        self._advance_stormers(dt)
         if not self.has_walker:
             # No room on the wall for him: the sentry on a damaged side
             # goes down instead, if he has nothing at his rifle.
@@ -2774,7 +2834,11 @@ class Siege:
             self.patrol_u = (self.patrol_u + dt / self.PATROL_LEG_S) % 2.0
             side = self._wall_to_mend()
             sh = self.ladder["side"]
-            if self._wants_shove(sh) and self.climbers() \
+            if self.stormers_on(mode="walk") and not self.gun["taken"]:
+                x, face = self.walker_x()
+                walker.update(mode="gun", x=x, face=face, t0=self.phase,
+                              station=None, clear=None)
+            elif self._wants_shove(sh) and self.climbers() \
                     and (self.busy(sh) or self.men[sh]["mode"] != "post"):
                 # The sentry there has his hands full; he goes himself.
                 walker.update(mode="shove_run", side=sh,
@@ -2798,6 +2862,8 @@ class Siege:
         to 1 at the east, and the way he faces (the way he is walking,
         or outward when he is at a wall's ladder)."""
         m = self.men[2]
+        if m["mode"] == "gun":
+            return m["x"], m["face"]
         if m["mode"] in ("to_wall", "shove_run", "shove", "lower", "haul",
                          "descend", "ascend", "mend"):
             x = m["x"] if m["mode"] in ("to_wall", "shove_run") \
@@ -2846,6 +2912,7 @@ class Siege:
                         and self.at_wall(rc) for rc in self.redcoats):
                     self.relief = {"side": i, "t0": self.phase,
                                    "landed": False, "from": self.gun_at}
+                    self.gun["facing"] = -1 if i == 0 else 1
                     self.tally["calls"] += 1
                     return
             return
@@ -2862,6 +2929,59 @@ class Siege:
         if t >= self.RELIEF_LEN:
             self.gun_at = self.GUN_POST[r["side"]]
             self.relief = None
+
+    def _advance_gunnery(self, dt):
+        """The walker at the gun against the stormers on the wall walk: he
+        runs to his station behind it, turns it on the nearest of them,
+        sights along the walk and fires, and reloads; when none are left
+        he stays at it a moment and goes back to his round."""
+        m, g = self.men[2], self.gun
+        if m["mode"] != "gun":
+            return
+        pace, gx = self.pace(2), self.gun_at
+        threats = self.stormers_on(mode="walk")
+        if not threats:
+            g["aim"] = None
+            if m["clear"] is None:
+                m["clear"] = self.phase
+            elif self.phase - m["clear"] >= self.STAND_S:
+                self._home_post(2)
+            return
+        m["clear"] = None
+        near = min(threats, key=lambda st: abs(st["x"] - gx))
+        face = 1 if near["x"] >= gx else -1
+        if m["station"] is None:
+            m["station"] = min(1.0, max(0.0, gx - face * self.STATION_DX))
+        step = dt * pace / self.RUN_X_S
+        left = m["station"] - m["x"]
+        m["x"] += max(-step, min(step, left))
+        m["face"] = (1 if left > 0 else -1) if abs(left) > 1e-9 else g["facing"]
+        if abs(left) > 1e-9:
+            return
+        if face != g["facing"]:
+            g.update(facing=face, turned=self.phase, aim=None)
+            g["ready"] = max(g["ready"], self.phase + self.TURN_S / pace)
+        ahead = [st for st in threats
+                 if 0 < (st["x"] - gx) * g["facing"] <= self.FIRE_RANGE]
+        if ahead and self.phase >= g["ready"]:
+            if g["aim"] is None:
+                g["aim"] = self.phase
+            elif self.phase - g["aim"] >= self.AIM_S / pace:
+                self._fire_gun(ahead, pace)
+        else:
+            g["aim"] = None
+
+    def _fire_gun(self, ahead, pace):
+        """The gun goes off along the wall walk: whoever is in front of it
+        may be taken, and it must be reloaded."""
+        g = self.gun
+        g.update(fired=self.phase, aim=None,
+                 ready=self.phase + self.RELOAD_S / pace)
+        for st in ahead:
+            if self.rng.random() < self.BLAST_KILL:
+                st["hit"] = self.phase
+                st["hp"] = 0
+                self.tally["gun_kills"] += 1
 
     # -- the walls --------------------------------------------------------
 
@@ -2885,19 +3005,25 @@ class Siege:
 
     def wait_at_breach(self, rc):
         """THE BREACH: a redcoat at the foot of a wall with a gap in it.
-        For now he waits there and does nothing more; what a breach lets
-        him do is for the next round to say, here. Meanwhile he does not
-        wait for ever: with nothing to pound and no way in, he tires after
-        BREACH_WAIT_S and goes back up the trail out of the picture, so a
-        steady siege still has its lulls and the walker can come home."""
-        if rc["at_wall"] is not None \
-                and self.phase - rc["at_wall"] >= self.BREACH_WAIT_S:
+        After THROUGH_S he goes through, and from inside the gap up onto
+        the wall walk, if there is room for him there, and a man on foot or
+        a horseman is a stormer from then on. One who cannot get anywhere,
+        a gun's crew or a man with no room, does not wait for ever: he
+        tires after BREACH_WAIT_S and goes back up the trail out of the
+        picture, so a steady siege still has its lulls."""
+        if rc["at_wall"] is None:
+            return
+        waited = self.phase - rc["at_wall"]
+        if waited >= self.THROUGH_S and rc["kind"] != "cannon" \
+                and self._room_on_top(rc["side"]):
+            self._step_onto(rc)
+        elif waited >= self.BREACH_WAIT_S:
             rc["gone"] = True
 
     def _pound(self, dt):
         """Redcoats at the wall's foot beat on it; a cannon fires into the
         logs. A breached wall takes nothing more."""
-        for rc in self.redcoats:
+        for rc in list(self.redcoats):
             if rc["hit"] is not None or not self.at_wall(rc) \
                     or rc.get("climb") is not None:
                 continue
@@ -5594,11 +5720,12 @@ class CpuView(Gtk.DrawingArea):
         # The fort's gun stands on the wall walk where it was last wheeled.
         gun_x, gs = x0 + (x1 - x0) * self.siege.gun_frac(), s * 1.25
         rt = self.siege.relief_t()
-        if rt is not None:
-            self.gun_facing = -1 if self.siege.relief["side"] == 0 else 1
-        gf = self.gun_facing
+        gun = self.siege.gun
+        gf = self.gun_facing = gun["facing"]
         pivot = (gun_x - gf * 2 * gs / 100, walk_y - 27 * gs / 100)
         elev, crank, boom, ball = 0.12, None, -1.0, None
+        if rt is None and gun["fired"] is not None:
+            boom = self.siege.phase - gun["fired"]
         if rt is not None:
             side = self.siege.relief["side"]
             nx, ny = self.trails[side][3]
@@ -5670,7 +5797,9 @@ class CpuView(Gtk.DrawingArea):
                                1 if bx >= patrol else -1, kneel=kneel,
                                aim=aim, shot=shot, elev=elev)
         elif wm not in ("patrol", "eat"):
-            if wm == "shove":
+            if wm == "gun":
+                self._draw_gunner(cr, patrol, walk_y, ws, facing_now)
+            elif wm == "shove":
                 self._draw_shover(cr, 2, patrol, walk_y, ws, facing_now)
             elif wm in ("to_wall", "shove_run"):
                 self._mountain_man(cr, patrol, walk_y, ws, facing_now,
@@ -5731,6 +5860,7 @@ class CpuView(Gtk.DrawingArea):
                 cr.arc(*handle, 3 * ws / 100, 0, 2 * math.pi)
                 cr.fill()
 
+        self._draw_stormers(cr, x0, x1, walk_y, ws, gun_x, gs)
         if ball is not None:
             r = max(2.5, gs * 0.045)
             for j in range(4):
@@ -5750,6 +5880,58 @@ class CpuView(Gtk.DrawingArea):
             cr.stroke()
         if rt is not None and 0 <= rt - Siege.FIRE_AT - Siege.FLIGHT_S < 1.0:
             self._blast(cr, land, rt - Siege.FIRE_AT - Siege.FLIGHT_S)
+
+    def _draw_gunner(self, cr, x, walk_y, ws, facing):
+        """The walker at the gun against the stormers: running to it,
+        kneeling to sight along the walk, reloading after the shot."""
+        siege = self.siege
+        gun = siege.gun
+        moving = abs(siege.men[2]["station"] - siege.men[2]["x"]) > 1e-6 \
+            if siege.men[2].get("station") is not None else True
+        kneel = aim = 0.0
+        if not moving:
+            fired = -1.0 if gun["fired"] is None \
+                else siege.phase - gun["fired"]
+            if gun["aim"] is not None:
+                kneel = self._ramp(siege.phase - gun["aim"], 0.0, 0.4)
+            elif 0 <= fired < Siege.RELOAD_S:
+                kneel = 0.7 + 0.2 * math.sin(self.phase * 9.0)
+        self._mountain_man(cr, x, walk_y, ws, facing, kneel=kneel,
+                           step=math.sin(self.phase * 14.0) * 0.55
+                           if moving else 0.0, shouldered=moving)
+
+    def _draw_stormers(self, cr, x0, x1, walk_y, ws, gun_x, gs):
+        """The redcoats on the wall walk, bayonets forward, facing the gun;
+        one the gun has taken falls, bleeding. The gun's blast, along the
+        walk, when it has just gone off."""
+        siege = self.siege
+        for st in siege.stormers:
+            x = x0 + (x1 - x0) * st["x"]
+            facing = 1 if st["side"] == 0 else -1
+            e = -1.0 if st["hit"] is None else siege.phase - st["hit"]
+            step = 0.0
+            if st["hit"] is None and st["mode"] == "walk":
+                step = math.sin(self.phase * 6.5 + st["n"] * 1.7) * 0.35
+            self._redcoat(cr, x, walk_y, ws * 0.95, facing, step,
+                          0.0 if e < 0 else e / Siege.FALL_S,
+                          seed=st["n"] * 1.3)
+            if e >= 0:
+                self._spray(cr, x, walk_y - ws * 0.6, ws * 0.95, -facing, e,
+                            st["n"] * 0.37)
+        gun = siege.gun
+        fired = -1.0 if gun["fired"] is None else siege.phase - gun["fired"]
+        if 0 <= fired < 0.6:
+            gf = gun["facing"]
+            mx, my = gun_x + gf * gs * 0.62, walk_y - gs * 0.28
+            reach = (x1 - x0) * Siege.FIRE_RANGE
+            self._glow(cr, mx, my, ws * (0.4 + 0.5 * fired), FLASH_RGB,
+                       max(0.0, 1.0 - fired * 2.0))
+            for k in range(7):
+                u = min(1.0, fired * 2.2) * (0.4 + 0.6 * ((k * 0.618) % 1.0))
+                cr.set_source_rgba(*SMOKE_RGB, 0.5 * (1.0 - fired / 0.6))
+                cr.arc(mx + gf * reach * u, my + ((k % 3) - 1) * ws * 0.12 * u,
+                       ws * (0.1 + 0.12 * u), 0, 2 * math.pi)
+                cr.fill()
 
     def _blast(self, cr, at, e):
         """The ball landing at the foot of the wall, e seconds on."""
@@ -10039,6 +10221,15 @@ def _foe(siege, kind="foot", p=0.6, side=0):
     return rc
 
 
+def _on_the_walk(siege, side=0, x=None):
+    """Put a redcoat up on side's end of the wall walk, at x along it."""
+    rc = _at_the_foot(siege, "foot", side)
+    siege._step_onto(rc)
+    if x is not None:
+        rc["x"] = x
+    return rc
+
+
 def _walker_out(siege, mode="mend", side=0, i=2):
     """Man i down at the foot of side's wall, the ladder standing."""
     m = siege.men[i]
@@ -10094,6 +10285,22 @@ def _stage_ladder(state, climb=None, shove=None):
     return stage
 
 
+def _stage_storm(xs=(0.04, 0.14, 0.25), side=0, fired=None):
+    """Redcoats on the wall walk, the walker at the gun facing them."""
+    def stage(siege):
+        face = -1 if side == 0 else 1
+        for x in xs:
+            _on_the_walk(siege, side, x)
+        gx = siege.gun_at
+        siege.men[2].update(mode="gun", x=gx - face * Siege.STATION_DX,
+                            face=face, t0=siege.phase, clear=None,
+                            station=gx - face * Siege.STATION_DX)
+        siege.gun.update(facing=face, aim=siege.phase - 0.5)
+        if fired is not None:
+            siege.gun.update(fired=siege.phase - fired, aim=None)
+    return stage
+
+
 # Every state the siege draws that a plain run of it seldom shows, by name.
 SIEGE_PICTURES = (
     ("walls-full", _stage_walls(1.0)),
@@ -10115,6 +10322,8 @@ SIEGE_PICTURES = (
     ("ladder-redcoat-climbing", _stage_ladder("standing", climb=0.5)),
     ("ladder-redcoat-falling", _stage_ladder("falling", climb=0.5)),
     ("sentry-shoving", _stage_ladder("standing", shove=0)),
+    ("walk-redcoats-facing-gun", _stage_storm()),
+    ("walk-gun-firing", _stage_storm(fired=0.15)),
 )
 
 
@@ -10362,8 +10571,8 @@ def siege_tests(view, cr):
     assert siege.tally["out_s"] > 5
 
     # A standing ladder is the redcoats' too: a man at its foot climbs it
-    # instead of pounding, one at a time, slowly; at the top he is stopped
-    # and thrown back off. (Sentries and walker hold fire here.)
+    # instead of pounding, one at a time, slowly; at the top he steps onto
+    # the wall walk. (Sentries and walker hold fire here.)
     siege = _quiet_siege()
     siege.has_walker = False
     siege.ladder.update(side=0, state="standing", ext=1.0)
@@ -10376,8 +10585,11 @@ def siege_tests(view, cr):
     siege.run(Siege.CLIMB_UP_S / 2)
     assert 0.3 < siege.climb_u(mid) < 0.8, siege.climb_u(mid)
     assert siege.tally["climbs"] == 1, "one man on it at a time"
-    assert _until(siege, lambda: mid["hit"] is not None, 20), "thrown off"
-    assert mid.get("fell") and siege.tally["fell"] == 1
+    assert _until(siege, lambda: mid in siege.stormers, 20), \
+        "at the top he steps onto the wall walk"
+    assert siege.tally["top"] == 1 and mid not in siege.redcoats \
+        and mid["mode"] == "walk" and mid["side"] == 0
+    assert mid["x"] >= Siege.LADDER_X[0] and not siege.climbers()
     assert siege.ladder["state"] == "standing", "still the redcoats' to use"
     assert _until(siege, lambda: siege.tally["climbs"] == 2, 10)
     # A shove kills the man on it: a sentry on that side puts his rifle
@@ -10449,6 +10661,36 @@ def siege_tests(view, cr):
     assert siege.phase - start > Siege.RAISE_ALONE_S * 0.9
     assert _until(siege, lambda: walker["mode"] == "patrol", 30)
     assert siege.ladder["state"] == "up"
+
+    # Redcoats on the wall walk advance on the gun; the walker runs to it,
+    # turns it on them and fires along the walk, which takes more than one
+    # man at once, and he reloads before he can fire again.
+    siege = _quiet_siege()
+    siege.BLAST_KILL = 1.0
+    a = _on_the_walk(siege, 0, 0.1)
+    b = _on_the_walk(siege, 0, 0.13)
+    assert siege.men[2]["mode"] == "patrol"
+    siege.run(0.1)
+    assert siege.men[2]["mode"] == "gun", "he goes to the gun"
+    assert a["x"] > 0.1, "they advance on it"
+    assert _until(siege, lambda: siege.gun["fired"] is not None, 30)
+    assert a["hit"] is not None and b["hit"] is not None, "both taken"
+    assert siege.tally["gun_kills"] == 2 and siege.gun["facing"] == -1
+    assert siege.gun["turned"] is not None, "turned to face the west"
+    assert siege.gun["ready"] - siege.gun["fired"] >= Siege.RELOAD_S
+    c = _on_the_walk(siege, 0, 0.3)
+    siege.run(Siege.RELOAD_S - 1.0)
+    assert c["hit"] is None, "no second shot while he reloads"
+    assert _until(siege, lambda: c["hit"] is not None, 20)
+    assert _until(siege, lambda: siege.men[2]["mode"] == "patrol", 10), \
+        "and back to his round"
+    assert not siege.stormers_on()
+    # From the east it already faces them, and there is no turning.
+    siege = _quiet_siege()
+    d = _on_the_walk(siege, 1, 0.9)
+    assert _until(siege, lambda: siege.gun["fired"] is not None, 40)
+    assert siege.gun["facing"] == 1 and siege.gun["turned"] is None
+    assert d["hit"] is not None, "taken from the east"
 
     # A wall reads by shape: more logs down, shorter, leaning, at each
     # level of damage, not only a different shade.
