@@ -2165,6 +2165,23 @@ class Siege:
     BUGLE_LEN = 2.0     # from raising the bugle to lowering it
     BUGLE_HEARD = 1.2   # the tower sentry starts his drill this far in
 
+    # The stew pot, hung over a small fire on the wall walk at POT_X along
+    # it (the gun stands at 0.5, and is wheeled to 0.2 or 0.8). It holds
+    # stew from 0 to 1 and is hot from 0 (cold) to 1 (at the boil). In THE
+    # CALM, and only then, it fills over REFILL_S and comes to the boil over
+    # BOIL_S; a man at it eats faster than from his pack, and draws it down
+    # slowly; and the sentries come down off their towers, DOWN_S, to sit
+    # round it with the walker, and go back, UP_S, when a redcoat is in sight.
+    POT_X = 0.66
+    POT_SEAT = (-0.095, 0.095, 0.0)     # the two sentries and the walker
+    POT_MEAL_S = 30.0   # seconds to eat his fill from starving, at the pot
+    POT_DRAW_S = 240.0  # seconds of one man eating that empty a full pot
+    POT_MIN = 0.02      # least stew he will sit down to
+    REFILL_S = 90.0
+    BOIL_S = 60.0
+    DOWN_S = 1.4
+    UP_S = 1.4
+
     def __init__(self, seed=1, steady=False):
         self.rng = random.Random(seed)    # its small chances; see vary()
         self.steady = steady              # no variation in the march
@@ -2193,6 +2210,11 @@ class Siege:
         self.quiet_since = None           # phase the last redcoat left range
         self.trail_quiet_since = None     # the same, of those on the trails
         self.side_quiet_since = [None, None]  # and of each side alone
+        self.calm_since = None            # phase nothing was in sight
+        self.boats_in_sight = False       # the view's: redcoats afloat
+        self.pot = {"x": self.POT_X, "stew": 1.0, "heat": 1.0,
+                    "at": "fire", "task": None}
+        self.pot_all = False              # all three at it together
         self.men = [self._new_man("post"), self._new_man("post"),
                     self._new_man("patrol")]
         self.patrol_u = 0.0               # the walker's patrol, 0..2
@@ -2234,7 +2256,10 @@ class Siege:
                       "bear_ground_kills": 0, "bear_musket": 0,
                       "bear_top_idle_max": 0.0, "rousings_over": 0,
                       "rousings_down": 0, "rousings_ground": 0,
-                      "rousings_ground_killed": 0}
+                      "rousings_ground_killed": 0, "pot_meals": 0,
+                      "pot_eating_s": 0.0, "pot_together": 0,
+                      "pot_together_s": 0.0, "off_s": 0.0, "off_caught": 0,
+                      "pours": 0, "scalded": 0}
 
     def vary(self, spread):
         """A factor near 1, up to spread either side of it: the siege's
@@ -2301,7 +2326,7 @@ class Siege:
                 or self.men[2]["mode"] != "patrol":
             return False
         self.bugle_at = self.phase
-        if not self.busy(side):
+        if not self.busy(side) and self.men[side]["mode"] in ("post", "eat"):
             self.drill_start[side] = self.phase + self.BUGLE_HEARD
             self.drill_target[side] = None
             self.drill_fired[side] = False
@@ -2554,12 +2579,14 @@ class Siege:
             - self.quiet_since >= (self.QUIET_S if seconds is None
                                    else seconds)
 
-    def _side_busy(self, side):
+    def _side_busy(self, side, p=None):
         """Something is up on one side alone: a redcoat close to its wall
-        or on its trail within range, on its ladder or up on its walk,
-        or out of the trail to drive the man in the woods back."""
+        or on its trail within range (p, CLOSE_P unless asked, farther for
+        the calm), on its ladder or up on its walk, or out of the trail to
+        drive the man in the woods back."""
+        p = self.CLOSE_P if p is None else p
         return any(rc["side"] == side and rc["hit"] is None and (
-            self.trail_p(rc["d"]) >= self.CLOSE_P or rc["at_wall"] is not None
+            self.trail_p(rc["d"]) >= p or rc["at_wall"] is not None
             or rc.get("drive") or rc.get("climb") is not None)
             for rc in self.redcoats) or bool(self.stormers_on(side))
 
@@ -2940,13 +2967,19 @@ class Siege:
             self.trail_quiet_since = None
         elif self.trail_quiet_since is None:
             self.trail_quiet_since = self.phase
+        if self.boats_in_sight or any(self._side_busy(side, self.WATCH_P)
+                                      for side in (0, 1)):
+            self.calm_since = None
+        elif self.calm_since is None:
+            self.calm_since = self.phase
         for side in (0, 1):
             if self._side_busy(side):
                 self.side_quiet_since[side] = None
             elif self.side_quiet_since[side] is None:
                 self.side_quiet_since[side] = self.phase
         for m in self.men:
-            if m["mode"] != "eat":
+            if m["mode"] != "eat" and not (m["mode"] == "pot"
+                                           and m["leg"] == "sit"):
                 m["hunger"] = min(1.0, m["hunger"] + dt / (
                     self.HEAVY_S if m["mode"] in self.HEAVY
                     else self.HUNGER_S))
@@ -2964,6 +2997,7 @@ class Siege:
         self._advance_stormers(dt)
         self._advance_driven(dt)
         self._advance_roofing(dt)
+        self._advance_pot(dt)
         self._advance_bears(dt)
         if not self.has_walker:
             # No room on the wall for him: the sentry on a damaged side
@@ -3015,7 +3049,12 @@ class Siege:
                               side=self._roof_to_mend())
             elif self.lull(self.MEAL_AFTER_S) \
                     and walker["hunger"] >= self.EAT_AT:
-                self._sit_down(2)
+                if self.pot_ready():
+                    self._to_pot(2, "meal")     # from the pot, not his pack
+                else:
+                    self._sit_down(2)
+            elif self.calm():
+                self._to_pot(2, "rest")
         elif walker["mode"] == "eat":
             if self._meal(2, dt, not self.in_range() and not (
                     self._wall_to_mend() is not None
@@ -3028,7 +3067,7 @@ class Siege:
         or outward when he is at a wall's ladder)."""
         m = self.men[2]
         if m["mode"] in ("gun", "driven", "retake", "to_roof", "roof",
-                         "brawl"):
+                         "brawl", "pot"):
             return m["x"], m["face"]
         if m["mode"] in ("to_wall", "shove_run", "shove", "lower", "haul",
                          "descend", "ascend", "mend"):
@@ -3041,6 +3080,185 @@ class Siege:
         u = self.patrol_u
         pos = u if u < 1.0 else 2.0 - u
         return 0.5 - 0.5 * math.cos(pos * math.pi), 1 if u < 1.0 else -1
+
+    # -- the stew pot -----------------------------------------------------
+
+    def calm(self):
+        """THE CALM, deeper than a lull: no redcoat in sight on either
+        trail, nor at a wall, nor up on it, for QUIET_S seconds."""
+        return self.calm_since is not None and self.phase \
+            - self.calm_since >= self.QUIET_S
+
+    def pot_ready(self):
+        """The pot hangs over its fire at the boil, with stew in it."""
+        p = self.pot
+        return p["at"] == "fire" and p["heat"] >= 1.0 \
+            and p["stew"] >= self.POT_MIN
+
+    def seat_x(self, i):
+        """Where man i sits by the pot, along the wall walk."""
+        return min(1.0, max(0.0, self.POT_X + self.POT_SEAT[i]))
+
+    def pot_sit(self, i):
+        """How far man i has sat down by the pot, 0..1."""
+        m = self.men[i]
+        if m["mode"] != "pot":
+            return 0.0
+        if m["leg"] == "sit":
+            return self.ramp(self.phase - m["t0"], 0.0, self.SIT_S)
+        if m["leg"] == "rise":
+            return 1.0 - self.ramp(self.phase - m["up"], 0.0, self.RISE_S)
+        return 0.0
+
+    def pot_eating(self, i):
+        """Man i is at his stew, or the jerky he has with him, by the pot."""
+        m = self.men[i]
+        return m["mode"] == "pot" and m["leg"] == "sit" \
+            and m["feed"] is not None \
+            and self.phase - m["t0"] >= self.SIT_S
+
+    def at_pot(self, i):
+        m = self.men[i]
+        return m["mode"] == "pot" and m["leg"] == "sit"
+
+    def _to_pot(self, i, why):
+        """Man i sets out for the pot: the walker along the walk; a
+        sentry down from his tower first. Only in a lull or the calm."""
+        m = self.men[i]
+        if i == 2:
+            x, face = self.walker_x()
+            m.update(mode="pot", leg="to", x=x, face=face, why=why,
+                     t0=self.phase, up=None, feed=None)
+        else:
+            m.update(mode="pot", leg="down", x=self._end_x(i), h=0.0,
+                     why=why, t0=self.phase, up=None, feed=None,
+                     caught=False, face=1 if i == 0 else -1)
+            self.drill_start[i] = None
+
+    def _pot_leave(self, i):
+        """Man i gets up from the pot, or turns back from it."""
+        m = self.men[i]
+        leg = m["leg"]
+        if leg in ("down", "to") and i != 2:
+            m["leg"] = "up" if leg == "down" else "back"
+        elif leg == "to":
+            self._home_post(2)
+        elif leg == "sit":
+            m.update(leg="rise", up=self.phase)
+
+    def _sentry_may_rest(self, i):
+        """A tower sentry with nothing at his rifle goes down to the pot,
+        in the calm and only then."""
+        man = self.men[i]
+        return self.has_walker and man["mode"] == "post" and self.calm() \
+            and not self.busy(i) and not self.calling(i) \
+            and self.relief is None and not self.ousted(i)
+
+    def _advance_pot(self, dt):
+        """The pot and the men round it. In the calm it fills and comes to
+        the boil; a man at it eats from it, and the sentries come down and
+        sit with the walker; when a redcoat comes in sight they get up and
+        go back."""
+        if not self.has_walker:
+            for i, m in enumerate(self.men):
+                if m["mode"] == "pot":
+                    self._home_post(i)
+            return
+        p = self.pot
+        sight = self.calm_since is None
+        if p["at"] == "fire" and self.calm():
+            p["stew"] = min(1.0, p["stew"] + dt / self.REFILL_S)
+            p["heat"] = min(1.0, p["heat"] + dt / self.BOIL_S)
+        for i, m in enumerate(self.men):
+            if m["mode"] != "pot":
+                continue
+            if i != 2:
+                self.tally["off_s"] += dt
+            self._pot_man(i, m, dt, sight)
+        together = all(self.at_pot(i) for i in (0, 1, 2))
+        if together:
+            self.tally["pot_together_s"] += dt
+            if not self.pot_all:
+                self.tally["pot_together"] += 1
+        self.pot_all = together
+
+    def _pot_man(self, i, m, dt, sight):
+        p, pace, leg = self.pot, self.pace(i), m["leg"]
+        if i != 2 and not m["caught"] and leg != "sit" and any(
+                rc["side"] == i and rc["hit"] is None and (
+                    self.trail_p(rc["d"]) >= self.ENGAGE_P
+                    or rc["at_wall"] is not None)
+                for rc in self.redcoats):
+            m["caught"] = True      # a redcoat at his range and he not back
+            self.tally["off_caught"] += 1
+        if leg == "down":
+            if sight:
+                m["leg"] = "up"
+                return
+            m["h"] = min(1.0, m["h"] + dt * pace / self.DOWN_S)
+            if m["h"] >= 1.0:
+                m["leg"] = "to"
+        elif leg == "to":
+            if (self.in_range() if i == 2 and m["why"] == "meal" else sight):
+                self._pot_leave(i)
+                return
+            goal = self.seat_x(i)
+            step = dt * pace / self.WALK_S
+            left = goal - m["x"]
+            m["x"] += max(-step, min(step, left))
+            m["face"] = 1 if left > 0 else -1 if left < 0 else m["face"]
+            if abs(goal - m["x"]) < 1e-9:
+                m.update(leg="sit", t0=self.phase, feed=None)
+                m["face"] = -1 if i == 1 else 1   # to the fire
+                if i == 2:
+                    m["face"] = 1 if m["x"] <= self.POT_X else -1
+        elif leg == "sit":
+            fed = False
+            if self.pot_sit(i) >= 1.0 and m["hunger"] > self.FED:
+                if self.pot_ready():
+                    m["feed"] = "stew"
+                    m["hunger"] = max(0.0, m["hunger"] - dt / self.POT_MEAL_S)
+                    p["stew"] = max(0.0, p["stew"] - dt / self.POT_DRAW_S)
+                    self.tally["pot_eating_s"] += dt
+                    fed = True
+                elif m["hunger"] >= self.EAT_AT:
+                    m["feed"] = "pack"
+                    m["hunger"] = max(0.0, m["hunger"] - dt / self.MEAL_S)
+                    self.tally["eating_s"] += dt
+                    fed = True
+            if not fed:
+                m["feed"] = None
+            if fed and not m.get("sat_fed"):
+                m["sat_fed"] = True
+                self.tally["pot_meals"] += 1
+            if i == 2:
+                work = self._wall_to_mend() is not None \
+                    and m["hunger"] <= self.MEND_FED
+                stay = not self.in_range() if m["why"] == "meal" \
+                    else not sight
+                done = m["why"] == "meal" and m["hunger"] <= self.FED
+                if not stay or done or work:
+                    m.update(leg="rise", up=self.phase, sat_fed=False)
+            elif sight:
+                m.update(leg="rise", up=self.phase, sat_fed=False)
+        elif leg == "rise":
+            if self.phase - m["up"] >= self.RISE_S:
+                if i == 2:
+                    self._home_post(2)
+                else:
+                    m["leg"] = "back"
+        elif leg == "back":
+            goal = self._end_x(i)
+            step = dt * pace / self.WALK_S
+            left = goal - m["x"]
+            m["x"] += max(-step, min(step, left))
+            m["face"] = 1 if left > 0 else -1 if left < 0 else m["face"]
+            if abs(left) < 1e-9:
+                m["leg"] = "up"
+        elif leg == "up":
+            m["h"] = max(0.0, m["h"] - dt * pace / self.UP_S)
+            if m["h"] <= 0.0:
+                self._home_post(i)
 
     # -- the gun ----------------------------------------------------------
 
@@ -3073,7 +3291,8 @@ class Siege:
                     or self.men[2]["mode"] != "patrol" or self.gun["taken"]:
                 return
             for i in (0, 1):
-                if not self.busy(i) and any(
+                if not self.busy(i) and self.men[i]["mode"] in (
+                        "post", "eat") and any(
                         rc["side"] == i and rc["hit"] is None
                         and self.at_wall(rc) for rc in self.redcoats):
                     self.relief = {"side": i, "t0": self.phase,
@@ -4066,6 +4285,9 @@ class Siege:
                     and not self.calling(i) and self._wants_shove(i):
                 man.update(mode="shove", t0=self.phase, side=i)
                 continue
+            if self._sentry_may_rest(i):
+                self._to_pot(i, "rest")
+                continue
             if man["mode"] not in ("post", "eat"):
                 continue  # he is at the ladder, or below it, or shoving
             if man["mode"] == "eat":
@@ -4331,6 +4553,9 @@ class CpuView(Gtk.DrawingArea):
             if self.wild is not None:
                 self._advance_horses(dt)
             return
+        # A boat of redcoats on the river is in sight, too.
+        siege.boats_in_sight = any(b["men"] > 0 and b["landed"] is None
+                                   for b in self.boats)
         siege.advance(dt, self.potshot is not None,
                       lambda: self._advance_afloat(dt))
 
@@ -6597,6 +6822,8 @@ class CpuView(Gtk.DrawingArea):
             return  # Nobody on the walls while the fort stands down.
         s = t * 0.85
         self.sentries_at = (towers, floor, s)
+        if walk[1] - walk[0] > s * 0.6:
+            self._draw_pot(cr, walk, walk_y, s * 0.92)
         for i, tx in enumerate(towers):
             outward = -1 if i == 0 else 1
             mode = self.siege.men[i]["mode"]
@@ -6608,6 +6835,12 @@ class CpuView(Gtk.DrawingArea):
                 continue
             if mode == "shove":
                 self._draw_shover(cr, i, tx, floor, s, outward)
+                continue
+            if mode == "pot":
+                x0_, x1_ = walk
+                self._draw_pot_man(cr, i, x0_ + (x1_ - x0_)
+                                   * self.siege.men[i]["x"], floor, walk_y,
+                                   s * 0.92, towers)
                 continue
             if mode not in ("post", "eat"):
                 if mode not in self.GROUND_MODES:
@@ -6746,7 +6979,9 @@ class CpuView(Gtk.DrawingArea):
                                1 if bx >= patrol else -1, kneel=kneel,
                                aim=aim, shot=shot, elev=elev)
         elif wm not in ("patrol", "eat"):
-            if wm == "gun":
+            if wm == "pot":
+                self._draw_pot_man(cr, 2, patrol, floor, walk_y, ws, towers)
+            elif wm == "gun":
                 self._draw_gunner(cr, patrol, walk_y, ws, facing_now)
             elif wm in ("driven", "retake", "to_roof", "roof", "brawl"):
                 self._draw_walker_back(cr, towers, floor, patrol, walk_y, ws,
@@ -6834,6 +7069,154 @@ class CpuView(Gtk.DrawingArea):
             cr.stroke()
         if rt is not None and 0 <= rt - Siege.FIRE_AT - Siege.FLIGHT_S < 1.0:
             self._blast(cr, land, rt - Siege.FIRE_AT - Siege.FLIGHT_S)
+
+    def _stew_pot(self, cr, x, y, s, heat, stew, tilt=0.0, fire=True):
+        """A black iron pot of stew on a tripod over a small fire, drawn
+        with its feet at (x, y), s tall in all; steam rises off it as it
+        comes to the boil. tilt turns the pot over on its side, to pour."""
+        t = self.phase
+        if fire:
+            # Three legs and a few logs, and the flames between them.
+            cr.set_source_rgb(*SEAM_RGB)
+            cr.set_line_width(max(1.0, s * 0.045))
+            cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            for dx in (-0.34, 0.0, 0.34):
+                cr.move_to(x + dx * s * 0.55, y)
+                cr.line_to(x, y - s * 0.62)
+                cr.stroke()
+            for dx, a in ((-0.2, 0.3), (0.2, -0.3)):
+                cr.save()
+                cr.translate(x + dx * s, y - s * 0.04)
+                cr.rotate(a)
+                self._rounded(cr, -s * 0.2, -s * 0.045, s * 0.4, s * 0.09,
+                              s * 0.04)
+                cr.set_source_rgb(*WOOD_RGB)
+                cr.fill()
+                cr.restore()
+            for k, (dx, h) in enumerate(((-0.1, 0.3), (0.06, 0.4),
+                                         (0.18, 0.22))):
+                flick = 0.75 + 0.25 * math.sin(t * 9.0 + k * 2.1)
+                fh = s * h * flick
+                cr.move_to(x + dx * s - s * 0.07, y - s * 0.04)
+                cr.curve_to(x + dx * s - s * 0.07, y - fh * 0.6,
+                            x + dx * s, y - fh * 0.5, x + dx * s, y - fh)
+                cr.curve_to(x + dx * s + s * 0.02, y - fh * 0.5,
+                            x + dx * s + s * 0.07, y - fh * 0.6,
+                            x + dx * s + s * 0.07, y - s * 0.04)
+                cr.close_path()
+                cr.set_source_rgb(*FLASH_RGB if k == 1 else FORT_RGB)
+                cr.fill()
+        # The pot hangs a little above the flames.
+        px, py = x, y - s * (0.6 if fire else 0.0)
+        r = s * 0.27
+        cr.save()
+        cr.translate(px, py)
+        cr.rotate(tilt)
+        cr.arc(0, -r * 0.95, r, 0.05 * math.pi, 0.95 * math.pi)
+        cr.close_path()
+        cr.set_source_rgb(*IRON_RGB)
+        cr.fill_preserve()
+        cr.set_source_rgb(*HAT_RGB)
+        cr.set_line_width(max(0.8, s * 0.03))
+        cr.stroke()
+        # Its rim, and the stew in it, bubbling.
+        cr.save()
+        cr.translate(0, -r * 0.95)
+        cr.scale(1.0, 0.28)
+        cr.arc(0, 0, r * 1.0, 0, 2 * math.pi)
+        cr.restore()
+        cr.set_source_rgb(*HAT_RGB)
+        cr.fill_preserve()
+        cr.set_source_rgb(*STEEL_RGB if stew <= 0.02 else BEAR_RGB)
+        cr.set_line_width(max(0.8, s * 0.025))
+        cr.stroke()
+        if stew > 0.02 and abs(tilt) < 0.2:
+            for k in range(3):
+                bu = (t * (0.9 + 0.3 * heat) + k * 0.37) % 1.0
+                cr.set_source_rgba(*BEAR_HI_RGB, 0.9 * heat * (1 - bu))
+                cr.arc(-r * 0.4 + k * r * 0.4, -r * 0.95 - bu * r * 0.1,
+                       max(0.8, s * 0.025), 0, 2 * math.pi)
+                cr.fill()
+        # The bail.
+        cr.set_source_rgb(*IRON_RGB)
+        cr.set_line_width(max(0.8, s * 0.03))
+        cr.arc(0, -r * 0.95, r * 1.05, 1.05 * math.pi, 1.95 * math.pi)
+        cr.stroke()
+        cr.restore()
+        if heat > 0.55 and stew > 0.02 and abs(tilt) < 0.2:
+            # Steam, more of it the nearer the boil, curling up.
+            for k in range(4):
+                u = (t * 0.6 + k * 0.25) % 1.0
+                cr.set_source_rgba(*SMOKE_RGB, 0.55 * (1 - u) * heat)
+                cr.arc(px + math.sin(t * 2.0 + k * 1.7) * s * 0.08 * u,
+                       py - r * 1.2 - u * s * 0.8,
+                       s * (0.07 + 0.1 * u), 0, 2 * math.pi)
+                cr.fill()
+
+    def _draw_pot(self, cr, walk, walk_y, ws):
+        """The pot over its fire where it hangs, or off the fire in a
+        man's hands, or left where it was emptied."""
+        pot = self.siege.pot
+        x0, x1 = walk
+        x = x0 + (x1 - x0) * pot["x"]
+        if pot["at"] == "fire":
+            self._stew_pot(cr, x, walk_y, ws * 1.0, pot["heat"],
+                           pot["stew"])
+            return
+        # Off the fire: its place keeps the embers, and the pot is wherever
+        # it is being carried or was left.
+        fx = x0 + (x1 - x0) * self.siege.POT_X
+        self._stew_embers(cr, fx, walk_y, ws * 1.0)
+        if pot["at"] == "spent":
+            self._stew_pot(cr, x, walk_y, ws * 1.0, 0.0, 0.0, tilt=1.5,
+                           fire=False)
+
+    def _stew_embers(self, cr, x, y, s):
+        """The fire with no pot over it: a few logs and a low flame."""
+        t = self.phase
+        for dx, a in ((-0.2, 0.3), (0.2, -0.3)):
+            cr.save()
+            cr.translate(x + dx * s, y - s * 0.04)
+            cr.rotate(a)
+            self._rounded(cr, -s * 0.2, -s * 0.045, s * 0.4, s * 0.09,
+                          s * 0.04)
+            cr.set_source_rgb(*WOOD_RGB)
+            cr.fill()
+            cr.restore()
+        fh = s * 0.16 * (0.7 + 0.3 * math.sin(t * 8.0))
+        cr.move_to(x - s * 0.08, y - s * 0.04)
+        cr.curve_to(x - s * 0.08, y - fh * 0.6, x, y - fh * 0.4, x, y - fh)
+        cr.curve_to(x + s * 0.02, y - fh * 0.4, x + s * 0.08, y - fh * 0.6,
+                    x + s * 0.08, y - s * 0.04)
+        cr.close_path()
+        cr.set_source_rgb(*FORT_RGB)
+        cr.fill()
+
+    def _draw_pot_man(self, cr, i, x, floor, walk_y, ws, towers):
+        """A man going to the pot, sitting at it, or going back: the
+        sentry down off his tower and up again, the walker along the
+        walk, seated just in front of the fire."""
+        siege = self.siege
+        m = siege.men[i]
+        leg = m["leg"]
+        sit = siege.pot_sit(i)
+        face = m["face"]
+        y = walk_y
+        if i != 2:
+            y = floor + (walk_y - floor) * m["h"]
+            if leg in ("down", "up"):
+                x = towers[i]
+        else:
+            y = walk_y + sit * ws * 0.3
+        walking = leg in ("to", "back")
+        climbing = leg in ("down", "up")
+        step = math.sin(self.phase * 7.0) * 0.38 if walking \
+            else math.sin(m["h"] * 40) * 0.5 if climbing else 0.0
+        if climbing:
+            face = 1 if i == 0 else -1
+        self._mountain_man(cr, x, y, ws, face, step=step,
+                           shouldered=walking, sit=sit,
+                           eat=self.phase if siege.pot_eating(i) else -1.0)
 
     def _draw_gunner(self, cr, x, walk_y, ws, facing):
         """The walker at the gun against the stormers: running to it,
@@ -11433,6 +11816,14 @@ def _quiet_siege(seed=1):
     siege.bear_rest = 1e9
     siege.wave_in = siege.spawn_in = 1e9
     siege.drill_start = [siege.phase + 1e9, siege.phase + 1e9]
+    siege.boats_in_sight = True     # no calm: the men keep to their rounds
+    return siege
+
+
+def _calm_siege(seed=1):
+    """The same, with nothing in sight, so that the calm comes."""
+    siege = _quiet_siege(seed)
+    siege.boats_in_sight = False
     return siege
 
 
@@ -11480,9 +11871,10 @@ def _walker_out(siege, mode="mend", side=0, i=2):
 
 
 def _stage_eating(siege):
+    siege.drill_start = [None, None]
     for m in siege.men:
         m["hunger"] = 0.7
-    siege.run(Siege.MEAL_AFTER_S + 2.5)
+    siege.run(Siege.QUIET_S + 14.0)
 
 
 def _stage_walls(strength):
@@ -11695,7 +12087,7 @@ SIEGE_PICTURES = (
     ("walls-hurt", _stage_walls(0.6)),
     ("walls-badly-hurt", _stage_walls(0.25)),
     ("walls-breached", _stage_walls(0.0)),
-    ("men-eating", _stage_eating),
+    ("men-eating", _stage_eating, (0.5, 0.45, 2.0)),
     ("walker-descending", _stage_out("descend", h=0.55)),
     ("walker-mending", _stage_out("mend")),
     ("walker-mending-from-outside", _stage_out("mend", g=2.0, rock=2)),
@@ -11804,6 +12196,8 @@ def siege_tests(view, cr):
     # work, but standing up takes a beat.
     siege = Siege()
     siege.wave_in = siege.spawn_in = 1e9
+    siege.boats_in_sight = True     # no calm: the pot is not for them
+    siege.pot.update(heat=0.0, stew=0.0)
     siege.men[0]["hunger"], siege.men[2]["hunger"] = 0.6, 0.6
     siege.run(Siege.QUIET_S - 1)
     assert not siege.lull() and not siege.eating(0), "not yet a lull"
@@ -11883,6 +12277,8 @@ def siege_tests(view, cr):
     siege = Siege()
     siege.wave_in = siege.spawn_in = 1e9
     siege.wall = [0.5, 1.0]
+    siege.boats_in_sight = True
+    siege.pot.update(heat=0.0, stew=0.0)
     walker = siege.men[2]
     walker["hunger"] = 0.9
     siege.run(Siege.MEAL_AFTER_S + 2)
@@ -12469,7 +12865,7 @@ def siege_tests(view, cr):
     assert _until(siege, lambda: siege.men[2]["mode"] == "roof", 60)
     assert _until(siege, lambda: siege.roof[0] >= 1.0, 60)
     assert siege.tally["roof_mended"][0] > 0.45
-    assert _until(siege, lambda: siege.men[2]["mode"] in ("patrol", "eat"), 5)
+    assert _until(siege, lambda: siege.men[2]["mode"] in ("patrol", "eat", "pot"), 5)
 
     # A wall reads by shape: more logs down, shorter, leaning, at each
     # level of damage, not only a different shade.
@@ -12484,18 +12880,104 @@ def siege_tests(view, cr):
         view._draw(view, cr, 1024, 680)
     view.siege.wall = [1.0, 1.0]
 
-    # A man at his meal, drawn: sentries on their tower floors, the walker
-    # on the wall walk.
+    # THE CALM: with nothing in sight for QUIET_S, the two sentries come
+    # down off their towers and sit round the pot with the walker, and
+    # eat; it is the only time a sentry leaves his post. They are all
+    # three there at once.
+    siege = _calm_siege(3)
+    siege.drill_start = [None, None]
+    for m in siege.men:
+        m["hunger"] = 0.6
+    siege.run(Siege.QUIET_S - 1)
+    assert all(m["mode"] != "pot" for m in siege.men), "not yet calm"
+    assert _until(siege, lambda: all(siege.at_pot(i) for i in range(3)), 25)
+    assert siege.tally["pot_together"] == 1
+    xs = [siege.men[i]["x"] for i in range(3)]
+    assert xs[0] < xs[2] < xs[1], "sat round the fire"
+    siege.run(20)
+    assert siege.tally["pot_together_s"] > 15 and siege.tally["off_s"] > 30
+    assert all(m["hunger"] < 0.3 for m in siege.men), "fed on stew"
+    assert siege.tally["pot_meals"] >= 3 and siege.tally["pot_eating_s"] > 20
+    # Stew feeds better than the pack: the same man, the same time.
+    fed = {}
+    for how in ("stew", "pack"):
+        siege = _quiet_siege()
+        siege.drill_start = [None, None]
+        m = siege.men[2]
+        m["hunger"] = 0.9
+        if how == "stew":
+            siege._to_pot(2, "meal")
+        else:
+            siege.pot.update(heat=0.0, stew=0.0)
+            siege._sit_down(2)
+        siege.run(Siege.WALK_S + Siege.SIT_S + 10)
+        fed[how] = 0.9 - m["hunger"]
+    assert fed["stew"] > 1.5 * fed["pack"] > 0, fed
+    # The pot holds so much and eating draws it down, slowly; it is not
+    # eaten from again until it is refilled and at the boil, which takes
+    # a calm.
+    siege = _quiet_siege()
+    siege.drill_start = [None, None]
+    siege.pot.update(stew=0.3)
+    for m in siege.men:
+        m["hunger"] = 1.0
+    siege.men[2].update(mode="patrol")
+    siege._to_pot(2, "meal")
+    siege.run(Siege.WALK_S + 5)
+    assert 0.0 < siege.pot["stew"] < 0.3, "drawn down"
+    assert _until(siege, lambda: siege.pot["stew"] <= 0.0
+                  or siege.men[2]["mode"] != "pot", 120)
+    siege.men[2]["hunger"] = 1.0
+    siege.pot.update(stew=0.0, heat=0.0)
+    siege.run(30)
+    assert siege.pot["stew"] == 0.0 and siege.pot["heat"] == 0.0 \
+        and not siege.pot_ready(), "no calm, no stew"
+    siege.boats_in_sight = False
+    assert _until(siege, lambda: siege.pot["stew"] > 0.2, 30)
+    assert not siege.pot_ready(), "full enough to eat from, not yet at the boil"
+    assert _until(siege, lambda: siege.pot_ready(), 120)
+    assert siege.pot["stew"] > 0.5
+    # When a redcoat comes into sight on either trail, they get up: a
+    # sentry takes a beat to rise, walk back and climb, and until he is
+    # back he cannot shoot.
+    siege = _calm_siege(4)
+    siege.drill_start = [None, None]
+    assert _until(siege, lambda: all(siege.at_pot(i) for i in range(3)), 25)
+    foe = _foe(siege, "foot", 0.45, 1)
+    foe["hp"] = 99
+    foe["d"] = Siege.trail_d(0.45)
+    siege.run(0.1)
+    assert siege.men[1]["leg"] in ("rise", "sit"), siege.men[1]["leg"]
+    siege.run(Siege.RISE_S + 0.1)
+    assert siege.men[1]["mode"] == "pot" and siege.men[1]["leg"] == "back"
+    siege.drill_start[1] = siege.phase - 1.0    # he is called to fire...
+    assert siege.men[1]["mode"] == "pot", "...but is not at his rifle"
+    shots = siege.tally["shot"]
+    siege.run(2.0)
+    assert foe["hit"] is None and siege.tally["shot"] == shots
+    assert _until(siege, lambda: siege.men[1]["mode"] == "post", 12)
+    assert siege.men[2]["mode"] in ("patrol", "gun", "eat"), siege.men[2]
+    assert siege.tally["off_caught"] >= 1 or foe["hit"] is not None
+    assert _until(siege, lambda: all(m["mode"] != "pot" for m in siege.men), 12)
+
+    # A man at his meal, drawn: in the calm, all three round the pot, the
+    # sentries on their way down off the towers and up again.
     view.siege.redcoats = []
     view.siege.spawn_in = view.siege.wave_in = view.boat_in = 1e9
     view.siege.drill_start = [None, None]
     for man in view.siege.men:
         man["hunger"] = 0.7
-    for _ in range(int((Siege.MEAL_AFTER_S + 2) * 30)):
+    view.siege.pot.update(heat=1.0, stew=1.0)
+    legs = set()
+    for n in range(int(40 * 30)):
         view.phase += 1 / 30
         view._advance(1 / 30)
-        view._draw(view, cr, 1024, 680)
-    assert all(view.siege.eating(i) for i in range(3)), view.siege.men
+        legs.update(m.get("leg") for m in view.siege.men)
+        if n % 3 == 0:
+            view._draw(view, cr, 1024, 680)
+    assert all(view.siege.at_pot(i) for i in range(3)), view.siege.men
+    assert view.siege.tally["pot_meals"] >= 3 and view.siege.tally["pot_together"]
+    assert {"down", "to", "sit"} <= legs, legs
 
     # The ladder, and the men on it and below it, drawn.
     view.siege.wall = [0.4, 0.4]
@@ -12937,6 +13419,8 @@ def self_test():
     assert siege.relief, "then the gun"
 
     # In the picture the fallen leave blood where they fall.
+    for i in range(3):
+        view.siege._home_post(i)    # nobody off at the pot
     view.siege.redcoats = [stand("cannon", at_wall=view.siege.phase)]
     view.siege.relief = None
     view.siege.drill_start = [None, None]
