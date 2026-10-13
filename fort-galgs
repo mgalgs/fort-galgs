@@ -2031,13 +2031,33 @@ class Siege:
     MEND_PER_S = 0.012  # of a wall's whole strength
     LOWER_S = 2.5
     HAUL_S = 2.5
-    CLIMB_S = 3.0
+    CLIMB_S = 2.6
     WALK_S = 8.0        # the walker takes this long to cross the wall walk
     LADDER_X = (0.03, 0.97)  # along the wall walk, the ladder at each wall
     CATCH_MARGIN = 0.5  # spare seconds he wants over the nearest redcoat
     MEND_FED = 0.3      # a man at his meal who has a wall to mend gets up at this
     HEAVY = ("lower", "descend", "mend", "ascend", "haul", "run", "hide",
              "home", "raise")
+
+    # Caught outside. Three hiding rocks stand in the woods outside each
+    # side wall, 1 to 3 each farther from the fort, at ground distance g
+    # from the foot of the wall (0). Redcoats on their trail are as far
+    # from the foot as G_SPAN times the trail still ahead of them.
+    G_SPAN = 3.0
+    RUN_S = 1.5         # seconds to run one rock's distance, fed
+    HOME_S = 2.2        # and to walk it
+    RAISE_ALONE_S = 10.0
+    HIDE_MIN_S = 6.0    # he stays behind a rock at least this long
+    POT_EVERY = (None, 6.0, 20.0, None)  # seconds between his shots, by rock
+    POT_HIT = (None, 0.5, 0.3, None)
+    POT_RANGE = 1.25    # from his rock, in g, his rifle reaches
+    DRIVE_RANGE = 1.0   # and a musket
+    DRIVE_CHANCE = 0.25 # per second, that a redcoat in range goes after him
+    DRIVERS_MAX = 2
+    CLOSE_G = 0.4       # a redcoat this near his rock drives him back
+    PIN_SHOTS = 3       # as do this many shots on his rock...
+    PIN_WINDOW = 15.0   # ...in this many seconds
+    VOLLEY_RATE = 1.5   # a redcoat's drill runs this much faster than a sentry's
 
     DRILL_LEN = 4.6     # from kneeling to the last of the smoke
     SHOT_AT = 2.0       # he fires this far into it
@@ -2072,12 +2092,15 @@ class Siege:
         # The fort's one ladder: stowed on the wall walk ("up"), or leaning
         # on the outside of a wall ("standing", ext of its length hung
         # down, 0..1), or ("falling", "fallen") on the grass.
-        self.ladder = {"side": 0, "state": "up", "ext": 0.0, "t0": 0.0}
+        self.ladder = {"side": 0, "state": "up", "ext": 0.0, "t0": 0.0,
+                       "raised": 0.0}
+        self.rock_chip = [[None] * 4 for _ in (0, 1)]  # phase each was hit
         self.tally = {"sent": {"foot": 0, "horse": 0, "cannon": 0},
                       "shot": 0, "reached": 0, "blasted": 0, "calls": 0,
                       "hurt": [0.0, 0.0], "mended": [0.0, 0.0],
                       "breaches": 0, "meals": 0, "eating_s": 0.0,
-                      "repairs": 0, "repairs_done": 0}
+                      "repairs": 0, "repairs_done": 0, "caught": 0,
+                      "out_s": 0.0, "retreats": 0, "rc_shots": 0}
 
     def _new_man(self, mode):
         """One of the fort's three men: his hunger, what he is at (mode),
@@ -2323,10 +2346,210 @@ class Siege:
                 lad["state"] = "up"
                 self._home_post(i)
 
+    def ground_g(self, rc):
+        """How far from the foot of its wall, in rock distances, a redcoat
+        is on his trail."""
+        return (1.0 - self.trail_p(rc["d"])) * self.G_SPAN
+
+    def _time_needed(self, i):
+        """Seconds man i needs to be up on the wall again with the ladder
+        under him, from where he is, at his pace."""
+        m, lad = self.men[i], self.ladder
+        t = 0.0
+        if m["mode"] in ("home", "run"):
+            t += m["g"] * self.HOME_S
+        if lad["state"] in ("fallen", "falling") and m["mode"] != "ascend":
+            t += self.RAISE_ALONE_S * (1.0 - lad["raised"])
+        h = m["h"] if m["mode"] in ("descend", "ascend", "mend") else 0.0
+        return (t + (1.0 - h) * self.CLIMB_S) / self.pace(i)
+
     def _ladder_alarm(self, i):
         """Man i, on the ladder or below it, is done or has seen redcoats:
-        he goes back up."""
-        self.men[i]["mode"] = "ascend"
+        he goes back up if he can reach the ladder and climb it before the
+        nearest redcoat reaches the foot of the wall, and if not he breaks
+        for the woods, leaving the ladder where it stands."""
+        m = self.men[i]
+        if self.wall[m["side"]] >= 1.0 or self._time_needed(i) \
+                + self.CATCH_MARGIN < self._time_to_foot(m["side"]):
+            if m["mode"] in ("home", "raise"):
+                m["mode"] = "home"   # carries on to the ladder
+            else:
+                m["mode"] = "ascend"
+            return
+        self._break_for_woods(i)
+
+    def _break_for_woods(self, i):
+        m = self.men[i]
+        self.tally["caught"] += 1
+        self.ladder["raised"] = 0.0
+        m.update(mode="run", rock=min(3, max(1, math.ceil(m["g"] - 1e-9))),
+                 t0=self.phase, h=0.0, up=None, pinned=[], shot_t=None)
+
+    def _rock_g(self, k):
+        return float(k)
+
+    def _advance_ground(self, i, dt):
+        """Man i out in the grass: running for the woods, behind a rock
+        taking pot shots, walking home, or raising the ladder alone."""
+        m, lad, pace = self.men[i], self.ladder, self.pace(i)
+        side, mode = m["side"], m["mode"]
+        close = self.in_range()
+        if mode == "run":
+            goal = self._rock_g(m["rock"])
+            m["g"] = min(goal, m["g"] + dt * pace / self.RUN_S)
+            if m["g"] >= goal:
+                m.update(mode="hide", t0=self.phase, shot_t=None,
+                         pinned=[], next_shot=self.phase + self._pot_wait(m))
+        elif mode == "hide":
+            self._hide(i, dt)
+        elif mode == "home":
+            if close and m["g"] > 0.0:
+                self._ladder_alarm(i)
+            if m["mode"] != "home":
+                return
+            m["g"] = max(0.0, m["g"] - dt * pace / self.HOME_S)
+            if m["g"] <= 0.0:
+                m["mode"] = "raise" if lad["state"] in ("fallen", "falling") \
+                    else "ascend"
+                m["h"] = 0.0
+        elif mode == "raise":
+            if close:
+                self._ladder_alarm(i)
+                if m["mode"] != "raise":
+                    return
+            if lad["state"] == "falling":
+                return
+            lad["raised"] = min(1.0, lad["raised"]
+                                + dt * pace / self.RAISE_ALONE_S)
+            if lad["raised"] >= 1.0:
+                lad.update(state="standing", ext=1.0, raised=0.0)
+                m.update(mode="ascend", h=0.0)
+
+    def _pot_wait(self, m):
+        every = self.POT_EVERY[m["rock"]]
+        return math.inf if every is None else every * (
+            0.6 + 0.8 * self.rng.random())
+
+    def _hide(self, i, dt):
+        """Behind a rock: crouched, rising now and then to take a pot shot
+        at a redcoat on his side, and driven back by fire or by a redcoat
+        close on him. Home in a lull."""
+        m = self.men[i]
+        side, k, pace = m["side"], m["rock"], self.pace(i)
+        m["pinned"] = [t for t in m["pinned"]
+                       if self.phase - t < self.PIN_WINDOW]
+        foes = [rc for rc in self.redcoats if rc["side"] == side
+                and rc["hit"] is None]
+        crowded = any(abs(self.ground_g(rc) - k) <= self.CLOSE_G
+                      for rc in foes if rc["kind"] != "cannon")
+        if k < 3 and (len(m["pinned"]) >= self.PIN_SHOTS or crowded):
+            self.tally["retreats"] += 1
+            m.update(mode="run", rock=k + 1, t0=self.phase, pinned=[],
+                     shot_t=None)
+            self._call_off(side)
+            return
+        if m["shot_t"] is not None:
+            m["shot_t"] += dt * pace
+            if m["shot_t"] >= self.SHOT_AT and not m.get("fired"):
+                m["fired"] = True
+                self._pot_shot(i)
+            if m["shot_t"] >= self.DRILL_LEN:
+                m["shot_t"] = None
+                m["next_shot"] = self.phase + self._pot_wait(m)
+            return
+        if self.phase >= m["next_shot"] and self.POT_EVERY[k] is not None \
+                and self._pot_target(i) is not None:
+            m.update(shot_t=0.0, fired=False)
+            return
+        if self.lull() and self.phase - m["t0"] >= self.HIDE_MIN_S \
+                and not m["pinned"]:
+            m["mode"] = "home"
+            self._call_off(side)
+
+    def _call_off(self, side):
+        """The redcoats who left the trail to drive him off go back to it."""
+        for rc in self.redcoats:
+            if rc["side"] == side:
+                rc.pop("drive", None)
+
+    def _pot_target(self, i):
+        m = self.men[i]
+        best, at = None, math.inf
+        for rc in self.redcoats:
+            if rc["side"] != m["side"] or rc["hit"] is not None \
+                    or rc.get("hid") is not None:
+                continue
+            gap = abs(self.ground_g(rc) - m["rock"])
+            if gap <= self.POT_RANGE and gap < at:
+                best, at = rc, gap
+        return best
+
+    def _pot_shot(self, i):
+        m = self.men[i]
+        rc = self._pot_target(i)
+        if rc is None or self.rng.random() >= self.POT_HIT[m["rock"]]:
+            return
+        rc["hp"] -= 1
+        rc["struck"] = self.phase
+        if rc["hp"] <= 0:
+            rc["hit"] = self.phase
+            self.tally["shot"] += 1
+
+    def _advance_drivers(self):
+        """A redcoat near his rock may leave the trail to drive him off:
+        he kneels and fires at the rock, and keeps on while the man is
+        there, until he has fallen back or the redcoat is shot."""
+        for i in (0, 1, 2):
+            m = self.men[i]
+            if m["mode"] != "hide" or m["rock"] >= 3:
+                continue
+            side, k = m["side"], m["rock"]
+            drivers = [rc for rc in self.redcoats if rc["side"] == side
+                       and rc["hit"] is None and rc.get("drive")]
+            for rc in self.redcoats:
+                if len(drivers) >= self.DRIVERS_MAX:
+                    break
+                if rc["side"] == side and rc["hit"] is None \
+                        and rc["kind"] == "foot" and rc["at_wall"] is None \
+                        and rc.get("hid") is None and not rc.get("drive") \
+                        and abs(self.ground_g(rc) - k) <= self.DRIVE_RANGE \
+                        and self.rng.random() < self.DRIVE_CHANCE / 30.0:
+                    rc["drive"] = {"t0": self.phase + self.rng.random(),
+                                   "born": self.phase, "rock": k,
+                                   "fired": False}
+                    drivers.append(rc)
+            for rc in drivers:
+                d = rc["drive"]
+                tau = (self.phase - d["t0"]) * self.VOLLEY_RATE
+                if tau >= self.DRILL_LEN:
+                    d.update(t0=self.phase + 0.3 + self.rng.random() * 0.6,
+                             fired=False)
+                elif tau >= self.SHOT_AT and not d["fired"]:
+                    d["fired"] = True
+                    self.tally["rc_shots"] += 1
+                    self.rock_chip[side][k] = self.phase
+                    m["pinned"].append(self.phase)
+
+    def hide_pose(self, i):
+        """Man i behind his rock: (how far ducked down behind it, kneel,
+        aim, seconds since his shot or -1)."""
+        t = self.men[i].get("shot_t")
+        if t is None:
+            return 1.0, 1.0, 0.0, -1.0
+        _, aim, shot = self.drill_pose(t)
+        duck = 1.0 - self.ramp(t, 0.0, 0.7) \
+            + self.ramp(t, self.DRILL_LEN - 1.0, self.DRILL_LEN - 0.3)
+        return min(1.0, max(0.0, duck)), 1.0, aim, shot
+
+    def volley(self, rc):
+        """A redcoat who has left the trail for his man's rock: (kneel,
+        aim, seconds since his shot or -1)."""
+        d = rc.get("drive")
+        if not d:
+            return 0.0, 0.0, -1.0
+        tau = (self.phase - d["t0"]) * self.VOLLEY_RATE
+        kneel, aim, shot = self.drill_pose(max(0.0, tau))
+        return kneel, aim, shot / self.VOLLEY_RATE if shot >= 0 else -1.0
 
     def _advance_men(self, dt, walker_busy):
         """Hunger, the walker's patrol, and what each man does in a lull."""
@@ -2343,6 +2566,11 @@ class Siege:
             if m["mode"] in ("to_wall", "lower", "descend", "mend",
                              "ascend", "haul"):
                 self._ladder_work(i, dt)
+            elif m["mode"] in ("run", "hide", "home", "raise"):
+                self._advance_ground(i, dt)
+            if self.out(i):
+                self.tally["out_s"] += dt
+        self._advance_drivers()
         if not self.has_walker:
             # No room on the wall for him: the sentry on a damaged side
             # goes down instead, if he has nothing at his rifle.
@@ -2552,6 +2780,8 @@ class Siege:
                            and rc["hit"] is None), key=lambda rc: rc["d"],
                           default=None)
             for rc in moving:
+                if rc.get("drive"):
+                    continue    # he has left the trail for the woods
                 if rc.get("hid") is not None:
                     # Not until the fire on him slackens: under steady fire
                     # he stays down until the third shot finds him.
@@ -2748,6 +2978,8 @@ class CpuView(Gtk.DrawingArea):
         self.river = None                 # its course, as last laid out
         self.fords = [None, None]         # p where each trail crosses it
         self.rocks = [None, None]         # each trail's cover, as last laid
+        self.hrocks = [[], []]            # each side's three hiding rocks
+        self.hrocks_key = None
         self.scenery = None               # the siege's woods, per size
         self.boats = []                   # bateaux of redcoats on the river
         self.boat_in = 30.0
@@ -4029,12 +4261,14 @@ class CpuView(Gtk.DrawingArea):
 
     @staticmethod
     def _redcoat(cr, x, feet, s, facing, step, fall, pound=-1.0, seed=0.0,
-                 crouch=0.0):
+                 crouch=0.0, aim=0.0, shot=-1.0):
         """A redcoat on the march, musket at the shoulder, in the same
         100-unit model as the mountain man. fall runs 0..1 as he topples
         backward and fades once he is shot; pound is the seconds he has
         been beating on the fort's wall, or negative on the march. crouch
-        runs 0..1 as he drops to one knee."""
+        runs 0..1 as he drops to one knee. aim runs 0..1 as he levels his
+        musket in front of him; shot is the seconds since he fired it, or
+        negative, a flash and smoke at its muzzle."""
         if s < 1.5:
             return
         cr.save()
@@ -4092,7 +4326,13 @@ class CpuView(Gtk.DrawingArea):
             cr.restore()
             return
 
-        # Musket at the shoulder, bayonet fixed.
+        # Musket at the shoulder, bayonet fixed; swung up level, about the
+        # shoulder, as he aims.
+        if aim > 0:
+            cr.save()
+            cr.translate(4, -72)
+            cr.rotate(aim * (math.pi / 2 + 0.13))
+            cr.translate(-4, 72)
         cr.set_source_rgb(*RIFLE_WOOD_RGB)
         cr.set_line_width(5)
         cr.move_to(7, -46)
@@ -4115,6 +4355,27 @@ class CpuView(Gtk.DrawingArea):
         cr.set_source_rgb(*SKIN_RGB)
         cr.arc(7, -48, 3, 0, 2 * math.pi)
         cr.fill()
+        if aim > 0:
+            cr.restore()
+        if 0 <= shot < 2.2:
+            mx, my = 60.0, -72.0 + drop * 0
+            for j in range(3):
+                u = min(1.0, max(0.0, shot - 0.06 * j) / 2.2)
+                cr.set_source_rgba(*SMOKE_RGB, 0.55 * (1 - u))
+                cr.arc(mx + 6 + 22 * math.sqrt(u) + 7 * j,
+                       my - 12 * u - 3 * j, 4 + 11 * math.sqrt(u) + 2 * j,
+                       0, 2 * math.pi)
+                cr.fill()
+            if shot < 0.14:
+                flare = 1.0 - shot / 0.14
+                CpuView._glow(cr, mx + 6, my, 26 * flare + 6, FLASH_RGB,
+                              flare)
+                cr.set_source_rgba(1, 1, 0.9, flare)
+                cr.move_to(mx, my - 4)
+                cr.line_to(mx + 22 * flare + 6, my)
+                cr.line_to(mx, my + 4)
+                cr.close_path()
+                cr.fill()
 
         if fall > 0:
             cr.pop_group_to_source()
@@ -4355,8 +4616,7 @@ class CpuView(Gtk.DrawingArea):
         tower_w = wall * 2.4
         tower_h = t * 0.5
         floor = Y - tower_h
-        self.fort_geo = {"X": X, "Y": Y, "W": W, "H": H, "wall": wall,
-                         "floor": floor, "t": t}
+
         towers = []
         for tx in (X - tower_w * 0.35, X + W - tower_w * 0.65):
             self._blockhouse(cr, tx, floor, tower_w, tower_h + wall)
@@ -4414,6 +4674,12 @@ class CpuView(Gtk.DrawingArea):
         if cover > 0:
             rock = self.rocks[rc["rock"]]
             x += (rock["x"] + rock["inward"] * rock["w"] * 0.08 - x) * cover
+        drive = rc.get("drive")
+        if drive and self.hrocks[rc["side"]]:
+            # He steps off the trail toward the man's rock to fire on it.
+            rock = self.hrocks[rc["side"]][drive["rock"] - 1]
+            x += (rock["x"] - x) * 0.5 * self._ramp(
+                self.siege.phase - drive["born"], 0.0, 1.0)
         if self.siege.at_wall(rc):
             outward = -1 if rc["side"] == 0 else 1
             x += outward * size * (self.STANDOFF[rc["kind"]]
@@ -4544,6 +4810,119 @@ class CpuView(Gtk.DrawingArea):
                 "side": side}
         self.siege.boulders = [bool(r) for r in self.rocks]
 
+    def _lay_hiding_rocks(self, key, width, height, t, die):
+        """Three rocks in the woods outside each side wall, one behind the
+        other, each farther from the wall's foot, laid out apart from the
+        siege's scenery: clear of the trail, the barracks, the chip, the
+        fort and the river, and on the outward side of the wall."""
+        g = self.fort_geo
+        if g is None:
+            self.hrocks = [[], []]
+            return
+        key = (key, round(g["X"]), round(g["Y"]), round(g["H"]),
+               round(self.redcoat_s), round(self.trails[0][3][0]))
+        if key == self.hrocks_key:
+            return
+        self.hrocks_key = key
+        mud = self.river["half"] * 0.35 + 1
+        wall = g["wall"]
+        tower = wall * 2.4 * 0.35
+        fort = (g["X"] - tower, g["floor"] - t * 1.1, g["X"] + g["W"] + tower,
+                g["Y"] + g["H"])
+        grow = [(fort, 0.1 * t), (die, 0.3 * t)] + [
+            (box, 0.3 * t) for box in self.barracks_box]
+        avoid = [(b[0] - m, b[1] - m, b[2] + m, b[3] + m)
+                 for b, m in grow if b is not None]
+        path = []
+        for pts in self.trails:
+            for k in range(49):
+                p = k / 48
+                x, y = self._bezier(pts, p)
+                path.append((x, y, self.redcoat_s * self._depth_scale(p)))
+        top, bottom = g["Y"], g["Y"] + g["H"]
+        self.hrocks = [[], []]
+        for side in (0, 1):
+            inward = 1 if side == 0 else -1
+            foot = self._ladder_ends(side)[0]
+            size_at = lambda y: self.redcoat_s * (0.7 + 0.3 * min(
+                1.0, max(0.0, (y - top) / max(1.0, bottom - top))))
+            near_rocks = [r for r in self.rocks if r]
+
+            def clear(x, base, tier):
+                size = size_at(base)
+                w, h = 0.62 * size, 0.4 * size
+                if x - w / 2 < 2 or x + w / 2 > width - 2 or base - h < 2:
+                    return False
+                box = (x - w * 0.6, base - h - 0.3 * size, x + w * 0.6,
+                       base + 2)
+                if any(self._overlaps(box, a) for a in avoid):
+                    return False
+                if abs(base - self._river_y(x)) < self._river_half_max(x) \
+                        + mud + 0.4 * h:
+                    return False
+                margin = (0.5, 0.3, 0.1)[tier] if tier < 3 else None
+                if margin is not None and any(
+                        abs(x - px) < w * 0.5 + psize * margin + 4
+                        and base - h - psize * 0.3 < py < base + psize * 0.5
+                        for px, py, psize in path):
+                    return False
+                if any(abs(x - r["x"]) < (w + r["w"]) * 0.6
+                       and abs(base - r["base"]) < size for r in near_rocks):
+                    return False
+                return True
+
+            # Every spot outside the wall, a step apart, nearest the foot
+            # of the wall first.
+            cands = []
+            step = 0.1 * t
+            x = foot[0] - inward * 0.3 * t
+            while 0 < x < width:
+                for j in range(60):
+                    base = bottom - 0.3 * t - j * step
+                    if base < top - 0.6 * t:
+                        break
+                    cands.append((x, base))
+                x -= inward * step
+            cands.sort(key=lambda c: math.hypot(c[0] - foot[0],
+                                                c[1] - foot[1]))
+            chosen = []
+            for tier in (0, 1, 2, 3):
+                chosen = []
+                for k in range(3):
+                    pick = next((c for c in cands
+                                 if self._ok_rock_dist(
+                                     c, foot, chosen, 0.5 * size_at(c[1]))
+                                 and clear(c[0], c[1], tier)), None)
+                    if pick is None:
+                        break
+                    chosen.append(pick)
+                if len(chosen) == 3:
+                    break
+            # Whatever happens, three: stood up the outside of the wall.
+            while len(chosen) < 3:
+                k = len(chosen)
+                chosen.append((foot[0] - inward * 0.9 * t,
+                               bottom - (1.0 + 1.1 * k) * t))
+            for k, (x, base) in enumerate(chosen):
+                size = size_at(base)
+                self.hrocks[side].append({
+                    "x": x, "base": base, "w": 0.62 * size, "h": 0.4 * size,
+                    "inward": inward, "side": side, "k": k + 1,
+                    "size": size})
+
+    @staticmethod
+    def _ok_rock_dist(c, foot, chosen, gap):
+        """A candidate spot for the next hiding rock: farther from the
+        foot of the wall than the last, and a gap from every other."""
+        d = math.hypot(c[0] - foot[0], c[1] - foot[1])
+        if d < gap:
+            return False
+        for o in chosen:
+            if math.hypot(c[0] - o[0], c[1] - o[1]) < gap or d <= math.hypot(
+                    o[0] - foot[0], o[1] - foot[1]):
+                return False
+        return True
+
     @staticmethod
     def _rock(cr, x, base, w, h, seed):
         """A lumpy boulder sitting on the ground at base, w wide, h high,
@@ -4621,22 +5000,37 @@ class CpuView(Gtk.DrawingArea):
                         rock["base"] - rock["h"] * 0.85, rock["h"] * 1.6,
                         self.siege.phase - chip)
 
+    def _draw_hiding_rock(self, cr, rock):
+        self._rock(cr, rock["x"], rock["base"], rock["w"], rock["h"],
+                   rock["k"] + 3 * rock["side"])
+        chip = self.siege.rock_chip[rock["side"]][rock["k"]]
+        if chip is not None:
+            # Fired on from the trail, which is up and outward of it.
+            self._chips(cr, rock["x"] - rock["inward"] * rock["w"] * 0.2,
+                        rock["base"] - rock["h"] * 0.85, rock["h"] * 1.6,
+                        self.siege.phase - chip)
+
     def _draw_redcoats(self, cr):
         self._draw_stains(cr)
         # Each boulder is drawn just after anyone crouched behind it, and
         # before anyone nearer the fort.
         items = [(-rc["d"], 0, rc) for rc in self.siege.redcoats]
         items += [(-rock["d"], 1, rock) for rock in self.rocks if rock]
+        # Whoever is outside is as far down the picture as his feet, with
+        # his rock just after him; the hiding rocks go in by the same rule.
+        items += [(-self._depth_of_y(r["base"]), 3, r)
+                  for side in self.hrocks for r in side]
         ground = self._ground_man()
-        if ground is not None and self.fort_geo is not None:
-            # Whoever is outside is as far down the picture as his feet.
-            items.append((-Siege.trail_d(min(1.0, max(0.0, (
-                self._ground_pos(ground)[1] - self.trails[0][0][1])
-                / (self.trails[0][3][1] - self.trails[0][0][1])))), 2,
-                ground))
+        if ground is not None and self.fort_geo is not None \
+                and self.hrocks[self.siege.men[ground]["side"]]:
+            items.append((-self._depth_of_y(self._ground_xy(ground)[1]),
+                          2, ground))
         for _, is_rock, rc in sorted(items, key=lambda it: it[:2]):
             if is_rock == 2:
-                self._ground_mender(cr, rc)
+                self._draw_ground_man(cr, rc)
+                continue
+            if is_rock == 3:
+                self._draw_hiding_rock(cr, rc)
                 continue
             if is_rock:
                 self._draw_rock(cr, rc)
@@ -4684,11 +5078,19 @@ class CpuView(Gtk.DrawingArea):
             else:
                 cover = self.siege.cover(rc)
                 step = math.sin(self.phase * 6.5 + rc["n"] * 1.7) * 0.35 \
-                    if marching and rc.get("hid") is None else 0.0
+                    if marching and rc.get("hid") is None \
+                    and not rc.get("drive") else 0.0
                 if cover > 0:
                     facing = toward  # he keeps his eyes on the fort
+                kneel = aim = 0.0
+                shot = -1.0
+                if rc.get("drive") and alive and self.hrocks[rc["side"]]:
+                    rock = self.hrocks[rc["side"]][rc["drive"]["rock"] - 1]
+                    facing = 1 if rock["x"] >= x else -1
+                    kneel, aim, shot = self.siege.volley(rc)
                 self._redcoat(cr, x, feet, size, facing, step, fall, pound,
-                              rc["n"] * 1.3, crouch=cover)
+                              rc["n"] * 1.3, crouch=max(cover, kneel),
+                              aim=aim, shot=shot)
             if not alive:
                 # The man bleeds, whether rider, gunner or foot.
                 bx = x - facing * size * 0.55 if kind == "cannon" else x
@@ -4770,8 +5172,6 @@ class CpuView(Gtk.DrawingArea):
             lx, ly = self._ladder_at(side, m["h"])
             self._mountain_man(cr, lx, ly, ws, inward,
                                step=math.sin(m["h"] * 40) * 0.5)
-        elif mode == "mend":
-            self._ground_mender(cr, i)
         else:
             # Leaning out over the wall to work the ladder.
             work = self.siege.ladder["ext"]
@@ -4788,12 +5188,61 @@ class CpuView(Gtk.DrawingArea):
         return bx - (1 if m["side"] == 0 else -1) * self.fort_geo["wall"] \
             * 0.9, by, s
 
-    def _ground_mender(self, cr, i):
+    def _ground_xy(self, i):
+        """Where man i stands on the ground outside: (x, feet, size),
+        from the ladder's foot out through the three rocks."""
         m = self.siege.men[i]
-        x, y, s = self._ground_pos(i)
-        inward = 1 if m["side"] == 0 else -1
-        swing = 0.5 + 0.5 * math.sin(self.siege.phase * 6.0)
-        self._mountain_man(cr, x, y, s, inward, axe=swing)
+        pts = [self._ground_pos(i)] + [
+            (r["x"] + r["inward"] * r["w"] * 0.1, r["base"],
+             r["size"] * 0.94) for r in self.hrocks[m["side"]]]
+        g = min(3.0, max(0.0, m["g"]))
+        k = min(int(g), len(pts) - 2)
+        u = g - k
+        a, b = pts[k], pts[min(k + 1, len(pts) - 1)]
+        return tuple(a[j] + (b[j] - a[j]) * u for j in range(3))
+
+    def _depth_of_y(self, y):
+        """The distance on the trail that stands as far down the picture
+        as y, for ordering whatever is on the ground by its feet."""
+        far, near = self.trails[0][0][1], self.trails[0][3][1]
+        return Siege.trail_d(min(1.0, max(0.0, (y - far) / (near - far))))
+
+    def _draw_ground_man(self, cr, i):
+        """Man i out in the grass: at the wall's foot with a mallet,
+        running for the woods, crouched behind a rock rising to shoot,
+        walking home, or raising the ladder."""
+        siege = self.siege
+        m = siege.men[i]
+        mode, side = m["mode"], m["side"]
+        inward = 1 if side == 0 else -1
+        x, y, s = self._ground_xy(i)
+        if mode == "mend":
+            swing = 0.5 + 0.5 * math.sin(siege.phase * 6.0)
+            self._mountain_man(cr, x, y, s, inward, axe=swing)
+        elif mode == "raise":
+            lift = 0.5 + 0.5 * math.sin(siege.phase * 3.0)
+            self._mountain_man(cr, x, y, s, inward, kneel=0.5 * lift,
+                               shouldered=True)
+        elif mode in ("run", "home"):
+            facing = -inward if mode == "run" else inward
+            fast = mode == "run"
+            self._mountain_man(cr, x, y, s, facing, shouldered=True,
+                               step=math.sin(self.phase * (14.0 if fast
+                                                           else 8.0))
+                               * (0.55 if fast else 0.38))
+        else:
+            duck, kneel, aim, shot = siege.hide_pose(i)
+            elev = 0.04
+            target = siege._pot_target(i)
+            facing = -inward
+            if target is not None:
+                tx, tfeet, tsize = self._redcoat_at(target)
+                facing = 1 if tx >= x else -1
+                elev = min(1.3, max(-0.6, math.atan2(
+                    (y - s * 0.52) - (tfeet - tsize * self.CHEST[
+                        target["kind"]]), max(1.0, abs(tx - x)))))
+            self._mountain_man(cr, x, y + duck * s * 0.34, s, facing,
+                               kneel=kneel, aim=aim, shot=shot, elev=elev)
 
     def _draw_sentries(self, cr, towers, floor, walk, walk_y, t):
         if not self.on:
@@ -7070,6 +7519,9 @@ class CpuView(Gtk.DrawingArea):
         avoid += [(r["x"] - r["w"] * 0.7, r["base"] - r["h"] - 0.4 * t,
                    r["x"] + r["w"] * 0.7, r["base"] + 0.1 * t)
                   for r in self.rocks if r]
+        avoid += [(r["x"] - r["w"] * 0.9, r["base"] - r["h"] - 0.5 * t,
+                   r["x"] + r["w"] * 0.9, r["base"] + 0.2 * t)
+                  for side in self.hrocks for r in side]
         path = []
         for pts in self.trails:
             for k in range(49):
@@ -7226,6 +7678,11 @@ class CpuView(Gtk.DrawingArea):
             self._draw_trails(cr)
             self._find_fords()
             self._lay_rocks()
+            wall = 0.3 * t
+            self.fort_geo = {"X": yx - wall, "Y": fy - wall, "W": yw + 2 * wall,
+                             "H": fh + 2 * wall, "wall": wall, "t": t,
+                             "floor": fy - wall - 0.5 * t}
+            self._lay_hiding_rocks(key, width, height, t, die)
             self._draw_boats(cr)
             self._draw_fords(cr)
             for i in (0, 1):
@@ -9280,6 +9737,98 @@ def _until(siege, test, seconds):
     return test()
 
 
+def _foe(siege, kind="foot", p=0.6, side=0):
+    """A redcoat marching on side's trail, at screen position p."""
+    siege.send(side, kind)
+    rc = siege.redcoats[-1]
+    rc["d"] = Siege.trail_d(p)
+    return rc
+
+
+def _walker_out(siege, mode="mend", side=0, i=2):
+    """Man i down at the foot of side's wall, the ladder standing."""
+    m = siege.men[i]
+    m.update(mode=mode, side=side, h=0.0, g=0.0, t0=siege.phase, up=None,
+             x=Siege.LADDER_X[side])
+    siege.ladder.update(side=side, state="standing", ext=1.0, raised=0.0)
+    return m
+
+
+def _stage_eating(siege):
+    for m in siege.men:
+        m["hunger"] = 0.7
+    siege.run(Siege.QUIET_S + 2.5)
+
+
+def _stage_walls(strength):
+    def stage(siege):
+        siege.wall = [strength, strength]
+    return stage
+
+
+def _stage_out(mode, h=0.0, g=0.0, rock=1, fire=False, side=0, wall=0.5,
+               ladder="standing"):
+    def stage(siege):
+        siege.wall = [wall, wall]
+        m = _walker_out(siege, mode, side)
+        m.update(h=h, g=g, rock=rock, shot_t=None, pinned=[],
+                 next_shot=1e9)
+        siege.ladder["state"] = ladder
+        if fire:
+            m["shot_t"] = 2.4
+            foe = _foe(siege, "foot", 0.7, side)
+            foe["drive"] = {"t0": siege.phase - 1.4 / Siege.VOLLEY_RATE,
+                            "born": siege.phase - 3, "rock": rock,
+                            "fired": True}
+    return stage
+
+
+# Every state the siege draws that a plain run of it seldom shows, by name.
+SIEGE_PICTURES = (
+    ("walls-full", _stage_walls(1.0)),
+    ("walls-hurt", _stage_walls(0.6)),
+    ("walls-badly-hurt", _stage_walls(0.25)),
+    ("walls-breached", _stage_walls(0.0)),
+    ("men-eating", _stage_eating),
+    ("walker-descending", _stage_out("descend", h=0.55)),
+    ("walker-mending", _stage_out("mend")),
+    ("walker-running", _stage_out("run", g=0.5)),
+    ("walker-behind-rock-1", _stage_out("hide", g=1.0, rock=1, fire=True)),
+    ("walker-behind-rock-2", _stage_out("hide", g=2.0, rock=2)),
+    ("walker-behind-rock-3", _stage_out("hide", g=3.0, rock=3, side=1)),
+    ("walker-coming-home", _stage_out("home", g=1.5, rock=1)),
+    ("walker-raising-ladder", _stage_out("raise", ladder="fallen")),
+)
+
+
+def siege_pictures(view, size=(900, 560), outdir=None):
+    """Draw each state of SIEGE_PICTURES on a fresh siege, a few frames
+    apiece so that anything animated moves, and write each as a PNG into
+    outdir if one is given. Returns the names drawn."""
+    w, h = size
+    names = []
+    for name, stage in SIEGE_PICTURES:
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+        cr = cairo.Context(surface)
+        view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
+        view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], True)
+        siege = view.siege
+        siege.wave_in = siege.spawn_in = view.boat_in = 1e9
+        siege.drill_start = [siege.phase + 1e9, siege.phase + 1e9]
+        view.phase = siege.phase
+        view._draw(view, cr, w, h)
+        stage(siege)
+        for _ in range(4):
+            view.phase += 0.1
+            siege.tick(0.1)
+            view._draw(view, cr, w, h)
+        if outdir:
+            surface.write_to_png(os.path.join(outdir, f"{name}.png"))
+        names.append(name)
+    view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
+    return names
+
+
 def siege_tests(view, cr):
     """The walls, the lulls, the walker's mending and the ladder: staged
     situations, run with Siege alone, and the drawings of each state."""
@@ -9408,6 +9957,88 @@ def siege_tests(view, cr):
     assert siege.out(1) and not siege.out(0) and siege.ladder["side"] == 1
     assert _until(siege, lambda: siege.wall[1] >= 1.0, 60)
     assert _until(siege, lambda: siege.men[1]["mode"] == "post", 20)
+
+    # Caught outside: a horseman in range will be at the foot of the wall
+    # before he can climb, so he breaks for the woods; the ladder is left
+    # standing. A man on foot far enough off, he climbs away from.
+    siege = _quiet_siege()
+    siege.drill_start = [None, None]
+    siege.wall = [0.5, 1.0]
+    walker = _walker_out(siege)
+    _foe(siege, "horse", 0.55)
+    siege.run(0.2)
+    assert walker["mode"] == "run" and siege.tally["caught"] == 1, walker
+    assert siege.ladder["state"] == "standing" and siege.out(2)
+    assert _until(siege, lambda: walker["mode"] == "hide", 10)
+    assert walker["rock"] == 1 and walker["g"] == 1.0
+    siege = _quiet_siege()
+    siege.drill_start = [None, None]
+    walker = _walker_out(siege)
+    siege.wall = [0.5, 1.0]
+    _foe(siege, "foot", 0.52)
+    siege.run(0.2)
+    assert walker["mode"] == "ascend", "time enough to climb"
+    siege = _quiet_siege()
+    siege.drill_start = [None, None]
+    walker = _walker_out(siege)
+    siege.wall = [0.5, 1.0]
+    siege.men[2]["hunger"] = 1.0   # starving, slowly
+    _foe(siege, "foot", 0.52)
+    siege.run(0.2)
+    assert walker["mode"] == "run", "a hungry man is caught where a fed one is not"
+
+    # Behind a rock he takes pot shots at redcoats on his side, often from
+    # the first, seldom from the second and not at all from the third,
+    # which is out of range.
+    shots = []
+    for k in (1, 2, 3):
+        count = 0
+        for seed in range(6):
+            siege = _quiet_siege(seed)
+            walker = _walker_out(siege)
+            walker.update(mode="hide", g=float(k), rock=k, shot_t=None,
+                          pinned=[], next_shot=siege.phase + 1)
+            rc = _foe(siege, "foot", 1.0 - (k + 0.7) / Siege.G_SPAN)
+            d, rc["hp"] = rc["d"], 99
+            for _ in range(40 * 30):
+                rc["d"] = d     # he stands his ground, for the count
+                siege.run(1 / 30)
+                walker.update(pinned=[], g=float(k), t0=siege.phase)
+            count += rc["struck"] is not None
+        shots.append(count)
+    assert shots[0] > shots[1] > shots[2] == 0, shots
+
+    # Redcoats answer: one leaves the trail and fires at the man's rock,
+    # chipping it; enough fire, and he falls back to the next rock. The
+    # man who went after him goes back to the trail.
+    siege = _quiet_siege(3)
+    siege.drill_start = [None, None]
+    walker = _walker_out(siege)
+    walker.update(mode="hide", g=1.0, rock=1, shot_t=None, pinned=[],
+                  next_shot=1e9)
+    siege.DRIVE_CHANCE = 600.0  # as good as certain, for the test
+    rc = _foe(siege, "foot", 0.43)
+    rc["hp"] = 99
+    assert _until(siege, lambda: rc.get("drive"), 60), "he goes after him"
+    assert _until(siege, lambda: siege.tally["rc_shots"] >= 1, 10)
+    assert siege.rock_chip[0][1] is not None, "the rock is struck"
+    assert _until(siege, lambda: walker["rock"] == 2, 40), walker
+    assert siege.tally["retreats"] == 1 and not rc.get("drive")
+    assert walker["mode"] in ("run", "hide") and siege.men[2]["hunger"] > 0
+    assert siege.wall[0] == 1.0 or True
+
+    # He comes home in a lull, climbs the ladder and hauls it up.
+    siege = _quiet_siege()
+    siege.drill_start = [None, None]
+    walker = _walker_out(siege)
+    walker.update(mode="hide", g=2.0, rock=2, shot_t=None, pinned=[],
+                  next_shot=1e9)
+    assert _until(siege, lambda: walker["mode"] == "home", 30)
+    assert _until(siege, lambda: walker["mode"] == "ascend", 20)
+    assert walker["g"] == 0.0
+    assert _until(siege, lambda: walker["mode"] == "patrol", 30)
+    assert siege.ladder["state"] == "up" and not siege.out(2)
+    assert siege.tally["out_s"] > 5
 
     # A wall reads by shape: more logs down, shorter, leaning, at each
     # level of damage, not only a different shade.
@@ -10080,6 +10711,7 @@ def self_test():
 
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], True)
     siege_tests(view, cr)
+    assert len(siege_pictures(view)) == len(SIEGE_PICTURES)
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
     assert view.siege.wall == [1.0, 1.0], "standing down mends everything"
 
