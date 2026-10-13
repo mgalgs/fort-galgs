@@ -2109,6 +2109,16 @@ class Siege:
     # The walker mends a roof as he mends a wall, in a lull, walls first.
     ROOF_HACK_PER_S = 0.012     # of its strength, a man's axe and bayonet
     ROOF_MEND_PER_S = 0.014
+
+    # The yard. Through a holed roof the stormers drop in, DROP_S apiece
+    # to fall, and make for the core tiles nearest them, positions (u, v)
+    # across and down the yard, 0..1, and batter them. That is a picture
+    # and nothing more: a tile's dent runs 0 whole to 1 smashed, and
+    # touches nothing real. Dents fade when the yard is clear in a lull.
+    DROP_S = 1.2
+    YARD_S = 14.0       # a stormer crosses the width of the yard in this
+    BATTER_PER_S = 0.04
+    DENT_FADE_PER_S = 0.02
     DRILL_LEN = 4.6     # from kneeling to the last of the smoke
     SHOT_AT = 2.0       # he fires this far into it
 
@@ -2151,6 +2161,8 @@ class Siege:
                        "raised": 0.0}
         self.rock_chip = [[None] * 4 for _ in (0, 1)]  # phase each was hit
         self.stormers = []                # redcoats on the wall walk, or past
+        self.tiles = [(u, v) for v in (0.3, 0.75) for u in (0.2, 0.5, 0.8)]
+        self.dents = {}                   # tile -> how battered, 0..1
         # The fort's gun, for the fight on the wall walk: which way it
         # points (+1 east), from when it may fire, when the walker began to
         # sight along the walk, when it last fired, and whether it is taken.
@@ -2165,7 +2177,7 @@ class Siege:
                       "climbs": 0, "pushes": 0, "raises": 0, "fell": 0,
                       "top": 0, "gun_kills": 0, "guns": 0,
                       "roof_hurt": [0.0, 0.0], "roof_mended": [0.0, 0.0],
-                      "roof_holes": 0}
+                      "roof_holes": 0, "yard": 0, "batter_s": 0.0}
 
     def vary(self, spread):
         """A factor near 1, up to spread either side of it: the siege's
@@ -2351,8 +2363,17 @@ class Siege:
                 st.update(mode="hack", since=self.phase)
             elif not gone and abs(gx - st["x"]) <= self.TAKE_X:
                 self._reach_gun(st)
-        for st in self.stormers_on(mode="hack"):
-            self.hurt_roof(st["side"], self.ROOF_HACK_PER_S * dt)
+        for side in (0, 1):
+            hackers = self.stormers_on(side, "hack")
+            for st in hackers:
+                self.hurt_roof(side, self.ROOF_HACK_PER_S * dt)
+            if self.holed(side):
+                for k, st in enumerate(hackers):
+                    if st.get("drop_at") is None:
+                        st["drop_at"] = self.phase + 0.5 + k
+                    if self.phase >= st["drop_at"]:
+                        st.update(mode="drop", since=self.phase)
+        self._advance_yard(dt)
         self.stormers = [st for st in self.stormers
                          if st["hit"] is None
                          or self.phase - st["hit"] < self.FALL_S]
@@ -3056,8 +3077,54 @@ class Siege:
         return self.roof[side] <= 0.0
 
     def ousted(self, i):
-        """Tower sentry i has been driven off his roof by men hacking it."""
-        return any(st["side"] == i for st in self.stormers_on(mode="hack"))
+        """Tower sentry i has been driven off his roof by men hacking it,
+        or by those who have gone down through it."""
+        return any(st["side"] == i and st["mode"] != "walk"
+                   for st in self.stormers_on())
+
+    def dent(self, k):
+        """How battered core tile k is, 0 whole to 1 smashed."""
+        return self.dents.get(k, 0.0)
+
+    def _advance_yard(self, dt):
+        """Stormers dropped through a roof, in the yard: each makes for
+        the nearest tile not yet smashed and batters it, and when the yard
+        is clear in a lull the dents mend over time."""
+        for st in self.stormers_on(mode="drop"):
+            if self.phase - st["since"] >= self.DROP_S:
+                st.update(mode="yard", u=0.02 if st["side"] == 0 else 0.98,
+                          v=0.0, tile=None, since=self.phase)
+                self.tally["yard"] += 1
+        yard = self.stormers_on(mode="yard")
+        for st in yard:
+            if st["tile"] is None or self.dent(st["tile"]) >= 1.0:
+                live = [k for k in range(len(self.tiles))
+                        if self.dent(k) < 1.0]
+                st["tile"] = min(live, key=lambda k: math.hypot(
+                    self.tiles[k][0] - st["u"], self.tiles[k][1] - st["v"]),
+                    default=None)
+            if st["tile"] is None:
+                continue
+            tu, tv = self.tiles[st["tile"]]
+            gu, gv = tu - st["u"], tv - st["v"]
+            dist = math.hypot(gu, gv)
+            step = dt * st["stride"] / self.YARD_S
+            if dist > 0.05:
+                st["u"] += gu / dist * min(step, dist)
+                st["v"] += gv / dist * min(step, dist)
+                st["batter"] = False
+            else:
+                st["batter"] = True
+                k = st["tile"]
+                self.dents[k] = min(1.0, self.dent(k)
+                                    + self.BATTER_PER_S * dt)
+                self.tally["batter_s"] += dt
+        if not yard and self.lull():
+            for k in list(self.dents):
+                self.dents[k] = max(0.0, self.dents[k]
+                                    - self.DENT_FADE_PER_S * dt)
+                if self.dents[k] <= 0.0:
+                    del self.dents[k]
 
     def _advance_driven(self, dt):
         """The walker with the gun taken: back along the walk to the far
@@ -3463,6 +3530,8 @@ class CpuView(Gtk.DrawingArea):
         self.redcoat_s = 14.0             # a redcoat's size at the near end
         self.walker_at = None             # (x, feet) as last drawn
         self.sentries_at = None           # (towers, floor, size) as drawn
+        self.yard_tiles = []              # (x, y, w, h) of each fort tile
+        self.yard_geo = None              # (x, y, w, h) of the yard
         self.potshot = None               # his shot at a boat, if taking one
         self.potshot_after = 0.0          # siege time he may next shoot
         self.overboard = []               # men shot out of the boats
@@ -6116,6 +6185,43 @@ class CpuView(Gtk.DrawingArea):
                            step=math.sin(self.phase * 14.0) * 0.55
                            if moving else 0.0, shouldered=moving)
 
+    def _draw_yard_stormers(self, cr, towers, floor, t):
+        """Redcoats dropping through a tower's roof into the yard, and in
+        it, at a core tile with an axe, battering at it."""
+        siege = self.siege
+        yx, fy, yw, fh = self.yard_geo
+        size = t * 0.8
+        for st in siege.stormers:
+            if st["mode"] not in ("drop", "yard"):
+                continue
+            e = -1.0 if st["hit"] is None else siege.phase - st["hit"]
+            facing = 1 if st["side"] == 0 else -1
+            if st["mode"] == "drop":
+                u = self._ramp(siege.phase - st["since"], 0.0, Siege.DROP_S)
+                x0 = towers[st["side"]]
+                x1 = yx + (0.02 if st["side"] == 0 else 0.98) * yw
+                x = x0 + (x1 - x0) * u
+                feet = floor + (fy + size * 0.2 - floor) * u * u
+                self._redcoat(cr, x, feet, size, facing, 0.0, 0.0,
+                              seed=st["n"] * 1.3)
+                continue
+            x = yx + st["u"] * yw
+            feet = fy + st["v"] * fh + (self.yard_tiles[0][3] * 0.3
+                                        if self.yard_tiles else 0.0)
+            tile = st.get("tile")
+            if tile is not None and tile < len(self.yard_tiles):
+                tx, ty, tw, th = self.yard_tiles[tile]
+                facing = 1 if tx + tw / 2 >= x else -1
+            pound = siege.phase - st["since"] if st.get("batter") else -1.0
+            step = math.sin(self.phase * 6.5 + st["n"] * 1.7) * 0.35 \
+                if st["hit"] is None and not st.get("batter") else 0.0
+            self._redcoat(cr, x, feet, size, facing, step,
+                          0.0 if e < 0 else e / Siege.FALL_S, pound=pound,
+                          seed=st["n"] * 1.3)
+            if e >= 0:
+                self._spray(cr, x, feet - size * 0.6, size, -facing, e,
+                            st["n"] * 0.37)
+
     def _draw_walker_back(self, cr, towers, floor, x, walk_y, ws, facing,
                           gun_x, gs):
         """The walker with the gun taken: running back along the walk,
@@ -6146,6 +6252,8 @@ class CpuView(Gtk.DrawingArea):
         siege = self.siege
         hacking = {0: 0, 1: 0}
         for st in siege.stormers:
+            if st["mode"] in ("drop", "yard"):
+                continue
             x = x0 + (x1 - x0) * st["x"]
             facing = 1 if st["side"] == 0 else -1
             e = -1.0 if st["hit"] is None else siege.phase - st["hit"]
@@ -8435,6 +8543,12 @@ class CpuView(Gtk.DrawingArea):
         # Orange only while the fort holds them; down, they are like any other.
         self._tiles(cr, fort, yx + (yw - fw) / 2, fy, cols_f, t, tile_h,
                     label_h, gap, self.on)
+        if self.on:
+            self.yard_geo = (yx, fy, yw, fh)
+            self.siege.tiles = [((x + w / 2 - yx) / yw, (y + h / 2 - fy) / fh)
+                                for x, y, w, h in self.yard_tiles] \
+                or self.siege.tiles
+            self._draw_yard_stormers(cr, towers, floor, t)
 
         # Last, so a pacing sentry passes in front of the tower roofs.
         if self.on:
@@ -8545,11 +8659,17 @@ class CpuView(Gtk.DrawingArea):
             cr.fill()
 
     def _tiles(self, cr, cores, x0, y0, cols, t, tile_h, label_h, gap, mine):
+        if mine:
+            self.yard_tiles = []
         for i, core in enumerate(cores):
             col, row = i % cols, i // cols
             x = x0 + col * (t + gap)
             y = y0 + row * (tile_h + label_h + gap)
-            self._draw_tile(cr, x, y, t, tile_h, core, mine)
+            dent = 0.0
+            if mine and self.on:
+                dent = self.siege.dent(i)
+                self.yard_tiles.append((x, y, t, tile_h))
+            self._draw_tile(cr, x, y, t, tile_h, core, mine, dent)
             label = " · ".join(str(c) for c in core["cpus"])
             self._text(cr, x + t / 2, y + tile_h + label_h * 0.78,
                        label, max(9.0, label_h * 0.6),
@@ -8581,7 +8701,63 @@ class CpuView(Gtk.DrawingArea):
         cr.set_line_width(1.4)
         cr.stroke()
 
-    def _draw_tile(self, cr, x, y, w, h, core, mine):
+    def _draw_dents(self, cr, x, y, w, h, dent, seed):
+        """A tile's frame cracked and dented by redcoats' axes and musket
+        butts, more with dent (0..1): cracks run in from the edge, bites
+        are knocked out of the frame, and at the last a corner is gone.
+        Shapes, not colour, say how bad it is."""
+        r = w * 0.16
+        cr.save()
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_line_join(cairo.LINE_JOIN_ROUND)
+        for k in range(1 + int(dent * 5.0)):
+            f = ((seed * 7 + k * 5 + 1) * 0.618034) % 1.0
+            side = (seed + k) % 4
+            ex = x + w * (0.15 + 0.7 * f) if side % 2 == 0 \
+                else x + (w if side == 1 else 0.0)
+            ey = y + h * (0.15 + 0.7 * f) if side % 2 == 1 \
+                else y + (h if side == 2 else 0.0)
+            px, py = ex, ey
+            cx, cy = x + w / 2, y + h / 2
+            pts = [(px, py)]
+            for j in range(1, 4):
+                u = j / 4.0 * min(1.0, 0.35 + dent)
+                jit = ((k * 3 + j) * 0.381966) % 1.0 - 0.5
+                pts.append((ex + (cx - ex) * u + jit * w * 0.18,
+                            ey + (cy - ey) * u - jit * h * 0.12))
+            for lw, a, rgb in ((max(1.8, w * 0.045), 0.95, (0.0, 0.0, 0.0)),
+                               (max(0.8, w * 0.016), 0.9, (1.0, 1.0, 1.0))):
+                cr.set_source_rgba(*rgb, a)
+                cr.set_line_width(lw)
+                cr.move_to(*pts[0])
+                for pt in pts[1:]:
+                    cr.line_to(*pt)
+                cr.stroke()
+        for k in range(int(dent * 4.0 + 0.5)):
+            f = ((seed * 3 + k * 7 + 2) * 0.618034) % 1.0
+            bx = x + (w if (seed + k) % 2 else 0.0)
+            by = y + h * (0.1 + 0.8 * f)
+            rad = w * (0.07 + 0.03 * (k % 2))
+            cr.set_source_rgba(0.02, 0.02, 0.04, 1.0)
+            cr.arc(bx, by, rad, 0, 2 * math.pi)
+            cr.fill()
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.8)
+            cr.set_line_width(max(0.8, w * 0.016))
+            cr.arc(bx, by, rad, 0, 2 * math.pi)
+            cr.stroke()
+        if dent >= 0.8:
+            # A corner knocked clean off, ragged.
+            cr.set_source_rgba(0.02, 0.02, 0.04, 1.0)
+            cr.move_to(x + w - r * 1.6, y - 1)
+            cr.line_to(x + w + 1, y - 1)
+            cr.line_to(x + w + 1, y + r * 1.6)
+            cr.line_to(x + w - r * 0.5, y + r * 0.8)
+            cr.line_to(x + w - r * 0.9, y + r * 0.2)
+            cr.close_path()
+            cr.fill()
+        cr.restore()
+
+    def _draw_tile(self, cr, x, y, w, h, core, mine, dent=0.0):
         pulse = 0.5 + 0.5 * math.sin(self.phase * 2.2)
         live = mine and self.on
         rgb = FORT_RGB if mine else REST_RGB
@@ -8638,6 +8814,8 @@ class CpuView(Gtk.DrawingArea):
             cr.set_source_rgba(*DIM_RGB, 0.22)
         cr.stroke()
         cr.set_dash([])
+        if dent > 0:
+            self._draw_dents(cr, x, y, w, h, dent, core["cpus"][0])
 
     def _sparks(self, cr, x, top, w, h, seed):
         """Campfire embers rising through the reserved tile."""
@@ -10566,6 +10744,23 @@ def _stage_taken(side=0):
     return stage
 
 
+def _stage_yard(side=0, dropping=False):
+    """The roof holed, redcoats in the yard at core tiles, battering."""
+    def stage(siege):
+        _stage_roof(0.0, side)(siege)
+        for st in siege.stormers:
+            st.update(mode="drop", since=siege.phase - 0.6)
+        if dropping:
+            return
+        for k, st in enumerate(siege.stormers):
+            tile = (1, 0)[k % 2]
+            st.update(mode="yard", since=siege.phase, tile=tile,
+                      u=siege.tiles[tile][0], v=siege.tiles[tile][1],
+                      batter=True)
+        siege.dents.update({0: 0.45, 1: 0.9, 2: 0.2})
+    return stage
+
+
 def _stage_roof(strength, side=0, mend=False):
     """A tower's roof hacked to this strength, men on it, or the walker
     mending it."""
@@ -10611,6 +10806,8 @@ SIEGE_PICTURES = (
     ("roof-hacked", _stage_roof(0.55)),
     ("roof-holed", _stage_roof(0.0)),
     ("walker-mending-roof", _stage_roof(0.6, mend=True)),
+    ("yard-redcoats-battering", _stage_yard()),
+    ("yard-redcoats-dropping", _stage_yard(dropping=True)),
 )
 
 
@@ -11021,6 +11218,34 @@ def siege_tests(view, cr):
     assert _until(siege, lambda: siege.men[2]["mode"] == "retake", 5)
     assert _until(siege, lambda: not siege.gun["taken"], 30)
     assert siege.men[2]["mode"] in ("patrol", "to_roof"), "back to work"
+    # Through a holed roof they drop into the yard and batter the core
+    # tile nearest them, a picture and nothing more; the dents fade once
+    # the yard is clear and it is quiet.
+    siege = _quiet_siege()
+    siege.gun["taken"] = True
+    siege.men[2].update(mode="driven", x=1.0, face=-1, goal=1.0, up=None)
+    siege.roof[0] = 0.0
+    a = _on_the_walk(siege, 0, 0.0)
+    a.update(mode="hack")
+    assert _until(siege, lambda: a["mode"] == "drop", 10), "down the hole"
+    assert not siege.tally["yard"]
+    assert _until(siege, lambda: a["mode"] == "yard", 5)
+    assert siege.tally["yard"] == 1 and siege.ousted(0)
+    assert _until(siege, lambda: siege.dent(0) > 0.1, 60)
+    assert a["tile"] == 0 and siege.dent(1) == 0.0 and not siege.dent(5)
+    assert siege.tally["batter_s"] > 1.0 and siege.wall == [1.0, 1.0]
+    assert _until(siege, lambda: siege.dent(0) >= 1.0, 60), "smashed"
+    assert _until(siege, lambda: a["tile"] == 1, 5), "and on to the next"
+    assert siege.tally["roof_holes"] == 0 and siege.holed(0)
+    before = dict(siege.dents)
+    siege.run(12)
+    assert siege.dent(1) > before.get(1, 0.0), "battered while in the yard"
+    a["hit"], a["hp"] = siege.phase, 0
+    siege.run(Siege.FALL_S + Siege.QUIET_S + 2)
+    again = dict(siege.dents)
+    siege.run(3)
+    assert siege.dent(0) < again[0] and siege.dent(1) < again[1], \
+        "the marks fade once the yard is clear"
     # In a lull he mends a roof, walls first.
     siege = _quiet_siege()
     siege.roof = [0.5, 1.0]
