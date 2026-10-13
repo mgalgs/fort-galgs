@@ -2199,6 +2199,9 @@ class Siege:
     DESPERATE_U = 0.5   # on the ladder this far up is near the top
     STEP_S = 3.0        # a man stepping onto the walk is so for this long
     DESPERATE_HOLD_S = 2.0   # desperate this long before the pot is sent for
+    GONE_S = 3.0        # nobody below this long, and a pour is called off
+    HOLD_S = 30.0       # or, once he has the pot up, this long: he waits
+    POT_REST_S = 20.0   # after a pour called off, not sent for again so soon
     CROWD = 4           # this many at the wall's foot are a crowd
     POUR_MIN = 0.3      # the pot must hold at least this much to be poured
     CARRY_S = 5.0
@@ -2240,6 +2243,8 @@ class Siege:
         self.pot = {"x": self.POT_X, "stew": 1.0, "heat": 1.0,
                     "at": "fire", "task": None, "side": 0}
         self.desp_since = [None, None]    # phase each side became desperate
+        self.below_at = [-1e9, -1e9]      # phase someone was last below each
+        self.pot_rest = -1e9              # phase it may be sent for again
         self.pot_all = False              # all three at it together
         self.men = [self._new_man("post"), self._new_man("post"),
                     self._new_man("patrol")]
@@ -2285,7 +2290,7 @@ class Siege:
                       "rousings_ground_killed": 0, "pot_meals": 0,
                       "pot_eating_s": 0.0, "pot_together": 0,
                       "pot_together_s": 0.0, "off_s": 0.0, "off_caught": 0,
-                      "pours": 0, "scalded": 0}
+                      "pour_trips": 0, "pours": 0, "scalded": 0}
 
     def vary(self, spread):
         """A factor near 1, up to spread either side of it: the siege's
@@ -3343,6 +3348,8 @@ class Siege:
         calm, once it has been emptied."""
         p = self.pot
         for s in (0, 1):
+            if self.below(s):
+                self.below_at[s] = self.phase
             if not self.desperate(s):
                 self.desp_since[s] = None
             elif self.desp_since[s] is None:
@@ -3350,7 +3357,8 @@ class Siege:
         if p["task"] is not None:
             return
         if p["at"] == "fire":
-            if p["heat"] < 1.0 or p["stew"] < self.POUR_MIN:
+            if p["heat"] < 1.0 or p["stew"] < self.POUR_MIN \
+                    or self.phase < self.pot_rest:
                 return
             # a flicker is not desperate straits: it must have held a while
             sides = [s for s in (0, 1) if self.desp_since[s] is not None
@@ -3374,6 +3382,8 @@ class Siege:
     def _start_carry(self, i, kind, side):
         m, p = self.men[i], self.pot
         p["task"] = {"kind": kind, "i": i, "side": side}
+        if kind == "pour":
+            self.tally["pour_trips"] += 1
         if i == 2:
             x, face = self.walker_x()
             m.update(mode="carry", leg="to", x=x, face=face, t0=self.phase,
@@ -3401,6 +3411,18 @@ class Siege:
             m.update(mode="pot", leg="to" if self.calm() else "back",
                      why="rest", feed=None, t0=self.phase)
 
+    def _gone(self, side, wait):
+        """Nobody has been below that side for wait seconds: men going
+        through the gap, or the next coming up the trail, leave it empty
+        for a moment, which is not gone."""
+        return self.phase - self.below_at[side] >= wait
+
+    def _pour_off(self, m):
+        """He carries the pot home rather than pour it on nobody, and it
+        is not sent for again until it has rested."""
+        m["kind"] = self.pot["task"]["kind"] = "fetch"
+        self.pot_rest = self.phase + self.POT_REST_S
+
     def _scald(self, side):
         """The stew goes down the outside of the wall: everyone on that
         side's ladder and at the wall's foot is scalded dead. A redcoat
@@ -3424,9 +3446,12 @@ class Siege:
             if m["h"] >= 1.0:
                 m["leg"] = "to"
         elif leg == "to":
-            if (kind == "pour" and not self.below(side)) \
-                    or (kind == "fetch" and self.calm_since is None):
-                self._finish_carry(i)       # it is over, or it has begun
+            if kind == "pour" and self._gone(side, self.GONE_S):
+                self.pot_rest = self.phase + self.POT_REST_S
+                self._finish_carry(i)       # it is over
+                return
+            if kind == "fetch" and self.calm_since is None:
+                self._finish_carry(i)       # the calm is over
                 return
             step = dt * pace / self.RUN_X_S
             left = p["x"] - m["x"]
@@ -3439,16 +3464,19 @@ class Siege:
                 p["at"] = "carried"
                 m["leg"] = "bear"
         elif leg == "bear":
-            if kind == "pour" and not self.below(side):
+            if kind == "pour" and self._gone(side, self.HOLD_S):
                 # nobody left below: carry it back rather than waste it
-                kind = m["kind"] = p["task"]["kind"] = "fetch"
+                self._pour_off(m)
+                kind = "fetch"
             goal = self.LADDER_X[side] if kind == "pour" else self.POT_X
             step = dt * pace / self.CARRY_S
             left = goal - m["x"]
             m["x"] += max(-step, min(step, left))
             m["face"] = 1 if left > 0 else -1 if left < 0 else m["face"]
             p["x"] = m["x"]
-            if abs(goal - m["x"]) < 1e-9:
+            if abs(goal - m["x"]) < 1e-9 \
+                    and (kind != "pour" or self.below(side)):
+                # at the wall with nobody below yet, he holds it there
                 m.update(leg="tip" if kind == "pour" else "set",
                          t0=self.phase, tipped=False)
                 if kind == "pour":
@@ -3456,8 +3484,9 @@ class Siege:
         elif leg == "tip":
             t = (self.phase - m["t0"]) * pace
             if t >= self.TIP_AT and not m["tipped"] and not self.below(side):
-                # they are gone: carry it home rather than pour it on no one
-                kind = m["kind"] = p["task"]["kind"] = "fetch"
+                # nobody below: hold it, and carry it home if they are gone
+                if self._gone(side, self.HOLD_S):
+                    self._pour_off(m)
                 m["leg"] = "bear"
                 return
             if t >= self.TIP_AT and not m["tipped"]:
@@ -13476,6 +13505,48 @@ def siege_tests(view, cr):
                   or carrier["mode"] == "post", 8)
     assert siege.tally["scalded"] >= 1 and foot_man.get("scalded")
 
+    # A side that flickers in and out of desperate straits does not have
+    # the pot sent for over and over: a moment with nobody below does not
+    # call a pour off, and once one is called off the pot rests a while.
+    siege = _quiet_siege(2)
+    siege.ladder.update(side=1, state="standing", ext=1.0)
+    siege.gun["taken"] = True
+    walker = _walker_out(siege, "hide", 1)
+    walker.update(g=2.0, rock=2, shot_t=None, pinned=[], next_shot=1e9,
+                  t0=siege.phase + 99)
+
+    def flare():
+        top = _at_the_foot(siege, "foot", 1, 0)
+        top.update(climb=siege.phase - 0.6 * Siege.CLIMB_UP_S, hp=99)
+        _at_the_foot(siege, "foot", 1, 1)["hp"] = 99
+
+    flare()
+    siege.run(Siege.DESPERATE_HOLD_S + 0.1)
+    assert siege.pot["task"]["kind"] == "pour" \
+        and siege.tally["pour_trips"] == 1
+    siege.redcoats = []
+    siege.run(Siege.GONE_S * 0.5)
+    flare()
+    siege.run(0.5)
+    assert siege.pot["task"]["kind"] == "pour", "a moment is not gone"
+    siege.redcoats = []
+    assert _until(siege, lambda: siege.pot["task"] is None
+                  or siege.pot["task"]["kind"] == "fetch",
+                  Siege.HOLD_S + 2), "they are gone: called off"
+    assert not siege.tally["pours"]
+    while siege.phase < siege.pot_rest - Siege.DESPERATE_HOLD_S - 1.0:
+        flare()
+        siege.run(Siege.DESPERATE_HOLD_S + 0.5)
+        siege.redcoats = []
+        siege.run(0.5)
+    assert siege.tally["pour_trips"] == 1, "rested, not sent for again"
+    assert _until(siege, lambda: siege.pot["at"] == "fire"
+                  and siege.pot["task"] is None, 20)
+    siege.run(max(0.0, siege.pot_rest - siege.phase))
+    flare()
+    siege.run(Siege.DESPERATE_HOLD_S + 0.1)
+    assert siege.tally["pour_trips"] == 2, "and sent for once it has rested"
+
     # A man at his meal, drawn: in the calm, all three round the pot, the
     # sentries on their way down off the towers and up again.
     view.siege.redcoats = []
@@ -14392,6 +14463,7 @@ SIEGE_COLUMNS = (
     ("bear home", 10, lambda t: t["bear_home"]),
     ("ground kills", 13, lambda t: t["bear_ground_kills"]),
     ("mend out", 9, lambda t: t["repairs_out"]),
+    ("sent for pot", 13, lambda t: t["pour_trips"]),
     ("pours", 6, lambda t: t["pours"]),
     ("scalded", 8, lambda t: t["scalded"]),
     ("pot min", 8, lambda t: f"{t['pot_eating_s'] / 60:.1f}"),
@@ -14501,8 +14573,8 @@ def siege_seeds(minutes, seeds, pressure="normal", out=None):
     for key in ("breaches", "caught", "driven", "climbs", "pushes",
                 "raises", "fell", "top", "guns", "roof_holes", "yard",
                 "bear_trips", "bear_kills", "bear_withdrawn", "bear_downs",
-                "bear_home", "bear_ground_kills", "repairs_out", "pours",
-                "scalded", "pot_together", "off_caught"):
+                "bear_home", "bear_ground_kills", "repairs_out",
+                "pour_trips", "pours", "scalded", "pot_together", "off_caught"):
         print(f"  {key:>9}: " + " ".join(f"{t[key]:>3}" for t in tallies),
               file=out)
     return tallies
