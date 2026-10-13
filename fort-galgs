@@ -4828,6 +4828,7 @@ class CpuView(Gtk.DrawingArea):
     BOATS_MAX = 2       # most afloat at once
     LAND_GAP_S = 1.4    # between one man stepping ashore and the next
     ASHORE_S = 0.6      # a man takes this long to step from the bow
+    BANK_WALK = 1.5     # then walks down the bank this many sizes a second
     CREW_X = (-64, 45, 8, -28)  # the steersman, then the oars, in the model
 
     def _launch_boat(self, side=1):
@@ -4856,14 +4857,22 @@ class CpuView(Gtk.DrawingArea):
 
     def _boat_stop(self, b):
         """Where the boat's middle comes to rest, its bow just short of
-        the ford's stones; None if it is not putting in at a ford."""
+        the ford's stones; None if it is not putting in at a ford. At the
+        downstream ford it pulls in short of the tower instead, its whole
+        length clear of the sentry there, so the walker's line of fire
+        stays open while its men step out and walk down the bank."""
         p = self.fords[b["side"]]
         if p is None or self.trails is None or not b["lands"] \
                 or b["men"] == 0:
             return None
         x = self._bezier(self.trails[b["side"]], p)[0]
+        m = self._boat_m(b["side"])
         stones = self.redcoat_s * 0.5 * self._depth_scale(p) * 0.9
-        return x - stones - self._boat_m(b["side"]) * 0.9
+        stop = x - stones - m * 0.9
+        if b["side"] == 1 and self.sentries_at is not None:
+            towers, _, s = self.sentries_at
+            stop = min(stop, towers[1] - s * 0.5 - m * 0.95)
+        return stop
 
     def _landing_p(self, side):
         """Where on the trail a man from the boat steps ashore: the far
@@ -6423,12 +6432,29 @@ class CpuView(Gtk.DrawingArea):
         x, y = self._bezier(self.trails[rc["side"]], p)
         size = self.redcoat_s * self._depth_scale(p)
         ashore = self.siege.phase - rc["born"]
-        if rc.get("boat") and ashore < self.ASHORE_S:
-            # A hop from the bow up onto the bank.
-            u = self._ramp(ashore, 0.0, self.ASHORE_S)
+        if rc.get("boat"):
+            # A hop from the bow up onto the bank, then a walk down it to
+            # the trail, if the boat pulled in short of the ford.
             bx, by = rc["boat"]
-            x, y = bx + (x - bx) * u, by + (y - by) * u \
-                - math.sin(u * math.pi) * size * 0.25
+
+            def bank(x):
+                return min(by, self._river_edge(x, -1)
+                           - self.river["half"] * 0.35 - 1)
+
+            kx = bx + size * 0.25
+            if ashore < self.ASHORE_S:
+                u = self._ramp(ashore, 0.0, self.ASHORE_S)
+                x, y = bx + (kx - bx) * u, by + (bank(kx) - by) * u \
+                    - math.sin(u * math.pi) * size * 0.25
+            else:
+                # Along the top of the bank to the trail, then down it.
+                step = (ashore - self.ASHORE_S) * size * self.BANK_WALK
+                along = abs(x - kx)
+                if step < along:
+                    x = kx + math.copysign(step, x - kx)
+                    y = bank(x)
+                elif step - along < abs(y - bank(x)):
+                    y = bank(x) + math.copysign(step - along, y - bank(x))
         cover = self.siege.cover(rc)
         if cover > 0:
             rock = self.rocks[rc["rock"]]
@@ -14241,10 +14267,19 @@ def self_test():
     view.potshot_after = 1e9
     boat = afloat(1, True)
     assert until(lambda: boat["landed"] is not None, 120), boat
+    # It pulls in short of the tower, so he has a clear shot at it from
+    # anywhere on his round between the two tower sentries.
+    towers, _, s = view.sentries_at
+    walker_at = view.walker_at
+    for k in range(11):
+        view.walker_at = (towers[0] + s * 0.5 + (towers[1] - towers[0] - s)
+                          * k / 10, walker_at[1])
+        assert view._clear_shot(boat), view.walker_at
+    view.walker_at = walker_at
     view.potshot, view.potshot_after = None, 0.0
     assert until(lambda: view.potshot is not None, 5), "he shoots"
     view.potshot_after = 1e9
-    assert ashore(boat) <= view.BOAT_MEN - 1, boat
+    assert ashore(boat) == view.BOAT_MEN - 1, boat
 
     # On patrol, the walker shoots at a boat in sight: he halts, and his
     # shot takes one man out of it, who goes over the side; the boat
