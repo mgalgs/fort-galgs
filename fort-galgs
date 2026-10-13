@@ -2059,6 +2059,22 @@ class Siege:
     PIN_WINDOW = 15.0   # ...in this many seconds
     VOLLEY_RATE = 1.5   # a redcoat's drill runs this much faster than a sentry's
 
+    # The redcoats' use of the ladder, and the men's pushing it off. A
+    # man at the foot of a wall with a ladder standing against it climbs
+    # it, one at a time, slowly; a sentry on that side, or the walker if he
+    # is on the wall walk, can put his rifle butt to its top and shove it
+    # away, which takes longer than a shot. The ladder falls outward; whoever
+    # is on it falls with it and dies. Two redcoats at the foot of a fallen
+    # ladder raise it again, in RAISE_BY_S, if neither is shot.
+    NOTICE_S = 1.5      # a man at the foot sees the ladder, and starts up
+    CLIMB_UP_S = 7.0    # a redcoat's climb, from the ground to the top
+    TOP_HOLD_S = 1.2    # at the top he is stopped this long, then shoved off
+    SHOVE_AT = 2.6      # the shove lands this far into it...
+    SHOVE_LEN = 3.6     # ...and he is done this far in
+    LADDER_FALL_S = 1.2
+    RAISE_BY_S = 6.0
+    RUN_X_S = 4.0       # the walker runs the whole wall walk in this long
+
     DRILL_LEN = 4.6     # from kneeling to the last of the smoke
     SHOT_AT = 2.0       # he fires this far into it
 
@@ -2100,7 +2116,8 @@ class Siege:
                       "hurt": [0.0, 0.0], "mended": [0.0, 0.0],
                       "breaches": 0, "meals": 0, "eating_s": 0.0,
                       "repairs": 0, "repairs_done": 0, "caught": 0,
-                      "out_s": 0.0, "retreats": 0, "rc_shots": 0}
+                      "out_s": 0.0, "retreats": 0, "rc_shots": 0,
+                      "climbs": 0, "pushes": 0, "raises": 0, "fell": 0}
 
     def _new_man(self, mode):
         """One of the fort's three men: his hunger, what he is at (mode),
@@ -2201,6 +2218,137 @@ class Siege:
 
     def bugling(self):
         return self.bugle_t() < self.BUGLE_LEN
+
+    # -- the ladder ---------------------------------------------------------
+
+    def fort_at_ladder(self):
+        """One of the fort's men is working the ladder, or is on it."""
+        return any(m["mode"] in ("lower", "descend", "mend", "ascend",
+                                 "haul", "raise") for m in self.men)
+
+    def usable(self):
+        """The ladder stands fully down against its wall with no one of
+        the fort's at it: the redcoats' to climb, the sentries' to push."""
+        lad = self.ladder
+        return lad["state"] == "standing" and lad["ext"] >= 1.0 \
+            and not self.fort_at_ladder()
+
+    def climbers(self):
+        """Redcoats alive on the ladder."""
+        return [rc for rc in self.redcoats if rc["hit"] is None
+                and rc.get("climb") is not None]
+
+    def climb_u(self, rc):
+        """How far up the ladder a redcoat is, 0..1."""
+        end = self.phase if rc["hit"] is None else rc["hit"]
+        return min(1.0, max(0.0, (end - rc["climb"]) / self.CLIMB_UP_S))
+
+    def fall_u(self):
+        """How far the ladder has fallen outward, 0..1."""
+        lad = self.ladder
+        if lad["state"] == "fallen":
+            return 1.0 - self.ramp(lad["raised"], 0.0, 1.0)
+        if lad["state"] == "falling":
+            return min(1.0, (self.phase - lad["t0"]) / self.LADDER_FALL_S)
+        return 0.0
+
+    def top_of_ladder(self, rc):
+        """THE TOP OF THE LADDER: a redcoat who has climbed all the way is
+        stopped there, held a moment and shoved back off by whoever is on
+        that side, and falls and dies. The next round replaces this, with
+        the fort's gun and what stands on the wall walk to be got past."""
+        if rc.get("top_at") is None:
+            rc["top_at"] = self.phase
+        elif self.phase - rc["top_at"] >= self.TOP_HOLD_S:
+            rc.update(hit=self.phase, fell=True, hp=0)
+            self.tally["fell"] += 1
+
+    def _foot_men(self, side):
+        return [rc for rc in self.redcoats if rc["side"] == side
+                and rc["hit"] is None and rc["kind"] == "foot"
+                and self.at_wall(rc)]
+
+    def _advance_ladder(self, dt):
+        """Redcoats climb a standing ladder or raise a fallen one; a
+        falling one lands."""
+        lad = self.ladder
+        side = lad["side"]
+        if lad["state"] == "falling":
+            if self.phase - lad["t0"] >= self.LADDER_FALL_S:
+                lad.update(state="fallen", raised=0.0)
+        elif lad["state"] == "fallen":
+            alone = self.men[2]["mode"] == "raise" \
+                or any(m["mode"] == "raise" for m in self.men)
+            if not alone:
+                if len(self._foot_men(side)) >= 2:
+                    lad["raised"] = min(1.0, lad["raised"]
+                                        + dt / self.RAISE_BY_S)
+                else:
+                    lad["raised"] = max(0.0, lad["raised"]
+                                        - 2.0 * dt / self.RAISE_BY_S)
+                if lad["raised"] >= 1.0:
+                    lad.update(state="standing", ext=1.0, raised=0.0)
+                    self.tally["raises"] += 1
+        elif self.usable():
+            on = self.climbers()
+            if not on:
+                for rc in self._foot_men(side):
+                    if rc.get("climb") is None and not rc.get("drive") \
+                            and self.phase - rc["at_wall"] >= self.NOTICE_S:
+                        rc["climb"] = self.phase
+                        self.tally["climbs"] += 1
+                        break
+        for rc in self.redcoats:
+            if rc["hit"] is None and rc.get("climb") is not None \
+                    and self.climb_u(rc) >= 1.0:
+                self.top_of_ladder(rc)
+
+    def _push_off(self):
+        """The ladder goes over backward, outward into the grass, and
+        takes whoever is on it."""
+        lad = self.ladder
+        lad.update(state="falling", t0=self.phase, raised=0.0)
+        self.tally["pushes"] += 1
+        for rc in self.climbers():
+            rc.update(hit=self.phase, hp=0, fell=True)
+            self.tally["fell"] += 1
+
+    def shove_t(self, i):
+        """Seconds into man i's shove at the ladder, or -1."""
+        m = self.men[i]
+        return (self.phase - m["t0"]) * self.pace(i) \
+            if m["mode"] == "shove" else -1.0
+
+    def _wants_shove(self, i):
+        """Whether tower sentry i, with nothing at his rifle, would rather
+        put his rifle butt to the ladder than shoot: a man climbing, or
+        two at its foot, which is an assault; one alone he shoots."""
+        lad = self.ladder
+        if lad["side"] != i or not self.usable():
+            return False
+        return bool(self.climbers()) or len(self._foot_men(i)) >= 2
+
+    def _advance_shoves(self, dt, walker_busy):
+        """Men at the ladder's top with their rifle butts."""
+        for i in (0, 1, 2):
+            m = self.men[i]
+            if m["mode"] == "shove":
+                t = self.shove_t(i)
+                if not m.get("done") and t >= self.SHOVE_AT:
+                    m["done"] = True
+                    if self.ladder["state"] == "standing":
+                        self._push_off()
+                if t >= self.SHOVE_LEN:
+                    m.pop("done", None)
+                    self._home_post(i)
+            elif m["mode"] == "shove_run":
+                goal = self.LADDER_X[m["side"]]
+                step = dt * self.pace(2) / self.RUN_X_S
+                m["x"] += max(-step, min(step, goal - m["x"]))
+                if not self._wants_shove(m["side"]) or not self.usable():
+                    self._home_post(2)
+                elif abs(goal - m["x"]) < 1e-9:
+                    m.update(mode="shove", t0=self.phase)
 
     # -- lulls, hunger and meals --------------------------------------------
 
@@ -2571,6 +2719,7 @@ class Siege:
             if self.out(i):
                 self.tally["out_s"] += dt
         self._advance_drivers()
+        self._advance_shoves(dt, walker_busy)
         if not self.has_walker:
             # No room on the wall for him: the sentry on a damaged side
             # goes down instead, if he has nothing at his rifle.
@@ -2590,7 +2739,13 @@ class Siege:
         if walker["mode"] == "patrol" and free:
             self.patrol_u = (self.patrol_u + dt / self.PATROL_LEG_S) % 2.0
             side = self._wall_to_mend()
-            if self.lull() and side is not None \
+            sh = self.ladder["side"]
+            if self._wants_shove(sh) and self.climbers() \
+                    and (self.busy(sh) or self.men[sh]["mode"] != "post"):
+                # The sentry there has his hands full; he goes himself.
+                walker.update(mode="shove_run", side=sh,
+                              x=self.walker_x()[0], t0=self.phase)
+            elif self.lull() and side is not None \
                     and walker["hunger"] < self.STARVING \
                     and self.ladder["state"] == "up":
                 self._start_mending(2, side)
@@ -2607,12 +2762,13 @@ class Siege:
         to 1 at the east, and the way he faces (the way he is walking,
         or outward when he is at a wall's ladder)."""
         m = self.men[2]
-        if m["mode"] in ("to_wall", "lower", "haul", "descend", "ascend",
-                         "mend"):
-            x = m["x"] if m["mode"] == "to_wall" \
+        if m["mode"] in ("to_wall", "shove_run", "shove", "lower", "haul",
+                         "descend", "ascend", "mend"):
+            x = m["x"] if m["mode"] in ("to_wall", "shove_run") \
                 else self.LADDER_X[m["side"]]
             goal = self.LADDER_X[m["side"]]
-            return x, (1 if goal > x else -1) if m["mode"] == "to_wall" \
+            return x, (1 if goal > x else -1) \
+                if m["mode"] in ("to_wall", "shove_run") \
                 else (-1 if m["side"] == 0 else 1)
         u = self.patrol_u
         pos = u if u < 1.0 else 2.0 - u
@@ -2700,7 +2856,8 @@ class Siege:
         """Redcoats at the wall's foot beat on it; a cannon fires into the
         logs. A breached wall takes nothing more."""
         for rc in self.redcoats:
-            if rc["hit"] is not None or not self.at_wall(rc):
+            if rc["hit"] is not None or not self.at_wall(rc) \
+                    or rc.get("climb") is not None:
                 continue
             side = rc["side"]
             if self.breached(side):
@@ -2854,14 +3011,19 @@ class Siege:
             else:
                 self.spawn_in = 1.0
 
+        self._advance_ladder(dt)
         self._advance_men(dt, walker_busy)
         for i in (0, 1):
             targets = [rc for rc in self.redcoats
                        if rc["side"] == i and rc["hit"] is None]
             nearest = min(targets, key=lambda rc: rc["d"], default=None)
             man = self.men[i]
+            if man["mode"] == "post" and not self.busy(i) \
+                    and not self.calling(i) and self._wants_shove(i):
+                man.update(mode="shove", t0=self.phase, side=i)
+                continue
             if man["mode"] not in ("post", "eat"):
-                continue  # he is at the ladder, or below it
+                continue  # he is at the ladder, or below it, or shoving
             if man["mode"] == "eat":
                 # He never leaves his post; he sits where he stands, and
                 # stands up first if called to his rifle.
@@ -5014,7 +5176,8 @@ class CpuView(Gtk.DrawingArea):
         self._draw_stains(cr)
         # Each boulder is drawn just after anyone crouched behind it, and
         # before anyone nearer the fort.
-        items = [(-rc["d"], 0, rc) for rc in self.siege.redcoats]
+        items = [(-rc["d"], 0, rc) for rc in self.siege.redcoats
+                 if rc.get("climb") is None]
         items += [(-rock["d"], 1, rock) for rock in self.rocks if rock]
         # Whoever is outside is as far down the picture as his feet, with
         # his rock just after him; the hiding rocks go in by the same rule.
@@ -5114,23 +5277,45 @@ class CpuView(Gtk.DrawingArea):
                 g["X"] + g["W"] - 0.05 * wall
         return (x0, g["Y"] + g["H"]), (x1, g["Y"] + 0.2 * wall)
 
+    def _ladder_pose(self, side):
+        """The ladder's foot and top as it is now: standing against the
+        wall, or swung outward and down into the grass, and shortened
+        as it goes, for it falls into the picture's depth."""
+        (bx, by), (tx, ty) = self._ladder_ends(side)
+        u = self._ramp(self.siege.fall_u(), 0.0, 1.0)
+        if u <= 0:
+            return (bx, by), (tx, ty)
+        length = math.hypot(tx - bx, ty - by)
+        a0 = math.atan2(ty - by, tx - bx)
+        af = -math.pi if side == 0 else 0.0
+        a = a0 + (af - a0) * u
+        length *= 1.0 - 0.6 * u
+        return (bx, by), (bx + length * math.cos(a), by + length * math.sin(a)
+                          + 0.04 * length * u)
+
     def _ladder_at(self, side, u):
         """The point a fraction u up the ladder at side's wall."""
-        (bx, by), (tx, ty) = self._ladder_ends(side)
+        (bx, by), (tx, ty) = self._ladder_pose(side)
         return bx + (tx - bx) * u, by + (ty - by) * u
 
     def _draw_ladder(self, cr):
-        """The fort's ladder, where it hangs or lies."""
+        """The fort's ladder, where it hangs or lies, and the redcoats
+        climbing it."""
         lad = self.siege.ladder
         if lad["state"] == "up" or self.fort_geo is None:
             return
         side = lad["side"]
-        (bx, by), (tx, ty) = self._ladder_ends(side)
+        (bx, by), (tx, ty) = self._ladder_pose(side)
         wall = self.fort_geo["wall"]
         half = wall * 0.22
         if lad["state"] == "standing":
-            bx, by = self._ladder_at(side, 1.0 - lad["ext"])
-        n = max(3, int(math.hypot(tx - bx, ty - by) / (wall * 0.5)))
+            bx, by = bx + (tx - bx) * (1.0 - lad["ext"]), \
+                by + (ty - by) * (1.0 - lad["ext"])
+        length = math.hypot(tx - bx, ty - by)
+        if length < 1:
+            return
+        px, py = -(ty - by) / length * half, (tx - bx) / length * half
+        n = max(3, int(length / (wall * 0.5)))
         cr.save()
         cr.set_line_cap(cairo.LINE_CAP_ROUND)
         for rail, rgb, lw in ((-1, SEAM_RGB, wall * 0.17),
@@ -5139,18 +5324,53 @@ class CpuView(Gtk.DrawingArea):
                               (1, WOOD_HI_RGB, wall * 0.09)):
             cr.set_source_rgb(*rgb)
             cr.set_line_width(lw)
-            cr.move_to(bx + rail * half, by)
-            cr.line_to(tx + rail * half, ty)
+            cr.move_to(bx + rail * px, by + rail * py)
+            cr.line_to(tx + rail * px, ty + rail * py)
             cr.stroke()
         cr.set_source_rgb(*WOOD_HI_RGB)
         cr.set_line_width(wall * 0.1)
         for k in range(n + 1):
             u = k / n
             x, y = bx + (tx - bx) * u, by + (ty - by) * u
-            cr.move_to(x - half, y)
-            cr.line_to(x + half, y)
+            cr.move_to(x - px, y - py)
+            cr.line_to(x + px, y + py)
         cr.stroke()
         cr.restore()
+        self._draw_climbers(cr)
+
+    def _draw_climbers(self, cr):
+        """Redcoats on the ladder, in front of the wall; one shoved from
+        the top drops to the ground, one on a ladder that is pushed off
+        goes down with it."""
+        siege = self.siege
+        for rc in siege.redcoats:
+            if rc.get("climb") is None:
+                continue
+            side = rc["side"]
+            alive = rc["hit"] is None
+            x, y = self._ladder_at(side, siege.climb_u(rc))
+            e = 0.0 if alive else siege.phase - rc["hit"]
+            if not alive and siege.ladder["state"] == "standing":
+                # Shoved off the top: down the wall's face.
+                k = min(1.0, e / 0.7) ** 2
+                (bx, by), _ = self._ladder_ends(side)
+                y += (by - y) * k
+                x += (bx - x) * k
+            inward = 1 if side == 0 else -1
+            fall = 0.0 if alive else e / Siege.FALL_S
+            self._redcoat(cr, x, y, self.redcoat_s, inward,
+                          math.sin(self.phase * 5.0 + rc["n"]) * 0.4
+                          if alive else 0.0, fall)
+
+    def _draw_shover(self, cr, i, x, feet, size, facing):
+        """Man i with the butt of his rifle against the ladder's top,
+        leaning on it."""
+        t = self.siege.shove_t(i)
+        lean = self._ramp(t, 0.0, 0.8) - self._ramp(
+            t, Siege.SHOVE_AT + 0.2, Siege.SHOVE_LEN)
+        thrust = self._ramp(t, Siege.SHOVE_AT - 0.5, Siege.SHOVE_AT)
+        self._mountain_man(cr, x, feet, size, facing, aim=lean,
+                           elev=-0.9 - 0.2 * thrust, kneel=0.25 * lean)
 
     GROUND_MODES = ("mend", "run", "hide", "home", "raise")
 
@@ -5252,6 +5472,9 @@ class CpuView(Gtk.DrawingArea):
         for i, tx in enumerate(towers):
             outward = -1 if i == 0 else 1
             mode = self.siege.men[i]["mode"]
+            if mode == "shove":
+                self._draw_shover(cr, i, tx, floor, s, outward)
+                continue
             if mode not in ("post", "eat"):
                 if mode not in self.GROUND_MODES:
                     self._draw_mender(cr, i, tx, floor, s, floor)
@@ -5379,7 +5602,9 @@ class CpuView(Gtk.DrawingArea):
                                1 if bx >= patrol else -1, kneel=kneel,
                                aim=aim, shot=shot, elev=elev)
         elif wm not in ("patrol", "eat"):
-            if wm == "to_wall":
+            if wm == "shove":
+                self._draw_shover(cr, 2, patrol, walk_y, ws, facing_now)
+            elif wm in ("to_wall", "shove_run"):
                 self._mountain_man(cr, patrol, walk_y, ws, facing_now,
                                    step=math.sin(self.phase * 7.0) * 0.38,
                                    shouldered=True)
@@ -9783,6 +10008,23 @@ def _stage_out(mode, h=0.0, g=0.0, rock=1, fire=False, side=0, wall=0.5,
     return stage
 
 
+def _stage_ladder(state, climb=None, shove=None):
+    def stage(siege):
+        siege.wall = [0.6, 0.6]
+        siege.ladder.update(side=0, state=state, ext=1.0, raised=0.0,
+                            t0=siege.phase - 0.5)
+        if climb is not None:
+            rc = _at_the_foot(siege, "foot", 0, 0)
+            rc.update(climb=siege.phase - climb * Siege.CLIMB_UP_S, hp=99)
+            if state == "falling":
+                rc.update(hit=siege.phase, fell=True)
+                siege.ladder["t0"] = siege.phase
+        if shove is not None:
+            siege.men[shove].update(mode="shove", t0=siege.phase - 2.0,
+                                    side=0)
+    return stage
+
+
 # Every state the siege draws that a plain run of it seldom shows, by name.
 SIEGE_PICTURES = (
     ("walls-full", _stage_walls(1.0)),
@@ -9798,6 +10040,12 @@ SIEGE_PICTURES = (
     ("walker-behind-rock-3", _stage_out("hide", g=3.0, rock=3, side=1)),
     ("walker-coming-home", _stage_out("home", g=1.5, rock=1)),
     ("walker-raising-ladder", _stage_out("raise", ladder="fallen")),
+    ("ladder-up", _stage_ladder("up")),
+    ("ladder-down", _stage_ladder("standing")),
+    ("ladder-fallen", _stage_ladder("fallen")),
+    ("ladder-redcoat-climbing", _stage_ladder("standing", climb=0.5)),
+    ("ladder-redcoat-falling", _stage_ladder("falling", climb=0.5)),
+    ("sentry-shoving", _stage_ladder("standing", shove=0)),
 )
 
 
@@ -10039,6 +10287,95 @@ def siege_tests(view, cr):
     assert _until(siege, lambda: walker["mode"] == "patrol", 30)
     assert siege.ladder["state"] == "up" and not siege.out(2)
     assert siege.tally["out_s"] > 5
+
+    # A standing ladder is the redcoats' too: a man at its foot climbs it
+    # instead of pounding, one at a time, slowly; at the top he is stopped
+    # and thrown back off. (Sentries and walker hold fire here.)
+    siege = _quiet_siege()
+    siege.has_walker = False
+    siege.ladder.update(side=0, state="standing", ext=1.0)
+    first = _at_the_foot(siege, "foot", 0, 0)
+    second = _at_the_foot(siege, "foot", 0, 1)
+    first["hp"] = second["hp"] = 99
+    siege.run(Siege.NOTICE_S + 0.5)
+    assert siege.tally["climbs"] == 1 and len(siege.climbers()) == 1
+    mid = siege.climbers()[0]
+    siege.run(Siege.CLIMB_UP_S / 2)
+    assert 0.3 < siege.climb_u(mid) < 0.8, siege.climb_u(mid)
+    assert siege.tally["climbs"] == 1, "one man on it at a time"
+    assert _until(siege, lambda: mid["hit"] is not None, 20), "thrown off"
+    assert mid.get("fell") and siege.tally["fell"] == 1
+    assert siege.ladder["state"] == "standing", "still the redcoats' to use"
+    assert _until(siege, lambda: siege.tally["climbs"] == 2, 10)
+    # A shove kills the man on it: a sentry on that side puts his rifle
+    # butt to the ladder's top, which takes him longer than a shot, and
+    # the ladder falls outward.
+    siege = Siege()
+    siege.wave_in = siege.spawn_in = 1e9
+    siege.ladder.update(side=0, state="standing", ext=1.0)
+    foot = _at_the_foot(siege, "foot", 0, 0)
+    foot["hp"] = 99
+    assert _until(siege, lambda: siege.climbers(), 10)
+    assert _until(siege, lambda: siege.men[0]["mode"] == "shove", 5), \
+        "a man climbing: he shoves"
+    assert siege.men[1]["mode"] == "post"
+    siege.run(Siege.SHOVE_AT - 0.5)
+    assert siege.ladder["state"] == "standing" and foot["hit"] is None, \
+        "slower than a shot"
+    siege.run(1.0)
+    assert siege.ladder["state"] == "falling" and foot["hit"] is not None
+    assert foot["fell"] and siege.tally["fell"] == 1 \
+        and siege.tally["pushes"] == 1
+    siege.run(Siege.LADDER_FALL_S + 0.1)
+    assert siege.ladder["state"] == "fallen"
+    assert _until(siege, lambda: siege.men[0]["mode"] == "post", 5)
+    # Two redcoats raise a fallen ladder, together, in some seconds; one
+    # alone cannot, and a shot man stops them.
+    siege = _quiet_siege()
+    siege.has_walker = False
+    siege.ladder.update(side=0, state="fallen", raised=0.0)
+    a = _at_the_foot(siege, "foot", 0, 0)
+    a["hp"] = 99
+    siege.run(Siege.RAISE_BY_S + 1)
+    assert siege.ladder["state"] == "fallen" and siege.ladder["raised"] == 0
+    b = _at_the_foot(siege, "foot", 0, 1)
+    b["hp"] = 99
+    siege.run(Siege.RAISE_BY_S / 2)
+    assert 0.3 < siege.ladder["raised"] < 0.7, siege.ladder
+    b["hit"] = siege.phase
+    siege.run(Siege.RAISE_BY_S)
+    assert siege.ladder["state"] == "fallen" and siege.ladder["raised"] == 0
+    c = _at_the_foot(siege, "foot", 0, 1)
+    c["hp"] = 99
+    assert _until(siege, lambda: siege.ladder["state"] == "standing",
+                  Siege.RAISE_BY_S + 2)
+    assert siege.tally["raises"] == 1
+    assert _until(siege, lambda: siege.tally["climbs"] == 1, 5), \
+        "a raised ladder is theirs to climb"
+    # With a sentry's hands full the walker runs to the wall's end himself
+    # and shoves it off.
+    siege = _quiet_siege()
+    siege.ladder.update(side=0, state="standing", ext=1.0)
+    a = _at_the_foot(siege, "foot", 0, 0)
+    a["hp"] = 99
+    assert _until(siege, lambda: siege.men[2]["mode"] == "shove_run", 20)
+    assert _until(siege, lambda: siege.men[2]["mode"] == "shove", 10)
+    assert _until(siege, lambda: siege.men[2]["mode"] == "patrol", 10)
+    assert siege.ladder["state"] in ("falling", "fallen") \
+        and siege.tally["pushes"] == 1
+    # He comes home to a fallen ladder, and raises it alone, which takes a
+    # while, before he climbs.
+    siege = _quiet_siege()
+    siege.ladder.update(side=0, state="fallen", ext=1.0, raised=0.0)
+    walker = _walker_out(siege, "home")
+    siege.ladder["state"] = "fallen"
+    walker["g"] = 1.0
+    assert _until(siege, lambda: walker["mode"] == "raise", 10)
+    start = siege.phase
+    assert _until(siege, lambda: walker["mode"] == "ascend", 30)
+    assert siege.phase - start > Siege.RAISE_ALONE_S * 0.9
+    assert _until(siege, lambda: walker["mode"] == "patrol", 30)
+    assert siege.ladder["state"] == "up"
 
     # A wall reads by shape: more logs down, shorter, leaning, at each
     # level of damage, not only a different shade.
