@@ -2158,7 +2158,8 @@ class Siege:
     BEAR_REST_S = 0.5   # before the woods will send them again
     BEAR_REACH_G = 0.4  # on the ground, how near a man a bear must be to maul
     BEAR_LANE_S = 0.8   # to cross from the woods' lane to the trail's
-    BEAR_WAIT_G = 2.6   # where they wait at the woods' edge, from the wall
+    BEAR_WAIT_G = 1.5   # where they wait at the woods' edge, from the wall
+    BEAR_WAIT_DG = 0.5  # and the room each leaves the next
     BEAR_CROSS_G = 5.0  # what a run round through the woods is worth
     DRIVER_BONUS_G = 1.5    # a man driving the walker is that much nearer
     MUSKET_RATE = 0.03  # per second, a musket on a charging bear hits
@@ -4069,7 +4070,8 @@ class Siege:
                 self._to_the_wall(b, dt)
             return
         # Hunting.
-        self._bear_ground_wounds(b, dt, b["maul"] is None)
+        self._bear_ground_wounds(b, dt, b["maul"] is None
+                                 and b["aim"] is not None)
         if b["maul"] is not None:
             tg = b["maul"]["target"]
             if tg["hit"] is not None \
@@ -4095,7 +4097,7 @@ class Siege:
                 self._bear_blow(b, aim, dt)
         else:
             self._bear_ground_move(
-                b, min(b["far"], self.BEAR_WAIT_G + 0.4 * b["n"]), dt)
+                b, self.BEAR_WAIT_G + self.BEAR_WAIT_DG * b["n"], dt)
 
     def _to_the_wall(self, b, dt):
         """To the foot of the wall by the woods' lane, and up it."""
@@ -12331,7 +12333,8 @@ def _stage_bears_waiting():
     """Nothing left to hunt: they wait at the woods' edge for the quiet."""
     def stage(siege):
         for b in _bears_up(siege):
-            b.update(layer="ground", g=Siege.BEAR_WAIT_G + 0.4 * b["n"],
+            b.update(layer="ground", g=Siege.BEAR_WAIT_G
+                     + Siege.BEAR_WAIT_DG * b["n"],
                      lane=0.0, aim=None)
     return stage
 
@@ -13463,6 +13466,27 @@ def siege_tests(view, cr):
     assert all(view.siege.at_pot(i) for i in range(3)), view.siege.men
     assert view.siege.tally["pot_meals"] >= 3 and view.siege.tally["pot_together"]
     assert {"down", "to", "sit"} <= legs, legs
+
+    # Every leg of the way to the pot and of the pot's carrying, drawn.
+    for i in (0, 1, 2):
+        for leg in ("down", "to", "sit", "rise", "back", "up"):
+            view.siege.men[i].update(mode="pot", leg=leg, x=0.4, h=0.5,
+                                     why="rest", t0=view.siege.phase - 2,
+                                     up=view.siege.phase - 0.3, feed="stew",
+                                     face=1)
+            view._draw(view, cr, 1024, 680)
+        for leg in ("down", "to", "lift", "bear", "tip", "set"):
+            view.siege.pot.update(at="carried", x=0.3)
+            view.siege.men[i].update(mode="carry", leg=leg, x=0.3, h=0.5,
+                                     t0=view.siege.phase - 1.4, kind="pour",
+                                     side=i % 2, face=-1)
+            view._draw(view, cr, 1024, 680)
+    view.siege.pot.update(at="spent", side=1, x=Siege.LADDER_X[1])
+    view._draw(view, cr, 1024, 680)
+    view.siege.pot.update(at="fire", x=Siege.POT_X, task=None)
+    for i in (0, 1):
+        view.siege._home_post(i)
+    view.siege._home_post(2)
 
     # The ladder, and the men on it and below it, drawn.
     view.siege.wall = [0.4, 0.4]
