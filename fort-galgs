@@ -5310,39 +5310,42 @@ class CpuView(Gtk.DrawingArea):
             self._stake(cr, x0 + i * w, bottom, w, top - lift, pointed)
 
     WALL_PIECES = 10    # logs stacked up each of a side wall's two columns
-    GAP_PIECES = (4, 5)     # the ones that go first, in both columns: the gap
+    GAP_PIECES = (1, 2, 3)  # low on the wall, a man's height: the gap
 
     @classmethod
     def _wall_piece_state(cls, strength, j, col):
         """How the log j up from the foot of a side wall's column col (0
-        the outer one) stands at this strength: 0 whole, 1 splintered
-        and shortened, 2 leaning, 3 fallen. Blows land low and outside
-        first, so the damage creeps up the wall. Only the logs of the gap
-        ever fall away entire: the rest of a breached wall still stands,
-        snapped off at ragged heights or leaning, so that the stockade
-        keeps its outline."""
+        the outer one) stands at this strength: 0 whole, 1 splintered, 2
+        splintered and askew, 3 fallen. The blows land low, where the gap
+        opens, and the damage spreads out from there. Only the logs of the
+        gap ever fall away entire, the outer column's first; the ones round
+        it are knocked askew; the rest of the wall stands, splintered, so
+        that a breached wall is a wall with one hole in it."""
+        lo, hi = cls.GAP_PIECES[0], cls.GAP_PIECES[-1]
+        away = max(lo - j, j - hi, 0)
         hit = ((j * 7 + col * 3 + 1) * 0.618034) % 1.0
-        rank = 0.55 * j / (cls.WALL_PIECES - 1) + 0.35 * hit + 0.1 * col
-        u = (1.0 - strength) * 1.1 - rank * 0.75
-        state = 0 if u <= 0 else 1 if u < 0.18 else 2 if u < 0.45 else 3
-        if j in cls.GAP_PIECES:
-            return 3 if state == 3 or strength <= 0.0 else min(state, 2)
-        if state == 3:
-            return 1 if ((j * 5 + col * 11 + 3) * 0.618034) % 1.0 < 0.55 else 2
-        return state
+        u = (1.0 - strength) * 1.2 - 0.18 * away - 0.25 * hit - 0.1 * col
+        if away == 0:
+            if strength <= 0.0 or (u > 0.75 and col == 0 and j == 2):
+                return 3
+            return 2 if u > 0.6 else 1 if u > 0.15 else 0
+        if away == 1:
+            return 2 if u > 0.75 else 1 if u > 0.2 else 0
+        return 1 if u - 0.12 * away > 0.1 else 0
 
     @classmethod
     def _wall_piece_height(cls, state, j, col):
         """How tall of a log's full length is left of one in this state:
-        a snapped one stands at its own ragged height."""
-        if state == 1:
-            return 0.55 + 0.35 * (((j * 5 + col * 11 + 3) * 0.618034) % 1.0)
-        return (1.0, 0.8, 0.75)[state]
+        a splintered one stands nearly whole, at its own ragged height."""
+        if state == 0:
+            return 1.0
+        return 0.78 + 0.17 * (((j * 5 + col * 11 + 3) * 0.618034) % 1.0)
 
     def _side_wall(self, cr, side, x, wall, top, bottom):
         """A side wall, seen end-on as a column of two stacks of logs. As
-        it is hurt, logs splinter and shorten, then lean, then fall,
-        leaving a gap; it reads by shape, not by colour."""
+        it is hurt, logs splinter, then are knocked askew, and at the last
+        those low on the wall fall out of it, leaving one gap; it reads by
+        shape, not by colour."""
         strength = self.siege.wall[side]
         n = self.WALL_PIECES
         w = wall / 2
@@ -5359,7 +5362,7 @@ class CpuView(Gtk.DrawingArea):
                 cr.save()
                 h = sh * self._wall_piece_height(state, j, col)
                 if state == 2:
-                    lean = (0.5 if (j + col) % 2 else -0.4)
+                    lean = (0.22 if (j + col) % 2 else -0.18)
                     cr.translate(cx + w / 2, y1)
                     cr.rotate(lean)
                     cr.translate(-(cx + w / 2), -y1)
@@ -5388,14 +5391,13 @@ class CpuView(Gtk.DrawingArea):
                              max(0.0, h - w * 0.5))
                 cr.fill()
                 cr.restore()
-        # The fallen lie in a heap at the foot, a log each, and the
-        # snapped-off tops of a broken wall among them.
-        if strength <= 0.0:
-            fallen += 3
-        for k in range(min(fallen, 9)):
+        # The fallen lie at the foot, outside, a log each, clear of the gap.
+        out = -1 if side == 0 else 1
+        for k in range(fallen):
             cr.save()
-            cr.translate(x + wall / 2 + (k % 2 - 0.5) * wall * 0.3,
-                         bottom - (k // 2 + 0.5) * w * 0.55)
+            cr.translate(x + wall / 2 + out * wall * (0.75 + 0.35 * (k % 3))
+                         + out * wall * 0.15 * (k // 3),
+                         bottom - (k // 3 + 0.5) * w * 0.5)
             cr.rotate(0.12 * ((k % 3) - 1))
             self._rounded(cr, -wall * 0.5, -w * 0.25, wall, w * 0.5,
                           w * 0.25)
