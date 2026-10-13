@@ -1970,6 +1970,8 @@ class Siege:
     he gets to it with the gun not ready, he takes it, and hacks at a tower
     roof, and through it drops into the yard to batter the cores, which is
     a picture and no more. It is the bears that stop him: see rouse_bears.
+    In the calm the men sit round the stew pot; in desperate straits they
+    pour it over the wall: see desperate.
     """
 
     MARCH_FAR = 6.0     # a new redcoat is this many times farther than...
@@ -2137,11 +2139,14 @@ class Siege:
     # roofs and in the yard, one at a time; the redcoats' bayonets wound
     # them, and a bear with WOUNDS of them withdraws. A bear is on one of
     # four layers: the ground, the wall's face, the walk, the yard; and
-    # means to attack, to withdraw wounded, or to leave when it is clear.
+    # means to attack, to withdraw wounded, or to go home when nothing is
+    # left to hunt. With the top clear they climb down, and on the ground
+    # (in the woods' lane or the trail's, 0..1) hunt every redcoat about
+    # the fort but those on the far half of a trail.
     BEAR_FAR_G = (3.2, 5.0)
-    BEAR_RUN_G_S = 2.2  # rock distances a second, flat out
-    BEAR_CLIMB_S = 1.8
-    BEAR_WALK_S = 6.0   # to cross the whole wall walk
+    BEAR_RUN_G_S = 2.8  # rock distances a second, flat out
+    BEAR_CLIMB_S = 1.2
+    BEAR_WALK_S = 4.0   # to cross the whole wall walk
     BEAR_YARD_S = 5.0   # and the width of the yard
     BEAR_REACH = 0.06   # along the walk; in the yard, in u, twice this
     MAUL_S = 1.3        # one blow, from the rear to the recovery...
@@ -2156,10 +2161,10 @@ class Siege:
     BEAR_WAIT_G = 2.6   # where they wait at the woods' edge, from the wall
     BEAR_CROSS_G = 5.0  # what a run round through the woods is worth
     DRIVER_BONUS_G = 1.5    # a man driving the walker is that much nearer
-    MUSKET_RATE = 0.06  # per second, a musket on a charging bear hits
+    MUSKET_RATE = 0.03  # per second, a musket on a charging bear hits
     MUSKET_G = 1.6      # from this far off
     BY_WALKER_G = 0.35  # she stands this far out from the walker in the woods
-    GROUND_SEEN_S = 4.0 # redcoats about this long make a rousing a ground one
+    GROUND_SEEN_S = 6.0 # redcoats about this long make a rousing a ground one
     BY_WALKER_S = 3.0   # the mother stops by the walker this long...
     BY_WALKER_DX = 0.2  # ...this far along the walk from him
     DRILL_LEN = 4.6     # from kneeling to the last of the smoke
@@ -3838,16 +3843,14 @@ class Siege:
     def _bear_plan(self, dt):
         """What each bear means to do, from what it sees. They go home
         when no redcoat is left to hunt and the trails have been quiet;
-        until then, the top comes first: one more bear on it than there
-        are redcoats there, the rest to the nearest on the ground, the men
-        driving the walker weighed ahead of the others; and a bear with
+        until then, the top comes first: every bear not already at a man
+        goes up while any redcoat is on it (and the first time they are
+        roused, to the top they were called for, whoever is left there);
+        otherwise each goes to the nearest redcoat on the ground, the men
+        driving the walker weighed ahead of the others, and a bear with
         nothing to fight waits at the woods' edge."""
         foes = self._bear_foes()
         tops = self.stormers_on()
-        r = self.rousing
-        if r is not None and foes and any(
-                b["intent"] == "attack" for b in self.bears):
-            r["ground_s"] += dt
         home = not foes and not tops and self.trail_quiet()
         sent = False
         for b in self.bears:
@@ -3866,21 +3869,15 @@ class Siege:
         free = []
         for b in live:
             if self._bear_is_up(b):
-                b["aim"] = "top" if tops else None
+                b["aim"] = "top" if tops or not self.bear_firsts else None
             elif b["maul"] is not None:
                 b["aim"] = b["maul"]["target"]
                 claims[id(b["aim"])] = claims.get(id(b["aim"]), 0) + 1
             else:
                 free.append(b)
-        up = sum(1 for b in live if self._bear_is_up(b))
-        slots = max(0, len(tops) + 1 - up) if tops else 0
-        free.sort(key=lambda b: (b["aim"] != "top",
-                                 b["g"] if b["layer"] == "ground" else 0.0,
-                                 b["n"]))
         for b in free:
-            if slots > 0:
+            if tops or not self.bear_firsts:
                 b["aim"] = "top"
-                slots -= 1
                 continue
             here = b["g"] if b["layer"] == "ground" else 0.0
             best, score = None, math.inf
@@ -3892,10 +3889,13 @@ class Siege:
                     - (0.3 if b["aim"] is rc else 0.0)
                 if c < score:
                     best, score = rc, c
-            b["aim"] = best if best is not None else (
-                "top" if tops else None)
+            b["aim"] = best
             if best is not None:
                 claims[id(best)] = claims.get(id(best), 0) + 1
+        if self.rousing is not None and any(
+                b["aim"] not in (None, "top") for b in live):
+            self.rousing["ground_s"] += dt      # redcoats near, and a bear
+                                                # free to go for them
 
     def _advance_bears(self, dt):
         """The woods and the fort's whole surround: bears rouse, run in,
@@ -4005,6 +4005,7 @@ class Siege:
             elif charging and rc["kind"] != "horse" \
                     and gap <= self.MUSKET_G:
                 shooters += 1
+        near, shooters = min(near, 2), min(shooters, 3)    # elbow room
         if near and self.rng.random() < self.BAYONET_RATE * near * dt:
             b["wounds"] += 1
         if shooters and self.rng.random() < self.MUSKET_RATE * shooters * dt:
@@ -4029,6 +4030,8 @@ class Siege:
         walk."""
         tops = self.stormers_on()
         best, score = b["side"], math.inf
+        if not tops:
+            return best
         for side in (0, 1):
             sec = (0.0 if side == b["side"]
                    else 2.0 * b["far"] / self.BEAR_RUN_G_S)
@@ -13125,6 +13128,7 @@ def siege_tests(view, cr):
     siege.gun["taken"] = True
     far = _on_the_walk(siege, 0, 0.95)
     far.update(hp=99)
+    siege.BEAR_KILL = 0.0   # he stays up there, to see what they do
     mother, b1, b2, b3 = _bears_up(siege, 0, 3)
     for b in (mother, b1):
         b.update(layer="walk", x=0.0)
@@ -14332,6 +14336,16 @@ SIEGE_COLUMNS = (
     ("withdrawn", 10, lambda t: t["bear_withdrawn"]),
     ("1st bear s", 11, lambda t: f"{t['bear_lag_s'] / t['bear_wall']:.1f}"
      if t["bear_wall"] else "-"),
+    ("bear down", 10, lambda t: t["bear_downs"]),
+    ("bear home", 10, lambda t: t["bear_home"]),
+    ("ground kills", 13, lambda t: t["bear_ground_kills"]),
+    ("mend out", 9, lambda t: t["repairs_out"]),
+    ("pours", 6, lambda t: t["pours"]),
+    ("scalded", 8, lambda t: t["scalded"]),
+    ("pot min", 8, lambda t: f"{t['pot_eating_s'] / 60:.1f}"),
+    ("together s", 11, lambda t: round(t["pot_together_s"])),
+    ("off tower s", 12, lambda t: round(t["off_s"])),
+    ("sentry caught", 14, lambda t: t["off_caught"]),
 )
 
 
@@ -14379,14 +14393,34 @@ SIEGE_CLAIMS = (
     ("... and driven back past the first rock",
      lambda t: t["caught"] >= 1 and t["retreats"] >= 1),
     ("redcoats climb the ladder", lambda t: t["climbs"] >= 1),
-    ("a man eating", lambda t: t["eating_s"] > 0),
+    ("a man eating", lambda t: t["eating_s"] > 0 or t["pot_eating_s"] > 0),
     ("redcoats onto the wall top", lambda t: t["top"] >= 1),
     ("every rousing brought a bear to the wall",
      lambda t: t["bear_wall"] >= t["bear_trips"] - t["bear_inflight"]),
     ("a gun overpowered", lambda t: t["guns"] >= 1),
     ("a tower roof holed", lambda t: t["roof_holes"] >= 1),
     ("redcoats battered a core", lambda t: t["batter_s"] > 0),
+    ("the three men at the pot together in the calm",
+     lambda t: t["pot_together"] >= 1),
+    ("a sentry caught off his tower", lambda t: t["off_caught"] >= 1),
+    ("a man mended from outside after hiding (of runs with a catch)",
+     lambda t: t["repairs_out"] >= 1),
+    ("bears climbed down once the top was clear, every rousing",
+     lambda t: t["rousings_down"] == t["rousings_over"]),
+    ("a bear stayed on top 60 s with nothing to fight",
+     lambda t: t["bear_top_idle_max"] >= 60.0),
+    ("roused bears killed redcoats on the ground, every rousing with "
+     "redcoats near",
+     lambda t: t["rousings_ground_killed"] == t["rousings_ground"]),
+    ("bears went home", lambda t: t["bear_home"] >= 1),
+    ("stew poured", lambda t: t["pours"] >= 1),
 )
+
+# Claims whose share is of the runs with something, not of all runs.
+SIEGE_BASES = {
+    "a man mended from outside after hiding (of runs with a catch)":
+        lambda t: t["caught"] >= 1,
+}
 
 
 def siege_seeds(minutes, seeds, pressure="normal", out=None):
@@ -14403,8 +14437,10 @@ def siege_seeds(minutes, seeds, pressure="normal", out=None):
         tallies.append(siege.tally)
     print(f"{seeds} seeds x {minutes} minutes, {pressure}", file=out)
     for what, test in SIEGE_CLAIMS:
-        n = sum(1 for t in tallies if test(t))
-        print(f"  {n:>2}/{seeds}  {what}", file=out)
+        base = SIEGE_BASES.get(what, lambda t: True)
+        n = sum(1 for t in tallies if base(t) and test(t))
+        print(f"  {n:>2}/{sum(1 for t in tallies if base(t))}  {what}",
+              file=out)
     caught = sum(t["caught"] for t in tallies)
     driven = sum(t["driven"] for t in tallies)
     print(f"  caught {caught} times in all, and driven back past the first "
@@ -14412,7 +14448,9 @@ def siege_seeds(minutes, seeds, pressure="normal", out=None):
           file=out)
     for key in ("breaches", "caught", "driven", "climbs", "pushes",
                 "raises", "fell", "top", "guns", "roof_holes", "yard",
-                "bear_trips", "bear_kills", "bear_withdrawn"):
+                "bear_trips", "bear_kills", "bear_withdrawn", "bear_downs",
+                "bear_home", "bear_ground_kills", "repairs_out", "pours",
+                "scalded", "pot_together", "off_caught"):
         print(f"  {key:>9}: " + " ".join(f"{t[key]:>3}" for t in tallies),
               file=out)
     return tallies
