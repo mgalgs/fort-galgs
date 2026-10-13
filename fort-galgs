@@ -4531,17 +4531,34 @@ class CpuView(Gtk.DrawingArea):
             self._stake(cr, x0 + i * w, bottom, w, top - lift, pointed)
 
     WALL_PIECES = 10    # logs stacked up each of a side wall's two columns
+    GAP_PIECES = (4, 5)     # the ones that go first, in both columns: the gap
 
     @classmethod
     def _wall_piece_state(cls, strength, j, col):
         """How the log j up from the foot of a side wall's column col (0
         the outer one) stands at this strength: 0 whole, 1 splintered
         and shortened, 2 leaning, 3 fallen. Blows land low and outside
-        first, so the damage creeps up the wall."""
+        first, so the damage creeps up the wall. Only the logs of the gap
+        ever fall away entire: the rest of a breached wall still stands,
+        snapped off at ragged heights or leaning, so that the stockade
+        keeps its outline."""
         hit = ((j * 7 + col * 3 + 1) * 0.618034) % 1.0
         rank = 0.55 * j / (cls.WALL_PIECES - 1) + 0.35 * hit + 0.1 * col
         u = (1.0 - strength) * 1.1 - rank * 0.75
-        return 0 if u <= 0 else 1 if u < 0.18 else 2 if u < 0.45 else 3
+        state = 0 if u <= 0 else 1 if u < 0.18 else 2 if u < 0.45 else 3
+        if j in cls.GAP_PIECES:
+            return 3 if state == 3 or strength <= 0.0 else min(state, 2)
+        if state == 3:
+            return 1 if ((j * 5 + col * 11 + 3) * 0.618034) % 1.0 < 0.55 else 2
+        return state
+
+    @classmethod
+    def _wall_piece_height(cls, state, j, col):
+        """How tall of a log's full length is left of one in this state:
+        a snapped one stands at its own ragged height."""
+        if state == 1:
+            return 0.55 + 0.35 * (((j * 5 + col * 11 + 3) * 0.618034) % 1.0)
+        return (1.0, 0.8, 0.75)[state]
 
     def _side_wall(self, cr, side, x, wall, top, bottom):
         """A side wall, seen end-on as a column of two stacks of logs. As
@@ -4561,7 +4578,7 @@ class CpuView(Gtk.DrawingArea):
                     fallen += 1
                     continue
                 cr.save()
-                h = sh * (1.0, 0.8, 0.68)[state]
+                h = sh * self._wall_piece_height(state, j, col)
                 if state == 2:
                     lean = (0.5 if (j + col) % 2 else -0.4)
                     cr.translate(cx + w / 2, y1)
@@ -4592,8 +4609,11 @@ class CpuView(Gtk.DrawingArea):
                              max(0.0, h - w * 0.5))
                 cr.fill()
                 cr.restore()
-        # The fallen lie in a heap at the foot, a log each.
-        for k in range(min(fallen, 8)):
+        # The fallen lie in a heap at the foot, a log each, and the
+        # snapped-off tops of a broken wall among them.
+        if strength <= 0.0:
+            fallen += 3
+        for k in range(min(fallen, 9)):
             cr.save()
             cr.translate(x + wall / 2 + (k % 2 - 0.5) * wall * 0.3,
                          bottom - (k // 2 + 0.5) * w * 0.55)
@@ -11903,12 +11923,12 @@ def siege_tests(view, cr):
 
     # A wall reads by shape: more logs down, shorter, leaning, at each
     # level of damage, not only a different shade.
-    ladder = [sum(CpuView._wall_piece_state(st, j, c) for j in range(10)
+    ladder = [sum(CpuView._wall_piece_state(st, j, c) > 0 for j in range(10)
                   for c in (0, 1)) for st in (1.0, 0.8, 0.5, 0.2, 0.0)]
     assert ladder[0] == 0 and ladder == sorted(ladder), ladder
     gone = [sum(CpuView._wall_piece_state(st, j, c) == 3 for j in range(10)
                 for c in (0, 1)) for st in (1.0, 0.8, 0.5, 0.2, 0.0)]
-    assert gone[0] == gone[1] == 0 and gone[3] > 0 and gone[4] > gone[3], gone
+    assert gone[0] == gone[1] == 0 and gone[3] > 0 and gone[4] >= gone[3], gone
     for strength in (1.0, 0.8, 0.5, 0.2, 0.0):
         view.siege.wall = [strength, 1.0 - strength]
         view._draw(view, cr, 1024, 680)
@@ -11941,6 +11961,25 @@ def siege_tests(view, cr):
         if _ % 5 == 0:
             view._draw(view, cr, 1024, 680)
     assert {"to_wall", "lower", "descend", "mend", "ascend", "haul"} <= seen
+    view.siege.wall = [1.0, 1.0]
+
+    # A breached wall is still a wall: one gap a man could get through,
+    # the rest standing broken, so the outline of the fort stays closed.
+    for col in (0, 1):
+        states = [CpuView._wall_piece_state(0.0, j, col)
+                  for j in range(CpuView.WALL_PIECES)]
+        gone = [j for j, st in enumerate(states) if st == 3]
+        assert gone == list(CpuView.GAP_PIECES), (col, states)
+        assert any(st == 1 for st in states) and any(st == 2 for st in states)
+        heights = {CpuView._wall_piece_height(st, j, col)
+                   for j, st in enumerate(states) if st == 1}
+        assert all(0.5 < h < 1.0 for h in heights)
+    for strength in (1.0, 0.6, 0.25, 0.05, 0.0):
+        fallen = sum(CpuView._wall_piece_state(strength, j, c) == 3
+                     for j in range(CpuView.WALL_PIECES) for c in (0, 1))
+        assert fallen <= 2 * len(CpuView.GAP_PIECES), (strength, fallen)
+    view.siege.wall = [0.0, 0.0]
+    view._draw(view, cr, 900, 560)
     view.siege.wall = [1.0, 1.0]
 
     # A breached wall in a flood, drawn as it runs: redcoats through the
