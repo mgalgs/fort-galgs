@@ -2005,6 +2005,23 @@ class Siege:
     HURT_PER_BALL = 0.045
     BOOM_EVERY = 4.0
 
+    # Lulls, hunger and meals. A lull is QUIET_S seconds with no redcoat
+    # beyond CLOSE_P of the trail, on either side. Hunger runs 0..1 for
+    # each of the three men (the two tower sentries, 0 and 1, and the
+    # walker, 2); it slows his drill and his work by up to HUNGER_SLOW.
+    CLOSE_P = 0.5
+    QUIET_S = 3.0
+    HUNGER_SLOW = 0.5
+    HUNGER_S = 2400.0   # seconds on the wall to go from fed to starving...
+    HEAVY_S = 300.0     # ...and doing heavy work
+    MEAL_S = 80.0       # seconds to eat his fill from starving
+    EAT_AT = 0.2        # hungry enough to sit down to a meal at this
+    FED = 0.03          # and he gets up again of his own accord at this
+    STARVING = 0.8      # too faint to go down and mend
+    SIT_S = 0.9         # sitting down
+    RISE_S = 1.1        # and getting up again, which is not instant
+    PATROL_LEG_S = 9.0  # the walker takes this long from one tower to the next
+
     DRILL_LEN = 4.6     # from kneeling to the last of the smoke
     SHOT_AT = 2.0       # he fires this far into it
 
@@ -2031,10 +2048,19 @@ class Siege:
         self.bugle_at = None              # phase the walker last sounded
         self.chipped = [None, None]       # phase a shot last struck each rock
         self.wall = [1.0, 1.0]            # each side wall's strength, 0..1
+        self.quiet_since = None           # phase the last redcoat left range
+        self.men = [self._new_man("post"), self._new_man("post"),
+                    self._new_man("patrol")]
+        self.patrol_u = 0.0               # the walker's patrol, 0..2
         self.tally = {"sent": {"foot": 0, "horse": 0, "cannon": 0},
                       "shot": 0, "reached": 0, "blasted": 0, "calls": 0,
                       "hurt": [0.0, 0.0], "mended": [0.0, 0.0],
-                      "breaches": 0}
+                      "breaches": 0, "meals": 0, "eating_s": 0.0}
+
+    def _new_man(self, mode):
+        """One of the fort's three men: his hunger, what he is at (mode),
+        since when, and, at a meal, when he began to get up."""
+        return {"hunger": 0.0, "mode": mode, "t0": self.phase, "up": None}
 
     @staticmethod
     def ramp(tau, a, b):
@@ -2085,7 +2111,8 @@ class Siege:
         """The walker sounds his bugle, and the tower sentry on side kneels
         and fires, at a redcoat if one is in sight. Not while he is
         sounding it, working the gun or (walker_busy) shooting at a boat."""
-        if self.bugling() or self.relief is not None or walker_busy:
+        if self.bugling() or self.relief is not None or walker_busy \
+                or self.men[2]["mode"] != "patrol":
             return False
         self.bugle_at = self.phase
         if not self.busy(side):
@@ -2130,6 +2157,89 @@ class Siege:
     def bugling(self):
         return self.bugle_t() < self.BUGLE_LEN
 
+    # -- lulls, hunger and meals --------------------------------------------
+
+    def in_range(self):
+        """Some redcoat is close to a wall: within the sentries' range."""
+        return any(rc["hit"] is None and self.trail_p(rc["d"]) >= self.CLOSE_P
+                   for rc in self.redcoats)
+
+    def lull(self):
+        """THE LULL: no redcoat close to either wall for QUIET_S seconds.
+        Whatever a man does only in the quiet asks this."""
+        return self.quiet_since is not None \
+            and self.phase - self.quiet_since >= self.QUIET_S
+
+    def pace(self, i):
+        """How fast man i works, 1 fed and HUNGER_SLOW less starving."""
+        return 1.0 - self.HUNGER_SLOW * self.men[i]["hunger"]
+
+    def sit(self, i):
+        """How far man i has sat down to eat, 0..1; he is not eating until
+        it is 1, and is on his feet again when it is 0."""
+        m = self.men[i]
+        if m["mode"] != "eat":
+            return 0.0
+        if m["up"] is None:
+            return self.ramp(self.phase - m["t0"], 0.0, self.SIT_S)
+        return 1.0 - self.ramp(self.phase - m["up"], 0.0, self.RISE_S)
+
+    def eating(self, i):
+        return self.men[i]["mode"] == "eat" and self.men[i]["up"] is None \
+            and self.phase - self.men[i]["t0"] >= self.SIT_S
+
+    def _sit_down(self, i):
+        m = self.men[i]
+        m.update(mode="eat", t0=self.phase, up=None)
+        self.tally["meals"] += 1
+
+    def _meal(self, i, dt, stay):
+        """Man i at his meal: eating while stay, getting up when not;
+        True once he is on his feet again, and free to go back to work."""
+        m = self.men[i]
+        if m["up"] is None:
+            if self.eating(i):
+                m["hunger"] = max(0.0, m["hunger"] - dt / self.MEAL_S)
+                self.tally["eating_s"] += dt
+            if not stay or m["hunger"] <= self.FED:
+                m["up"] = self.phase
+        elif self.phase - m["up"] >= self.RISE_S:
+            m["up"] = None
+            return True
+        return False
+
+    def _advance_men(self, dt, walker_busy):
+        """Hunger, and what each man does in a lull."""
+        if self.in_range():
+            self.quiet_since = None
+        elif self.quiet_since is None:
+            self.quiet_since = self.phase
+        for i, m in enumerate(self.men):
+            if m["mode"] != "eat":
+                heavy = False
+                m["hunger"] = min(1.0, m["hunger"] + dt / (
+                    self.HEAVY_S if heavy else self.HUNGER_S))
+        # The walker's patrol goes on while he is on the wall and not at
+        # his bugle, the gun or a shot at a boat.
+        walker = self.men[2]
+        if not self.has_walker:
+            return
+        free = not (self.bugling() or self.relief is not None or walker_busy)
+        if walker["mode"] == "patrol" and free:
+            self.patrol_u = (self.patrol_u + dt / self.PATROL_LEG_S) % 2.0
+            if self.lull() and walker["hunger"] >= self.EAT_AT:
+                self._sit_down(2)
+        elif walker["mode"] == "eat":
+            if self._meal(2, dt, not self.in_range()):
+                walker["mode"] = "patrol"
+
+    def walker_x(self):
+        """Where the walker stands on the wall walk, 0 at the west tower
+        to 1 at the east, and the way he faces."""
+        u = self.patrol_u
+        pos = u if u < 1.0 else 2.0 - u
+        return 0.5 - 0.5 * math.cos(pos * math.pi), 1 if u < 1.0 else -1
+
     # -- the gun ----------------------------------------------------------
 
     def relief_t(self):
@@ -2157,7 +2267,8 @@ class Siege:
         r = self.relief
         if r is None:
             # Called while the walker shoots at a boat, it waits for him.
-            if not self.has_walker or self.bugling() or walker_busy:
+            if not self.has_walker or self.bugling() or walker_busy \
+                    or self.men[2]["mode"] != "patrol":
                 return
             for i in (0, 1):
                 if not self.busy(i) and any(
@@ -2363,10 +2474,27 @@ class Siege:
             else:
                 self.spawn_in = 1.0
 
+        self._advance_men(dt, walker_busy)
         for i in (0, 1):
             targets = [rc for rc in self.redcoats
                        if rc["side"] == i and rc["hit"] is None]
             nearest = min(targets, key=lambda rc: rc["d"], default=None)
+            man = self.men[i]
+            if man["mode"] == "eat":
+                # He never leaves his post; he sits where he stands, and
+                # stands up first if called to his rifle.
+                if self._meal(i, dt, not self.in_range()
+                              and not self.busy(i)):
+                    man["mode"] = "post"
+                elif self.busy(i):
+                    self.drill_start[i] = max(
+                        self.drill_start[i], (man["up"] or self.phase)
+                        + self.RISE_S)
+                continue
+            if not self.busy(i) and self.lull() \
+                    and man["hunger"] >= self.EAT_AT:
+                self._sit_down(i)
+                continue
             if not self.busy(i):
                 self.drill_target[i] = None
                 if self.calling(i):
@@ -2404,6 +2532,11 @@ class Siege:
                     if target["hp"] <= 0:
                         target["hit"] = self.phase
                         self.tally["shot"] += 1
+        # A hungry man's drill drags: each second of it is a little longer.
+        for i in (0, 1):
+            start = self.drill_start[i]
+            if start is not None and self.phase - start < self.DRILL_LEN:
+                self.drill_start[i] = start + dt * (1.0 - self.pace(i))
 
 
 class CpuView(Gtk.DrawingArea):
@@ -2453,8 +2586,6 @@ class CpuView(Gtk.DrawingArea):
         self.barracks_box = [None, None]  # (x0, y0, x1, y1) as last drawn
         self.trails = None                # each side's trail, as last drawn
         self.redcoat_s = 14.0             # a redcoat's size at the near end
-        self.walker_halted = 0.0          # seconds he has stood still
-        self.walker_facing = 1            # as last drawn
         self.walker_at = None             # (x, feet) as last drawn
         self.sentries_at = None           # (towers, floor, size) as drawn
         self.potshot = None               # his shot at a boat, if taking one
@@ -2581,7 +2712,7 @@ class CpuView(Gtk.DrawingArea):
             if self.on and self._on_river(x, y):
                 self._launch_boat(0 if x < self.river["w"] / 2 else 1)
             return
-        self.siege.sound_bugle(1 if self.walker_facing > 0 else 0,
+        self.siege.sound_bugle(1 if self.siege.walker_x()[1] > 0 else 0,
                                self.potshot is not None)
 
     def _double_click_s(self):
@@ -2601,9 +2732,6 @@ class CpuView(Gtk.DrawingArea):
         siege = self.siege
         if self.on:
             siege.tick(dt if elapsed is None else elapsed)
-        if siege.bugling() or siege.relief is not None \
-                or self.potshot is not None:
-            self.walker_halted += dt
         if not self.on:
             if self.wild is not None:
                 self._advance_horses(dt)
@@ -2614,7 +2742,7 @@ class CpuView(Gtk.DrawingArea):
     def _advance_afloat(self, dt):
         """Between the barracks' calls and the new arrivals: the walker's
         shots at the boats, and the boats themselves."""
-        self._advance_potshot()
+        self._advance_potshot(dt)
         self._advance_boats(dt)
 
     # -- the boats --------------------------------------------------------
@@ -2757,13 +2885,14 @@ class CpuView(Gtk.DrawingArea):
     SLUMP_S = 0.4       # a man shot in a boat slumps this long...
     OVER_S = 0.5        # ...then goes over the side and under
 
-    def _advance_potshot(self):
+    def _advance_potshot(self, dt):
         """On patrol, the walker now and then halts to shoot at the nearest
         boat still carrying redcoats down the river; his every shot takes
         a man out of it."""
         ps = self.potshot
         if ps is None:
             if not self.siege.has_walker or self.walker_at is None \
+                    or self.siege.men[2]["mode"] != "patrol" \
                     or self.siege.bugling() or self.siege.relief is not None \
                     or self.siege.phase < self.potshot_after:
                 return
@@ -2779,13 +2908,16 @@ class CpuView(Gtk.DrawingArea):
             b = min(afloat, key=lambda b: math.hypot(
                 b["x"] - wx, self._boat_at(b)[1] - wy), default=None)
             if b is not None:
-                self.potshot = {"t0": self.siege.phase, "boat": b, "fired": False}
+                self.potshot = {"t0": self.siege.phase, "boat": b,
+                                "fired": False, "tau": 0.0}
             return
-        tau = self.siege.phase - ps["t0"]
+        # A hungry man's shot drags like his drill.
+        ps["tau"] += dt * self.siege.pace(2)
+        tau = ps["tau"]
         if tau >= Siege.SHOT_AT and not ps["fired"]:
             ps["fired"] = True
             self._shoot_aboard(ps["boat"])
-        if tau >= Siege.DRILL_LEN or tau < 0:
+        if tau >= Siege.DRILL_LEN:
             self.potshot = None
             self.potshot_after = self.siege.phase + self.POTSHOT_REST
 
@@ -3235,7 +3367,7 @@ class CpuView(Gtk.DrawingArea):
     def _mountain_man(cr, x, feet, s, facing, step=0.0, shouldered=False,
                       glint=0.0, kneel=0.0, aim=0.0, shot=-1.0, bugle=0.0,
                       toot=-1.0, elev=0.04, beaver=False, axe=0.0,
-                      log=False, knife=0.0):
+                      log=False, knife=0.0, sit=0.0, eat=-1.0):
         """A buckskin-clad mountain man with a coonskin cap and a long rifle.
 
         Drawn in a 100-unit-tall model with the feet at 0; facing is +1 for
@@ -3248,14 +3380,16 @@ class CpuView(Gtk.DrawingArea):
         axe above 0 puts an axe in his hands instead, raised behind him at
         1 and swung through at 0, with the rifle slung across his back.
         knife above 0 likewise slings the rifle and puts a knife in his
-        near hand, thrust out at 1.
+        near hand, thrust out at 1. sit runs 0..1 as he sits on the
+        ground with his rifle stood beside him; eat, once he is sitting, is
+        the seconds he has been at his jerky and steaming tin cup.
         """
         cr.save()
         cr.translate(x, feet)
         cr.scale(facing * s / 100.0, s / 100.0)
         cr.set_line_cap(cairo.LINE_CAP_ROUND)
         cr.set_line_join(cairo.LINE_JOIN_ROUND)
-        drop = 20 * kneel
+        drop = 20 * kneel + 30 * sit
 
         def lerp(a, b, u):
             return (a[0] + (b[0] - a[0]) * u, a[1] + (b[1] - a[1]) * u)
@@ -3267,6 +3401,9 @@ class CpuView(Gtk.DrawingArea):
             knee = lerp((fx / 2, -24), (20, -26) if front else (-4, -5),
                         kneel)
             foot = lerp((fx, -2), (21, -2) if front else (-26, -3), kneel)
+            if sit > 0:
+                knee = lerp(knee, (22, -22) if front else (14, -20), sit)
+                foot = lerp(foot, (30, -2) if front else (22, -2), sit)
             cr.set_source_rgb(*rgb)
             cr.set_line_width(8)
             cr.move_to(0, -46 + drop)
@@ -3511,6 +3648,48 @@ class CpuView(Gtk.DrawingArea):
             for p in (guard, hand):
                 cr.arc(*p, 3, 0, 2 * math.pi)
                 cr.fill()
+        elif sit > 0.3:
+            # The rifle stood beside him; jerky in the near hand, brought
+            # up to his mouth now and then, and a tin cup in the far one,
+            # steaming.
+            tip = rifle()
+            bite = max(0.0, math.sin(eat * 1.7)) ** 2 if eat >= 0 else 0.0
+            cup = (25, -34 + drop)
+            mouth = (9, -80 + drop)
+            hand = lerp((22, -44 + drop), mouth, bite)
+            cr.set_line_width(6)
+            for start, end, rgb in (((4, -73 + drop), cup, BUCK_DARK_RGB),
+                                    (shoulder, hand, BUCK_RGB)):
+                cr.set_source_rgb(*rgb)
+                cr.move_to(*start)
+                cr.line_to(*end)
+                cr.stroke()
+            cr.set_source_rgb(*BEAVER_DARK_RGB)
+            cr.set_line_width(3.2)
+            cr.move_to(hand[0], hand[1])
+            cr.line_to(hand[0] + 9, hand[1] - 3)
+            cr.stroke()
+            cr.set_source_rgb(*STEEL_RGB)
+            cr.move_to(cup[0] - 5, cup[1] - 5)
+            cr.line_to(cup[0] + 5, cup[1] - 5)
+            cr.line_to(cup[0] + 4, cup[1] + 5)
+            cr.line_to(cup[0] - 4, cup[1] + 5)
+            cr.close_path()
+            cr.fill()
+            cr.set_source_rgb(*SKIN_RGB)
+            for p in (cup, hand):
+                cr.arc(*p, 3, 0, 2 * math.pi)
+                cr.fill()
+            if eat >= 0:
+                cr.set_source_rgba(*SMOKE_RGB, 0.7)
+                cr.set_line_width(1.8)
+                for k in range(3):
+                    u = (eat * 0.7 + k / 3) % 1.0
+                    cr.new_sub_path()
+                    cr.arc(cup[0] - 3 + 3 * k + 3 * math.sin(u * 7 + k),
+                           cup[1] - 8 - 26 * u, 1.6 + 2 * u, 0, 2 * math.pi)
+                    cr.set_source_rgba(*SMOKE_RGB, 0.7 * (1 - u))
+                    cr.fill()
         else:
             if not shouldered:
                 tip = rifle()
@@ -4369,6 +4548,12 @@ class CpuView(Gtk.DrawingArea):
                 self._mountain_man(cr, tx, floor, s, -outward, bugle=raised,
                                    toot=toot)
                 continue
+            sit = self.siege.sit(i)
+            if sit > 0:
+                self._mountain_man(cr, tx, floor, s, outward, sit=sit,
+                                   eat=self.phase if self.siege.eating(i)
+                                   else -1.0)
+                continue
             kneel, aim, shot = self.siege.drill(i)
             if self.siege.drilling(i):
                 elev = 0.04
@@ -4394,11 +4579,9 @@ class CpuView(Gtk.DrawingArea):
             return
         # One more walks the wall from tower to tower and back, and stands
         # still while he sounds his bugle or works the gun.
-        walked = self.phase - self.walker_halted
-        u = (walked / 9.0) % 2.0
-        pos = u if u < 1.0 else 2.0 - u
-        patrol = x0 + (x1 - x0) * (0.5 - 0.5 * math.cos(pos * math.pi))
-        self.walker_facing = 1 if u < 1.0 else -1
+        walked = self.siege.patrol_u * Siege.PATROL_LEG_S
+        frac, facing_now = self.siege.walker_x()
+        patrol = x0 + (x1 - x0) * frac
         ws = s * 0.92
         self.walker_at = (patrol, walk_y)
 
@@ -4471,7 +4654,7 @@ class CpuView(Gtk.DrawingArea):
         if rt is None and self.potshot is not None:
             # Halted, he kneels and fires up at the boat.
             ps = self.potshot
-            kneel, aim, shot = Siege.drill_pose(self.siege.phase - ps["t0"])
+            kneel, aim, shot = Siege.drill_pose(ps["tau"])
             bx, by, _ = self._boat_at(ps["boat"])
             by -= self._boat_m(ps["boat"]["side"]) * 0.3
             rise = (walk_y - ws * 0.52) - by
@@ -4484,9 +4667,12 @@ class CpuView(Gtk.DrawingArea):
             raised, toot = self._bugle()
             step = 0.0 if self.siege.bugling() \
                 else math.sin(walked * 7.0) * 0.38
-            self._mountain_man(cr, patrol, walk_y, ws, self.walker_facing,
-                               step=step, shouldered=True, bugle=raised,
-                               toot=toot)
+            sit = self.siege.sit(2)
+            self._mountain_man(cr, patrol, walk_y, ws, facing_now,
+                               step=step, shouldered=not sit, bugle=raised,
+                               toot=toot, sit=sit,
+                               eat=self.phase if self.siege.eating(2)
+                               else -1.0)
         else:
             # He runs to his place behind the gun, wheels it toward the
             # wall in trouble, kneels to crank it up, and once it has fired
@@ -4498,7 +4684,7 @@ class CpuView(Gtk.DrawingArea):
             back = Siege.FIRE_AT + 0.5
             pushing = there <= rt < Siege.CRANK_AT
             if rt < Siege.HEARD_AT or rt >= back + Siege.RUN_S:
-                wx, facing, run = patrol, self.walker_facing, False
+                wx, facing, run = patrol, facing_now, False
             elif rt < there:
                 k = self._ramp(rt, Siege.HEARD_AT, there)
                 wx, run = patrol + (station - patrol) * k, True
@@ -8841,6 +9027,44 @@ def siege_tests(view, cr):
     assert siege.tally["breaches"] == 1, "a breach is counted once"
     assert siege.at_wall(rc), "he waits at the gap"
 
+    # A lull, a few quiet seconds, lets a hungry man sit and eat: each of
+    # the two sentries where he stands and the walker on the wall walk,
+    # while a fed man goes on watching. Redcoats in range send him back to
+    # work, but standing up takes a beat.
+    siege = Siege()
+    siege.wave_in = siege.spawn_in = 1e9
+    siege.men[0]["hunger"], siege.men[2]["hunger"] = 0.6, 0.6
+    siege.run(Siege.QUIET_S - 1)
+    assert not siege.lull() and not siege.eating(0), "not yet a lull"
+    siege.run(2.5)
+    assert siege.lull() and siege.eating(0) and siege.eating(2)
+    assert not siege.eating(1), "a fed man does not sit down"
+    assert siege.sit(0) == 1.0 and siege.men[0]["mode"] == "eat"
+    assert not siege.sound_bugle(0), "no bugle from a man at his meal"
+    siege.run(20)
+    assert siege.men[0]["hunger"] < 0.6 and siege.tally["meals"] >= 2
+    assert siege.tally["eating_s"] > 30
+    rc = _at_the_foot(siege)
+    rc["d"] = Siege.trail_d(0.6)
+    rc["at_wall"] = None
+    siege.run(0.3)
+    assert siege.men[0]["mode"] == "eat" and 0 < siege.sit(0) < 1, \
+        "getting up is not instant"
+    siege.run(Siege.RISE_S + 0.2)
+    assert siege.men[0]["mode"] == "post" and siege.sit(0) == 0.0
+    assert siege.men[2]["mode"] == "patrol"
+    siege.run(0.5)
+    assert not siege.lull(), "redcoats in range"
+    # A hungry man's drill takes longer.
+    siege = _quiet_siege()
+    siege.drill_start = [siege.phase, siege.phase]
+    siege.men[0]["hunger"] = 1.0
+    siege.run(Siege.DRILL_LEN + 0.2)
+    assert not siege.busy(1) and siege.busy(0), "starving, he is slower"
+    assert abs(siege.pace(0) - (1 - Siege.HUNGER_SLOW)) < 1e-9
+    siege.run(Siege.DRILL_LEN)
+    assert not siege.busy(0)
+
     # A wall reads by shape: more logs down, shorter, leaning, at each
     # level of damage, not only a different shade.
     ladder = [sum(CpuView._wall_piece_state(st, j, c) for j in range(10)
@@ -8853,6 +9077,19 @@ def siege_tests(view, cr):
         view.siege.wall = [strength, 1.0 - strength]
         view._draw(view, cr, 1024, 680)
     view.siege.wall = [1.0, 1.0]
+
+    # A man at his meal, drawn: sentries on their tower floors, the walker
+    # on the wall walk.
+    view.siege.redcoats = []
+    view.siege.spawn_in = view.siege.wave_in = view.boat_in = 1e9
+    view.siege.drill_start = [None, None]
+    for man in view.siege.men:
+        man["hunger"] = 0.7
+    for _ in range(int(Siege.QUIET_S * 30) + 40):
+        view.phase += 1 / 30
+        view._advance(1 / 30)
+        view._draw(view, cr, 1024, 680)
+    assert all(view.siege.eating(i) for i in range(3)), view.siege.men
 
 
 def self_test():
@@ -9085,12 +9322,13 @@ def self_test():
     assert sum(map(int, sent.split("/"))) >= 5 and int(shot) >= 1, lines[-1]
 
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], True)
-    view.boats, view.potshot, view.walker_halted = [], None, 0.0
+    view.boats, view.potshot = [], None
     for facing, phase in ((1, 0.0), (-1, 10.0)):
         view.siege.bugle_at = None
         view.phase = view.siege.phase = phase
+        view.siege.patrol_u = 0.3 if facing > 0 else 1.3
         view._draw(view, cr, 1024, 680)
-        assert view.walker_facing == facing, (facing, view.walker_facing)
+        assert view.siege.walker_x()[1] == facing
         view._on_click(None, 1, 0, 0)  # empty sky
         assert not view.siege.bugling()
         x0, y0, x1, y1 = view.fort_box
@@ -9380,18 +9618,18 @@ def self_test():
     boat = afloat(1, True)
     assert until(lambda: view.potshot is not None, 30), "he shoots"
     assert view.potshot["boat"] is boat and view._clear_shot(boat)
-    halted = view.walker_halted
+    halted = view.siege.patrol_u
     assert until(lambda: view.potshot["fired"], Siege.SHOT_AT + 0.5)
     assert boat["men"] == view.BOAT_MEN - 1, boat
     assert len(view.overboard) == 1, view.overboard
     assert until(lambda: view.potshot is None, Siege.DRILL_LEN)
-    assert view.walker_halted - halted > Siege.DRILL_LEN - 0.5, "he halts"
+    assert abs(view.siege.patrol_u - halted) < 0.1, "he halts"
     view.potshot_after = 1e9
     assert ashore(boat) == view.BOAT_MEN - 1
     view.potshot_after = 0.0
     boat = afloat(1, True)
     assert until(lambda: view.potshot is not None, 30)
-    run(Siege.DRILL_LEN + 0.1, 3)
+    run(Siege.DRILL_LEN / view.siege.pace(2) + 0.1, 3)
     assert view.potshot is None and boat["men"] == view.BOAT_MEN - 1
     run(view.POTSHOT_REST - 0.5, 3)
     assert view.potshot is None, "he patrols between shots"
@@ -9625,6 +9863,7 @@ SIEGE_COLUMNS = (
     ("hurt %", 9, lambda t: _pair(t["hurt"])),
     ("mended %", 10, lambda t: _pair(t["mended"])),
     ("breaches", 9, lambda t: t["breaches"]),
+    ("eating min", 11, lambda t: f"{t['eating_s'] / 60:.1f}"),
 )
 
 
