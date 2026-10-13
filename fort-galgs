@@ -2148,6 +2148,15 @@ class Siege:
     WOUNDS = (3, 5)     # a follower withdraws with this many, the mother
     WALKER_KILL = 0.2   # per second a man of the fort at a stormer in reach
     BEAR_REST_S = 0.5   # before the woods will send them again
+    BEAR_REACH_G = 0.4  # on the ground, how near a man a bear must be to maul
+    BEAR_LANE_S = 0.8   # to cross from the woods' lane to the trail's
+    BEAR_WAIT_G = 2.6   # where they wait at the woods' edge, from the wall
+    BEAR_CROSS_G = 5.0  # what a run round through the woods is worth
+    DRIVER_BONUS_G = 1.5    # a man driving the walker is that much nearer
+    MUSKET_RATE = 0.06  # per second, a musket on a charging bear hits
+    MUSKET_G = 1.6      # from this far off
+    BY_WALKER_G = 0.35  # she stands this far out from the walker in the woods
+    GROUND_SEEN_S = 4.0 # redcoats about this long make a rousing a ground one
     BY_WALKER_S = 3.0   # the mother stops by the walker this long...
     BY_WALKER_DX = 0.2  # ...this far along the walk from him
     DRILL_LEN = 4.6     # from kneeling to the last of the smoke
@@ -2202,6 +2211,7 @@ class Siege:
         self.bear_rest = 0.0              # phase the woods may send them again
         self.bear_trigger = None          # phase this coming was roused
         self.bear_firsts = True           # a bear has reached the wall's top
+        self.rousing = None               # the book of this coming
         # The fort's gun, for the fight on the wall walk: which way it
         # points (+1 east), from when it may fire, when the walker began to
         # sight along the walk, when it last fired, and whether it is taken.
@@ -2220,7 +2230,11 @@ class Siege:
                       "bear_trips": 0, "bear_out": 0, "bear_wall": 0,
                       "bear_lag_s": 0.0, "bear_kills": 0,
                       "bear_withdrawn": 0, "walker_kills": 0,
-                      "bear_inflight": 0}
+                      "bear_inflight": 0, "bear_downs": 0, "bear_home": 0,
+                      "bear_ground_kills": 0, "bear_musket": 0,
+                      "bear_top_idle_max": 0.0, "rousings_over": 0,
+                      "rousings_down": 0, "rousings_ground": 0,
+                      "rousings_ground_killed": 0}
 
     def vary(self, spread):
         """A factor near 1, up to spread either side of it: the siege's
@@ -3343,10 +3357,14 @@ class Siege:
         that foreleg and a hate for anyone who touches it, and she comes
         at a run out of the woods, larger than the rest, and always. The
         woods come with her: one more bear for each the valley holds, up
-        to three, all of them claws first up the stockade."""
+        to three, all of them claws first up the stockade. Roused, they
+        hunt redcoats wherever they are about the fort (see _bear_foes),
+        the top first, and go home when none is left."""
         self.tally["bear_trips"] += 1
         self.bear_trigger = self.phase
         self.bear_firsts = False
+        self.rousing = {"ground_s": 0.0, "ground_kills": 0, "down": False,
+                        "idle_s": 0.0}
         n = 1 + min(3, max(0, self.valley_bears))
         for k in range(n):
             self.bears.append({
@@ -3354,7 +3372,8 @@ class Siege:
                 "intent": "attack", "g": self.rng.uniform(*self.BEAR_FAR_G),
                 "u": 0.0, "x": 0.0, "wounds": 0, "maul": None,
                 "stopped": None, "by": None, "t0": self.phase,
-                "far": 0.0})
+                "far": 0.0, "lane": 0.0, "dir": 1, "aim": None,
+                "exit": None, "face": 1 if side == 0 else -1})
             self.bears[-1]["far"] = self.bears[-1]["g"]
             self.tally["bear_out"] += 1
 
@@ -3379,62 +3398,141 @@ class Siege:
             return False    # she never leaves while a redcoat is in the yard
         return b["wounds"] >= self.WOUNDS[b["mother"]]
 
+    def _bear_foes(self):
+        """The redcoats a roused bear hunts below the top: those on a
+        ladder, at the foot of either wall, on the near half of either
+        trail, and any who left the trail to drive the walker from his
+        rock. Not the far half of a trail: they do not go up to the
+        barracks."""
+        return [rc for rc in self.redcoats if rc["hit"] is None and (
+            rc.get("climb") is not None or rc["at_wall"] is not None
+            or rc.get("drive") or self.trail_p(rc["d"]) >= self.CLOSE_P)]
+
+    def _foe_g(self, rc):
+        """Where on the ground, from the foot of his wall, a redcoat is."""
+        if rc.get("climb") is not None or rc["at_wall"] is not None:
+            return 0.0
+        return self.ground_g(rc)
+
+    @staticmethod
+    def _top_foe(rc):
+        """Whether rc is a stormer (up on the top) rather than a redcoat
+        on the ground."""
+        return rc.get("mode") is not None
+
+    def _top_x(self, st):
+        """Where along the wall walk a redcoat up there is, for a bear
+        going to him: those on a roof or in the yard are at their tower."""
+        return st["x"] if st["mode"] == "walk" else self._end_x(st["side"])
+
+    def _bear_is_up(self, b):
+        return b["layer"] in ("walk", "yard") \
+            or (b["layer"] == "wall" and b["dir"] > 0)
+
+    def _bear_plan(self, dt):
+        """What each bear means to do, from what it sees. They go home
+        when no redcoat is left to hunt and the trails have been quiet;
+        until then, the top comes first: one more bear on it than there
+        are redcoats there, the rest to the nearest on the ground, the men
+        driving the walker weighed ahead of the others; and a bear with
+        nothing to fight waits at the woods' edge."""
+        foes = self._bear_foes()
+        tops = self.stormers_on()
+        r = self.rousing
+        if r is not None and foes and any(
+                b["intent"] == "attack" for b in self.bears):
+            r["ground_s"] += dt
+        home = not foes and not tops and self.trail_quiet()
+        sent = False
+        for b in self.bears:
+            if b["maul"] is not None:
+                continue
+            if b["intent"] == "attack" and home:
+                b.update(intent="greet" if b["mother"] else "leave",
+                         by=None, aim=None)
+                sent = True
+            elif b["intent"] in ("greet", "leave") and not home:
+                b.update(intent="attack", by=None)      # more of them
+        if sent:
+            self.tally["bear_home"] += 1
+        live = [b for b in self.bears if b["intent"] == "attack"]
+        claims = {}
+        free = []
+        for b in live:
+            if self._bear_is_up(b):
+                b["aim"] = "top" if tops else None
+            elif b["maul"] is not None:
+                b["aim"] = b["maul"]["target"]
+                claims[id(b["aim"])] = claims.get(id(b["aim"]), 0) + 1
+            else:
+                free.append(b)
+        up = sum(1 for b in live if self._bear_is_up(b))
+        slots = max(0, len(tops) + 1 - up) if tops else 0
+        free.sort(key=lambda b: (b["aim"] != "top",
+                                 b["g"] if b["layer"] == "ground" else 0.0,
+                                 b["n"]))
+        for b in free:
+            if slots > 0:
+                b["aim"] = "top"
+                slots -= 1
+                continue
+            here = b["g"] if b["layer"] == "ground" else 0.0
+            best, score = None, math.inf
+            for rc in foes:
+                c = abs(self._foe_g(rc) - here) \
+                    + (self.BEAR_CROSS_G if rc["side"] != b["side"] else 0.0) \
+                    - (self.DRIVER_BONUS_G if rc.get("drive") else 0.0) \
+                    + 0.8 * claims.get(id(rc), 0) \
+                    - (0.3 if b["aim"] is rc else 0.0)
+                if c < score:
+                    best, score = rc, c
+            b["aim"] = best if best is not None else (
+                "top" if tops else None)
+            if best is not None:
+                claims[id(best)] = claims.get(id(best), 0) + 1
+
     def _advance_bears(self, dt):
-        """The woods and the wall top: bears rouse, run in, climb, maul,
-        and when it is clear withdraw, the mother last, stopping by the
-        walker on her way."""
+        """The woods and the fort's whole surround: bears rouse, run in,
+        climb, maul, climb down when the top is clear, hunt the redcoats on
+        the ground, and go home when there are none, the mother last,
+        stopping by the walker on her way."""
         stormers = self.stormers_on()
         if not self.bears and stormers and self.phase >= self.bear_rest:
             self.rouse_bears(min(stormers, key=lambda st: st["since"])["side"])
+        if self.bears:
+            self._bear_plan(dt)
+            r = self.rousing
+            if self.bears_on("walk", "yard") and not stormers:
+                r["idle_s"] += dt
+                self.tally["bear_top_idle_max"] = max(
+                    self.tally["bear_top_idle_max"], r["idle_s"])
+            else:
+                r["idle_s"] = 0.0
         for b in self.bears:
             self._bear_step(b, dt)
         left = [b for b in self.bears if not b.get("gone")]
         if self.bears and not left:
             self.bear_rest = self.phase + self.BEAR_REST_S
+            r, t = self.rousing, self.tally
+            t["rousings_over"] += 1
+            t["rousings_down"] += r["down"]
+            if r["ground_s"] >= self.GROUND_SEEN_S:
+                t["rousings_ground"] += 1
+                t["rousings_ground_killed"] += r["ground_kills"] > 0
+            self.rousing = None
         self.bears = left
 
     def _bear_step(self, b, dt):
         layer = b["layer"]
-        if b["intent"] in ("greet", "leave") and not b["maul"] \
-                and self.stormers_on():
-            b.update(intent="attack", by=None)     # more of them: back to it
         if self._wounded_enough(b):
             b["intent"] = "withdraw"
             b["maul"] = None
             self.tally["bear_withdrawn"] += 1
         speed = 0.6 if b["intent"] == "withdraw" else 1.0
         if layer == "ground":
-            if b["intent"] == "attack":
-                b["g"] -= self.BEAR_RUN_G_S * dt
-                if b["g"] <= 0.0:
-                    # To the wall that needs it most: the most redcoats up
-                    # there for each bear already on it.
-                    need = [sum(st["side"] == k for st in
-                                self.stormers_on()) / (1 + sum(
-                                    o["side"] == k and o["layer"] != "ground"
-                                    for o in self.bears if o is not b))
-                            for k in (0, 1)]
-                    if need[1 - b["side"]] > need[b["side"]]:
-                        b["side"] = 1 - b["side"]
-                    b.update(layer="wall", g=0.0, u=0.0)
-            else:
-                b["g"] += self.BEAR_RUN_G_S * dt * speed
-                if b["g"] >= b["far"]:
-                    b["gone"] = True
+            self._bear_on_ground(b, dt, speed)
         elif layer == "wall":
-            if b["intent"] == "attack":
-                b["u"] += dt / self.BEAR_CLIMB_S
-                if b["u"] >= 1.0:
-                    b.update(layer="walk", u=1.0, x=self._end_x(b["side"]))
-                    if not self.bear_firsts:
-                        self.bear_firsts = True
-                        self.tally["bear_wall"] += 1
-                        self.tally["bear_lag_s"] += self.phase \
-                            - self.bear_trigger
-            else:
-                b["u"] -= dt * speed / self.BEAR_CLIMB_S
-                if b["u"] <= 0.0:
-                    b.update(layer="ground", u=0.0, g=0.0)
+            self._bear_on_wall(b, dt, speed)
         elif layer == "walk":
             self._bear_on_walk(b, dt, speed)
         else:
@@ -3460,8 +3558,183 @@ class Siege:
             if tg["hit"] is None and self.rng.random() < self.BEAR_KILL:
                 tg.update(hit=self.phase, hp=0, mauled=True)
                 self.tally["bear_kills"] += 1
+                if not self._top_foe(tg):
+                    self.tally["bear_ground_kills"] += 1
+                    if self.rousing is not None:
+                        self.rousing["ground_kills"] += 1
         if t >= self.MAUL_S:
             b["maul"] = None
+
+    # On the ground: where it goes, the lane it is in (0 the woods' own,
+    # 1 the trail's, where the redcoats march), and how it is hurt.
+
+    def _bear_ground_move(self, b, goal, dt, speed=1.0, lane=0.0):
+        """Run along the ground toward goal, in the given lane."""
+        run = self.BEAR_RUN_G_S * dt * speed
+        d = goal - b["g"]
+        b["g"] += max(-run, min(run, d))
+        k = dt / self.BEAR_LANE_S
+        b["lane"] += max(-k, min(k, lane - b["lane"]))
+        if abs(d) > 1e-9:
+            inward = 1 if b["side"] == 0 else -1
+            b["face"] = inward if d < 0 else -inward
+
+    def _bear_cross(self, b, dt):
+        """Out through the woods and round to the other side's wall."""
+        self._bear_ground_move(b, b["far"], dt)
+        if b["g"] >= b["far"] - 1e-9:
+            b["side"] = 1 - b["side"]
+
+    def _bear_ground_wounds(self, b, dt, charging):
+        """Redcoats on the ground fight back: bayonets on a bear at their
+        elbow, and a musket shot at one charging in."""
+        near, shooters = 0, 0
+        for rc in self.redcoats:
+            if rc["side"] != b["side"] or rc["hit"] is not None \
+                    or rc.get("climb") is not None:
+                continue
+            gap = abs(self._foe_g(rc) - b["g"])
+            if gap <= self.BEAR_REACH_G * 1.5 and b["lane"] > 0.5:
+                near += 1
+            elif charging and rc["kind"] != "horse" \
+                    and gap <= self.MUSKET_G:
+                shooters += 1
+        if near and self.rng.random() < self.BAYONET_RATE * near * dt:
+            b["wounds"] += 1
+        if shooters and self.rng.random() < self.MUSKET_RATE * shooters * dt:
+            b["wounds"] += 1
+            self.tally["bear_musket"] += 1
+
+    def _greet_plan(self):
+        """Where the mother is to stop by the walker: ("ground", side, g)
+        if he is out in the woods, ("walk", side, x) if he is on the wall,
+        or None if there is no walker."""
+        if not self.has_walker:
+            return None
+        m = self.men[2]
+        if self.out(2):
+            return "ground", m["side"], m.get("g", 0.0) + self.BY_WALKER_G
+        wx = self.walker_x()[0]
+        return "walk", 0 if wx < 0.5 else 1, wx
+
+    def _bear_top_side(self, b):
+        """The wall a bear is to climb to get at the redcoats up there,
+        by the time it takes: round through the woods, and along the
+        walk."""
+        tops = self.stormers_on()
+        best, score = b["side"], math.inf
+        for side in (0, 1):
+            sec = (0.0 if side == b["side"]
+                   else 2.0 * b["far"] / self.BEAR_RUN_G_S)
+            sec += min(abs(self._top_x(st) - self._end_x(side))
+                       for st in tops) * self.BEAR_WALK_S
+            if sec < score:
+                best, score = side, sec
+        return best
+
+    def _bear_on_ground(self, b, dt, speed):
+        intent = b["intent"]
+        if intent in ("withdraw", "leave"):
+            self._bear_ground_move(b, b["far"], dt, speed)
+            if b["g"] >= b["far"] - 1e-9:
+                b["gone"] = True
+            return
+        if intent == "greet":
+            plan = self._greet_plan()
+            if plan is None:
+                b["intent"] = "leave"
+                return
+            kind, side, goal = plan
+            if b["side"] != side:
+                self._bear_cross(b, dt)
+            elif kind == "ground":
+                self._bear_ground_move(b, goal, dt)
+                if abs(goal - b["g"]) < 0.05:
+                    if b["by"] is None:
+                        b["by"] = self.phase
+                    elif self.phase - b["by"] >= self.BY_WALKER_S:
+                        b["intent"] = "leave"
+                else:
+                    b["by"] = None
+            else:
+                self._to_the_wall(b, dt)
+            return
+        # Hunting.
+        self._bear_ground_wounds(b, dt, b["maul"] is None)
+        if b["maul"] is not None:
+            tg = b["maul"]["target"]
+            if tg["hit"] is not None \
+                    and self.phase - b["maul"]["t0"] >= self.MAUL_AT:
+                b["maul"] = None
+            else:
+                self._bear_blow(b, tg, dt)
+            return
+        aim = b["aim"]
+        if aim == "top":
+            if self._bear_top_side(b) != b["side"]:
+                self._bear_cross(b, dt)
+            else:
+                self._to_the_wall(b, dt)
+        elif aim is not None:
+            if aim["side"] != b["side"]:
+                self._bear_cross(b, dt)
+                return
+            goal = self._foe_g(aim)
+            self._bear_ground_move(b, goal, dt, lane=1.0)
+            if abs(goal - b["g"]) <= self.BEAR_REACH_G * 0.8 \
+                    and b["lane"] >= 0.95:
+                self._bear_blow(b, aim, dt)
+        else:
+            self._bear_ground_move(
+                b, min(b["far"], self.BEAR_WAIT_G + 0.4 * b["n"]), dt)
+
+    def _to_the_wall(self, b, dt):
+        """To the foot of the wall by the woods' lane, and up it."""
+        self._bear_ground_move(b, 0.0, dt)
+        if b["g"] <= 1e-9 and b["lane"] <= 1e-9:
+            b.update(layer="wall", u=0.0, dir=1)
+
+    def _bear_on_wall(self, b, dt, speed):
+        """On the outside of the wall, climbing or coming down it, claws
+        to the logs either way."""
+        intent = b["intent"]
+        up = (intent == "attack" and b["aim"] == "top") \
+            or (intent == "greet" and self._greet_plan() is not None
+                and self._greet_plan()[0] == "walk")
+        b["dir"] = 1 if up else -1
+        b["u"] += b["dir"] * dt * speed / self.BEAR_CLIMB_S
+        if b["u"] >= 1.0:
+            b.update(layer="walk", u=1.0, x=self._end_x(b["side"]))
+            if not self.bear_firsts:
+                self.bear_firsts = True
+                self.tally["bear_wall"] += 1
+                self.tally["bear_lag_s"] += self.phase - self.bear_trigger
+        elif b["u"] <= 0.0:
+            b.update(layer="ground", u=0.0, g=0.0, lane=0.0)
+
+    def _bear_descend(self, b, step):
+        """Nothing left up here: along the walk to the wall's end and down
+        the outside, to the side with the redcoats to be fought if any."""
+        x = b["x"]
+        if b["exit"] is None:
+            side = 0 if x < 0.5 else 1
+            if b["intent"] == "attack":
+                foes = self._bear_foes()
+                if foes:
+                    near = min(foes, key=lambda rc: self._foe_g(rc)
+                               + (0.0 if rc["side"] == side else 1.0))
+                    side = near["side"]
+            b["exit"] = side
+        end = self._end_x(b["exit"])
+        if abs(end - x) > 1e-9:
+            b["x"] += max(-step, min(step, end - x))
+            b["face"] = 1 if end > x else -1
+            return
+        b.update(layer="wall", u=1.0, dir=-1, side=b["exit"], exit=None,
+                 aim=None)
+        self.tally["bear_downs"] += 1
+        if self.rousing is not None:
+            self.rousing["down"] = True
 
     def _bear_on_walk(self, b, dt, speed):
         side, x = b["side"], b["x"]
@@ -3486,6 +3759,7 @@ class Siege:
                     self._bear_blow(b, b["maul"]["target"], dt)
                     return
             if goals:
+                b["exit"] = None
                 dist, gx, st = min(goals, key=lambda g: g[0])
                 if dist <= reach * 0.8:
                     self._bear_blow(b, st, dt)
@@ -3503,38 +3777,34 @@ class Siege:
                     b.update(layer="yard", u=0.02 if side == 0 else 0.98,
                              v=0.0)
                 return
-            if self.trail_quiet():
-                b["intent"] = "greet" if b["mother"] else "leave"
-            else:
-                # Redcoats still at the wall: it is no time to go. It keeps
-                # watch at the end of the walk they would come up by.
-                end = self._end_x(side)
-                b["x"] += max(-step, min(step, end - x))
-                b["face"] = -1 if side == 0 else 1
-                return
-        if b["intent"] == "greet":
-            wx = self.walker_x()[0]
-            stand = min(1.0, max(0.0, wx + (-1 if side == 0 else 1)
-                                 * self.BY_WALKER_DX))
-            if abs(stand - x) > 0.01:
-                b["x"] += max(-step, min(step, stand - x))
-                b["face"] = 1 if wx > x else -1
-            else:
-                if b["by"] is None:
-                    b["by"] = self.phase
-                b["face"] = 1 if wx > x else -1
-                others = [o for o in self.bears if not o["mother"]
-                          and o["layer"] != "ground"]
-                if self.phase - b["by"] >= self.BY_WALKER_S and not others:
-                    b["intent"] = "leave"
+            self._bear_descend(b, step)
             return
-        # Leaving, or withdrawn: back along the walk to the wall's end.
-        end = self._end_x(side)
-        if abs(end - x) > 1e-9:
-            b["x"] += max(-step, min(step, end - x))
-            b["face"] = 1 if end > x else -1
-        else:
-            b.update(layer="wall", u=1.0)
+        if b["intent"] == "greet":
+            plan = self._greet_plan()
+            if plan is None:
+                b["intent"] = "leave"
+            elif plan[0] == "ground":
+                self._bear_descend(b, step)     # he is out in the woods
+                return
+            else:
+                wx = plan[2]
+                stand = min(1.0, max(0.0, wx + (-1 if side == 0 else 1)
+                                     * self.BY_WALKER_DX))
+                if abs(stand - x) > 0.01:
+                    b["x"] += max(-step, min(step, stand - x))
+                    b["face"] = 1 if wx > x else -1
+                else:
+                    if b["by"] is None:
+                        b["by"] = self.phase
+                    b["face"] = 1 if wx > x else -1
+                    others = [o for o in self.bears if not o["mother"]
+                              and o["layer"] != "ground"]
+                    if self.phase - b["by"] >= self.BY_WALKER_S \
+                            and not others:
+                        b["intent"] = "leave"
+                return
+        # Leaving, or withdrawn: back along the walk and down.
+        self._bear_descend(b, step)
 
     def _bear_in_yard(self, b, dt, speed):
         step = dt * speed / self.BEAR_YARD_S
@@ -3564,8 +3834,6 @@ class Siege:
                     b["v"] += gv / dist * min(step, dist)
                     b["face"] = 1 if gu > 0 else -1
                 return
-            if self.trail_quiet():
-                b["intent"] = "greet" if b["mother"] else "leave"
         # Back to the wall's end, and up to the walk.
         eu = 0.02 if b["side"] == 0 else 0.98
         gu, gv = eu - b["u"], 0.0 - b["v"]
@@ -6593,13 +6861,14 @@ class CpuView(Gtk.DrawingArea):
         t = self.fort_geo["t"]
         return t * self.BEAR_S * (self.MOTHER_K if b["mother"] else 1.0)
 
-    def _draw_one_bear(self, cr, b, x, feet, facing, moving, climbing=False):
+    def _draw_one_bear(self, cr, b, x, feet, facing, moving, climbing=False,
+                       scale=1.0):
         """A bear of the siege, in the pose its doing calls for: reared up
         and clawing at the stockade, charging, rearing to strike (and a
         spray of blood as the blow lands), or standing, head low, by the
         walker."""
         siege = self.siege
-        s = self._bear_size(b)
+        s = self._bear_size(b) * scale
         m = b["maul"]
         stand = swipe = step = charge = head = 0.0
         if m is not None:
@@ -6656,8 +6925,23 @@ class CpuView(Gtk.DrawingArea):
             out = b["intent"] in ("withdraw", "leave", "greet")
             if b["layer"] == "ground":
                 x, feet = self._bear_ground_xy(side, b["g"])
-                self._draw_one_bear(cr, b, x, feet, -inward if out
-                                    else inward, True)
+                scale = 1.0
+                if b["lane"] > 0.0:
+                    # Out on the trail where the redcoats are, and smaller
+                    # as it is farther up it.
+                    p = min(1.0, max(0.0, 1.0 - b["g"] / Siege.G_SPAN))
+                    tx, ty = self._bezier(self.trails[side], p)
+                    # At the wall's foot, beside the men beating on it.
+                    tx += (-1 if side == 0 else 1) * geo["wall"] * 0.5 \
+                        * max(0.0, 1.0 - b["g"] * 2)
+                    k = b["lane"]
+                    x, feet = x + (tx - x) * k, feet + (ty - feet) * k
+                    scale = 1.0 + (self._depth_scale(p) * 1.1 - 1.0) * k
+                moving = b["maul"] is None and (
+                    b["intent"] != "attack" or b["aim"] is not None
+                    or b["g"] > Siege.BEAR_WAIT_G - 0.1)
+                self._draw_one_bear(cr, b, x, feet, b["face"], moving,
+                                    scale=scale)
             elif b["layer"] == "wall":
                 (_, by), _ = self._ladder_ends(side)
                 x = geo["X"] + (-0.15 if side == 0 else geo["W"] + 0.15) \
@@ -11325,6 +11609,58 @@ def _stage_bears_fighting():
     return stage
 
 
+def _stage_bears_down():
+    """The top clear, the bears coming down the outside of the wall."""
+    def stage(siege):
+        mother, b1, b2, b3 = _bears_up(siege)
+        mother.update(layer="wall", u=0.55, dir=-1, aim=None)
+        b1.update(layer="wall", u=0.2, dir=-1, aim=None)
+        b2.update(layer="ground", g=0.0, lane=0.0, aim=None)
+        b3.update(layer="ground", g=1.1, lane=0.0, aim=None)
+    return stage
+
+
+def _stage_bears_waiting():
+    """Nothing left to hunt: they wait at the woods' edge for the quiet."""
+    def stage(siege):
+        for b in _bears_up(siege):
+            b.update(layer="ground", g=Siege.BEAR_WAIT_G + 0.4 * b["n"],
+                     lane=0.0, aim=None)
+    return stage
+
+
+def _stage_bears_at_the_foot():
+    """Bears mauling redcoats at the foot of each wall."""
+    def stage(siege):
+        mother, b1, b2, _ = _bears_up(siege)
+        a = _at_the_foot(siege, "foot", 0, 0)
+        c = _at_the_foot(siege, "cannon", 0, 1)
+        far = _at_the_foot(siege, "foot", 1, 0)
+        mother.update(layer="ground", g=0.0, lane=1.0, aim=a, maul={
+            "t0": siege.phase - 0.55, "target": a, "struck": False})
+        b1.update(layer="ground", g=0.0, lane=1.0, aim=c, maul=None)
+        b2.update(layer="ground", side=1, g=0.0, lane=1.0, aim=far, maul={
+            "t0": siege.phase - 0.5, "target": far, "struck": False})
+        _foe(siege, "foot", 0.8, 0)["hit"] = siege.phase - 0.4
+    return stage
+
+
+def _stage_bears_on_the_trail():
+    """Bears mauling redcoats out on the trail, the near half of it."""
+    def stage(siege):
+        mother, b1, b2, _ = _bears_up(siege)
+        a = _foe(siege, "foot", 0.62, 0)
+        c = _foe(siege, "foot", 0.8, 0)
+        d = _foe(siege, "horse", 0.55, 1)
+        mother.update(layer="ground", g=Siege.G_SPAN * 0.38, lane=1.0, aim=a,
+                      maul={"t0": siege.phase - 0.55, "target": a,
+                            "struck": False})
+        b1.update(layer="ground", g=Siege.G_SPAN * 0.2, lane=1.0, aim=c)
+        b2.update(layer="ground", side=1, g=Siege.G_SPAN * 0.45, lane=1.0,
+                  aim=d)
+    return stage
+
+
 def _stage_mother_by_walker():
     def stage(siege):
         mother = _bears_up(siege, 0, 0)[0]
@@ -11383,6 +11719,10 @@ SIEGE_PICTURES = (
     ("walker-mending-roof", _stage_roof(0.6, mend=True)),
     ("bears-climbing-the-wall", _stage_bears_climbing()),
     ("bears-fighting-on-the-walk", _stage_bears_fighting()),
+    ("bears-climbing-down", _stage_bears_down()),
+    ("bears-waiting-at-the-woods-edge", _stage_bears_waiting()),
+    ("bears-mauling-at-the-foot", _stage_bears_at_the_foot()),
+    ("bears-mauling-on-the-trail", _stage_bears_on_the_trail()),
     ("mother-bear-by-the-walker", _stage_mother_by_walker(), (0.58, 0.52, 2.0)),
     ("yard-redcoats-battering", _stage_yard()),
     ("yard-redcoats-dropping", _stage_yard(dropping=True)),
@@ -11947,29 +12287,153 @@ def siege_tests(view, cr):
     assert stopped is not None and siege.phase - stopped >= Siege.BY_WALKER_S
     assert siege.tally["guns"] == 0, "no gun was lost to them"
     assert _until(siege, lambda: not siege.gun["taken"], 30), "and he retakes it"
-    # While redcoats are still at the wall's foot they do not go: they keep
-    # watch at the end of the walk, and go when it has been quiet.
-    siege = _quiet_siege()
+    # Roused, they hunt redcoats wherever they are about the fort, the top
+    # first. With the top cleared they climb down the outside of the wall,
+    # and kill the men at its foot, the near half of either trail, and the
+    # men driving the walker from his rock; they never go up to the
+    # barracks; and they go home only when none is left to hunt and the
+    # trails have been quiet.
+    siege = _quiet_siege(5)
     siege.bear_rest = 0.0
     siege.has_walker = False
-    siege.valley_bears = 0
-    siege.men[2]["mode"] = "patrol"
-    a = _on_the_walk(siege, 0, 0.0)
-    watcher = _at_the_foot(siege, "cannon", 0, 0)
-    watcher["hp"] = 99
-    siege.wall = [1.0, 1.0]
-    mother = None
-    assert _until(siege, lambda: siege.bears and siege.bears[0]["layer"]
-                  == "walk", 15)
-    mother = siege.bears[0]
-    assert _until(siege, lambda: a["hit"] is not None, 20)
-    siege.run(Siege.QUIET_S + 6)
-    assert mother["layer"] == "walk" and mother["intent"] == "attack", \
-        "redcoats still at the foot: she keeps watch"
-    watcher["hit"] = siege.phase
-    assert _until(siege, lambda: mother["intent"] != "attack", 12), \
-        "and goes once it is quiet"
-    assert _until(siege, lambda: mother.get("gone"), 40)
+    siege.valley_bears = 2
+    top = _on_the_walk(siege, 0, 0.5)
+    top["hp"] = 99
+    siege.run(0.1)
+    assert len(siege.bears) == 3 and all(b["aim"] == "top"
+                                         for b in siege.bears[:2])
+    assert _until(siege, lambda: siege.bears_on("walk"), 12)
+    held = []
+    foot = _at_the_foot(siege, "foot", 0, 0)
+    far_foot = _at_the_foot(siege, "cannon", 1, 0)
+    near = _foe(siege, "foot", 0.7, 0)
+    driver = _foe(siege, "foot", 0.35, 0)
+    driver["drive"] = {"t0": siege.phase, "born": siege.phase, "rock": 1,
+                       "fired": False}
+    barracks = _foe(siege, "foot", 0.2, 0)
+    for rc in (foot, far_foot, near, driver, barracks):
+        rc["hp"] = 99
+    mauled, hunted_g, climbed = [], 0.0, False
+    for _ in range(150 * 30):
+        near["d"] = Siege.trail_d(0.7)
+        barracks["d"] = Siege.trail_d(0.2)
+        siege.run(1 / 30)
+        climbed |= any(b["layer"] == "wall" and b["dir"] < 0
+                       for b in siege.bears)
+        for b in siege.bears:
+            assert b["aim"] is not barracks, "never the far half"
+            if b["layer"] == "ground" and b["maul"] is not None:
+                hunted_g = max(hunted_g, b["g"])
+            if b["intent"] != "attack" and b["layer"] != "walk" \
+                    and b["intent"] != "withdraw":
+                assert not siege.stormers_on() and not [
+                    rc for rc in (foot, far_foot, near, driver)
+                    if rc["hit"] is None], "not while redcoats are about"
+        if not siege.bears:
+            break
+    assert climbed and siege.tally["bear_downs"] >= 1, "down from the top"
+    assert top["hit"] is not None
+    assert all(rc["hit"] is not None and rc.get("mauled")
+               for rc in (foot, far_foot, near, driver)), \
+        "at the wall's foot, on either side, on the trail, driving"
+    assert barracks["hit"] is None and hunted_g < 2.3, \
+        "not up the trail to the barracks"
+    assert siege.tally["bear_ground_kills"] >= 4
+    assert not siege.bears and siege.tally["bear_home"] >= 1, \
+        "home once none is left and it has been quiet"
+    assert siege.tally["rousings_over"] == 1 and siege.tally["rousings_down"] == 1
+    assert siege.tally["bear_top_idle_max"] < 12, siege.tally
+
+    # While any redcoat is up on top, the bears there stay; the rest come
+    # up to join them. The top cleared, they all come down; at the woods'
+    # edge they wait out the quiet, and climb straight back up if a redcoat
+    # steps onto the top again.
+    siege = _quiet_siege(6)
+    siege.has_walker = False
+    siege.gun["taken"] = True
+    far = _on_the_walk(siege, 0, 0.95)
+    far.update(hp=99)
+    mother, b1, b2, b3 = _bears_up(siege, 0, 3)
+    for b in (mother, b1):
+        b.update(layer="walk", x=0.0)
+    b2.update(layer="wall", u=0.5, dir=1)
+    b3.update(g=2.6)
+    siege.run(5)
+    assert mother["layer"] != "ground" and b1["layer"] in ("walk", "yard")
+    assert not siege.bears_on("ground") or b3["layer"] == "ground"
+    assert all(b["layer"] != "ground" or b is b3 for b in siege.bears) \
+        or siege.tally["bear_downs"] == 0, "none down while one is up there"
+    far["hit"], far["hp"] = siege.phase, 0
+    siege.trail_quiet_since = siege.phase + 6.0     # quiet only from then
+    assert _until(siege, lambda: siege.tally["bear_downs"] >= 3, 15)
+    assert _until(siege, lambda: all(b["layer"] == "ground"
+                                     for b in siege.bears), 12), \
+        [(b["layer"], b["intent"]) for b in siege.bears]
+    assert not siege.bears_on("walk", "yard", "wall")
+    siege.run(2.5)
+    for b in siege.bears:
+        assert b["intent"] == "attack" and b["aim"] is None \
+            and b["g"] > Siege.BEAR_WAIT_G - 0.1, \
+            "they wait at the woods' edge out the quiet"
+    again = _on_the_walk(siege, 1, 0.9)
+    again["hp"] = 99
+    siege.run(0.1)
+    assert sum(b["aim"] == "top" for b in siege.bears) >= 2
+    assert _until(siege, lambda: siege.bears_on("wall", "walk"), 8), \
+        "straight back up"
+    assert siege.tally["rousings_over"] == 0
+
+    # In the woods with the walker out, the mother goes home by way of him:
+    # she stops by him there, then leaves; the others go straight home.
+    siege = _quiet_siege(7)
+    siege.wall = [0.5, 1.0]
+    walker = _walker_out(siege)
+    walker.update(mode="hide", g=2.0, rock=2, shot_t=None, pinned=[],
+                  next_shot=1e9, t0=siege.phase + 30)
+    mother, b1 = _bears_up(siege, 0, 1)
+    mother.update(g=3.0, far=3.0)
+    b1.update(g=2.7, far=4.0)
+    siege.trail_quiet_since = siege.phase - Siege.QUIET_S - 1
+    assert _until(siege, lambda: mother["intent"] == "greet", 2)
+    assert _until(siege, lambda: b1.get("gone"), 10)
+    assert _until(siege, lambda: mother["by"] is not None, 10)
+    assert abs(mother["g"] - (walker["g"] + Siege.BY_WALKER_G)) < 0.06
+    assert mother["layer"] == "ground" and mother["side"] == 0
+    stopped = siege.phase
+    assert _until(siege, lambda: mother["intent"] == "leave", 8)
+    assert siege.phase - stopped >= Siege.BY_WALKER_S - 0.5
+    assert _until(siege, lambda: mother.get("gone"), 10)
+
+    # A redcoat on the ground fights back: bayonets at the bear's elbow,
+    # and a musket at one charging in; enough wounds, and the bear goes.
+    siege = _quiet_siege(8)
+    siege.has_walker = False
+    siege.gun["taken"] = True
+    mother, b1, *_ = _bears_up(siege, 0, 1)
+    top = _on_the_walk(siege, 0, 0.9)
+    top["hp"] = 99
+    b1.update(g=0.0, lane=1.0, wounds=0, aim=None)
+    mother.update(g=3.5, far=3.5, wounds=0)
+    foot = _at_the_foot(siege, "foot", 0, 0)
+    foot["hp"] = 99
+    siege.BEAR_KILL = 0.0       # a bear that cannot kill, to see the wounds
+    siege.MUSKET_RATE = 0.0
+    siege.run(40)
+    assert b1["wounds"] >= 1 and foot["hit"] is None, "bayonets"
+    siege = _quiet_siege(9)
+    siege.has_walker = False
+    siege.gun["taken"] = True
+    mother, = _bears_up(siege, 0, 0)
+    top = _on_the_walk(siege, 0, 0.1)
+    top["hp"] = 99
+    mother.update(g=3.0, far=3.0, aim="top")
+    near = _foe(siege, "foot", 0.6, 0)
+    near["hp"] = 99
+    siege.MUSKET_RATE = 60.0
+    siege.BAYONET_RATE = 0.0
+    siege.run(2)
+    assert siege.tally["bear_musket"] >= 1 and mother["wounds"] >= 1, \
+        "a musket shot at a bear charging in"
 
     # A bear that takes enough bayonet wounds withdraws, wounded; the
     # mother does not leave with a redcoat in the yard.
