@@ -10,7 +10,10 @@ Run with --self-test to build every page and draw every state once, or with
 --snapshot <png> to draw the chip from live load. --time-scale <x> runs the
 valley's clock x times faster than real time, to watch the seasons turn.
 --almanac <years> [--seed N] runs a fresh valley headless and prints a row
-for every season. The valley itself is kept in
+for every season. --siege <minutes> [--seed N] runs a fresh siege headless
+and prints a row for every minute: the redcoats sent, shot, at the wall and
+killed by the gun, and the calls for it; the boats, which need the river's
+drawn course, are left out. The valley itself is kept in
 $XDG_STATE_HOME/fort-galgs/world.json between runs.
 """
 
@@ -8875,6 +8878,21 @@ def self_test():
         assert word in lines[0], word
     assert [ln.split()[0] for ln in lines[1:]] == list(World.SEASONS)
 
+    # The siege report runs headless too: a row a minute and a total, in
+    # which redcoats were sent and some were shot.
+    buf = io.StringIO()
+    siege_report(3, seed=2, out=buf)
+    assert parse_args(["--siege", "3"])["siege"] == 3
+    assert parse_args(["--siege", "3", "--seed", "5"])["seed"] == 5
+    lines = buf.getvalue().splitlines()
+    assert len(lines) == 2 + 3 + 1, lines
+    assert "no boats" in lines[0]
+    for word in ("minute", "sent", "shot", "wall", "blasted", "gun calls"):
+        assert word in lines[1], word
+    assert [ln.split()[0] for ln in lines[2:]] == ["1", "2", "3", "total"]
+    sent, shot = lines[-1].split()[1:3]
+    assert sum(map(int, sent.split("/"))) >= 5 and int(shot) >= 1, lines[-1]
+
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], True)
     view.boats, view.potshot, view.walker_halted = [], None, 0.0
     for facing, phase in ((1, 0.0), (-1, 10.0)):
@@ -9352,7 +9370,8 @@ def snapshot(path):
 
 
 USAGE = ("usage: fort-galgs [--time-scale <x>] | --self-test"
-         " | --snapshot <png> | --almanac <years> [--seed N]")
+         " | --snapshot <png> | --almanac <years> [--seed N]"
+         " | --siege <minutes> [--seed N]")
 
 
 def almanac(years, seed=1, out=None):
@@ -9384,10 +9403,41 @@ def almanac(years, seed=1, out=None):
         w.run(0.5)
 
 
+def siege_report(minutes, seed=1, out=None):
+    """Run a fresh siege headless for so many minutes and print one row a
+    minute, then the total: the redcoats sent (foot/horse/cannon), those
+    shot by the sentries, those who reached the wall, those the gun's blast
+    took, and the calls for the gun. No boats: they row on the river as
+    drawn, which a headless run has not got."""
+    out = out or sys.stdout
+    siege = Siege(seed)
+    print(f"siege, seed {seed}, no boats (they need the drawn river)",
+          file=out)
+    print(f"{'minute':>6}{'sent f/h/c':>14}{'shot':>6}{'at wall':>9}"
+          f"{'blasted':>9}{'gun calls':>11}", file=out)
+
+    def row(label, t):
+        sent = "/".join(str(t["sent"][k]) for k in ("foot", "horse",
+                                                    "cannon"))
+        print(f"{label:>6}{sent:>14}{t['shot']:>6}{t['reached']:>9}"
+              f"{t['blasted']:>9}{t['calls']:>11}", file=out)
+
+    last = copy.deepcopy(siege.tally)
+    for n in range(int(minutes)):
+        siege.run(60.0)
+        t = siege.tally
+        row(n + 1, {"sent": {k: t["sent"][k] - last["sent"][k]
+                             for k in t["sent"]},
+                    **{k: t[k] - last[k] for k in t if k != "sent"}})
+        last = copy.deepcopy(t)
+    row("total", siege.tally)
+
+
 def parse_args(argv):
     """The command line as a dict; a usage error exits 2."""
     opts = {"self_test": False, "snapshot": None, "help": False,
-            "time_scale": 1.0, "almanac": None, "seed": 1}
+            "time_scale": 1.0, "almanac": None, "siege": None,
+            "seed": 1}
     args = list(argv)
 
     def fail():
@@ -9412,14 +9462,14 @@ def parse_args(argv):
             opts["time_scale"] = x
         elif a == "--time-scale":
             fail()
-        elif a in ("--almanac", "--seed"):
+        elif a in ("--almanac", "--siege", "--seed"):
             try:
                 n = int(args.pop(0))
             except (IndexError, ValueError):
                 fail()
-            if a == "--almanac" and n < 1:
+            if a in ("--almanac", "--siege") and n < 1:
                 fail()
-            opts["almanac" if a == "--almanac" else "seed"] = n
+            opts[a[2:]] = n
     return opts
 
 
@@ -9427,6 +9477,9 @@ def main():
     opts = parse_args(sys.argv[1:])
     if opts["almanac"]:
         almanac(opts["almanac"], opts["seed"])
+        return 0
+    if opts["siege"]:
+        siege_report(opts["siege"], opts["seed"])
         return 0
     if opts["self_test"]:
         self_test()
