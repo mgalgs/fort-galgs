@@ -4641,9 +4641,12 @@ class CpuView(Gtk.DrawingArea):
         self.on = False
         self.loads = {}       # cpu -> target load
         self.shown = {}       # cpu -> displayed load, eased toward target
-        self.phase = 0.0
-        self.last_draw = -1.0
+        self.phase = 0.0                  # the scene's clock, in seconds
+        self.last_draw = -1.0             # real seconds, as self.real
         self._t0 = None
+        self.real = 0.0                   # real seconds since the first frame
+        self.speed = 1                    # scene seconds per real second
+        self._base = (0.0, 0.0)           # (real, phase) the speed last set
         self.siege = Siege(seed=7)        # the rules; this view draws them
         self.siege.boulders = [False, False]  # none laid until drawn
         self.siege.has_walker = False
@@ -4716,21 +4719,32 @@ class CpuView(Gtk.DrawingArea):
         showing. A long gap, like a suspend, counts for only a little."""
         if self.world_at is not None and now - self.world_at > 1.0:
             gap = min(now - self.world_at, self.CATCH_UP_MAX)
-            self.world.advance(gap * self.time_scale)
+            self.world.advance(gap * self.time_scale * self.speed)
         if self.world_at is None or now - self.world_at > 1.0:
             self.world_at = now
 
     def set_loads(self, loads):
         self.loads = loads
 
+    def set_speed(self, speed):
+        """Run the whole scene, siege, boats and valley alike, at speed
+        times real time from here on, like fast-forwarding a film. The
+        fort itself, its loads and the user's clicks stay on real time."""
+        self._base = (self.real, self.phase)
+        self.speed = speed
+
     def _on_tick(self, widget, clock):
         now = clock.get_frame_time()
         if self._t0 is None:
             self._t0 = now
-        prev = self.phase
-        self.phase = (now - self._t0) / 1_000_000.0
-        dt = max(0.0, self.phase - prev)
-        self._advance(min(dt, 0.1), dt)
+        prev = self.real
+        self.real = (now - self._t0) / 1_000_000.0
+        real0, phase0 = self._base
+        self.phase = phase0 + (self.real - real0) * self.speed
+        dt = max(0.0, self.real - prev)
+        # Faster is more frames' worth of the same steps, not longer steps.
+        for _ in range(self.speed):
+            self._advance(min(dt, 0.1), dt)
         self.world_at = GLib.get_monotonic_time() / 1_000_000.0
         # Frame-rate independent easing: the same glide at 30 Hz or 144 Hz.
         k = 1.0 - math.exp(-dt * 7.0)
@@ -4740,8 +4754,8 @@ class CpuView(Gtk.DrawingArea):
 
         root = widget.get_root()
         focused = root is not None and root.is_active()
-        if focused or self.phase - self.last_draw >= IDLE_REDRAW_S:
-            self.last_draw = self.phase
+        if focused or self.real - self.last_draw >= IDLE_REDRAW_S:
+            self.last_draw = self.real
             self.queue_draw()
         return GLib.SOURCE_CONTINUE
 
@@ -4777,7 +4791,9 @@ class CpuView(Gtk.DrawingArea):
         sends a boatload of redcoats down it."""
         i = self._barracks_at(x, y)
         if i is not None:
-            self.siege.click_barracks(i, n, self._double_click_s())
+            # Its wait is on the siege's clock, the click's on real time.
+            self.siege.click_barracks(i, n,
+                                      self._double_click_s() * self.speed)
             return
         if not self._on_fort(x, y):
             if self.on and self._on_river(x, y):
@@ -14269,6 +14285,48 @@ def self_test():
     view._on_click(None, 2, *mid)
     assert view.siege.called[0][-4:] == list(Siege.WAVE)
     assert view.siege.pending_call is None
+
+    # At 2x the whole scene runs twice as fast, siege and valley alike, and
+    # back at 1x as before; the fort's load bars ease on real time.
+    class Clock:
+        us = 0
+
+        def get_frame_time(self):
+            return self.us
+
+    def frames(clock, n):
+        for _ in range(n):
+            clock.us += 40_000  # 25 frames a second
+            view._on_tick(view, clock)
+
+    assert view.on and view.speed == 1
+    clock = Clock()
+    frames(clock, 1)
+    for speed in (1, 2, 1):
+        view.set_speed(speed)
+        before = view.siege.phase, view.world.time, view.phase
+        view.loads, view.shown = {0: 1.0}, {0: 0.0}
+        frames(clock, 25)
+        moved = (view.siege.phase - before[0],
+                 (view.world.time - before[1]) / view.time_scale,
+                 view.phase - before[2])
+        assert all(abs(m - speed) < 1e-9 for m in moved), (speed, moved)
+        assert abs(view.shown[0] - (1 - math.exp(-7.0))) < 1e-9, view.shown
+    # A double click spaced inside GTK's double-click time is still one at
+    # 2x: the lone click's file waits out real time, not the siege's.
+    view.set_speed(2)
+    wait = round(view._double_click_s() / 0.04)
+    view.siege.pending_call = None
+    view._on_click(None, 1, *mid)
+    frames(clock, int(wait * 0.8))
+    assert view.siege.pending_call, "no file yet, a second click may come"
+    view._on_click(None, 2, *mid)
+    assert view.siege.called[0][-4:] == list(Siege.WAVE)
+    assert view.siege.pending_call is None
+    view._on_click(None, 1, *mid)
+    frames(clock, wait + 2)
+    assert view.siege.pending_call is None, "a lone click sends its file"
+    view.set_speed(1)
 
     # Whoever reaches the wall beats on it.
     def stand(kind, n=99, d=1.05, at_wall=None, hp=1):
