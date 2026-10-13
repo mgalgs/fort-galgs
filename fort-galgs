@@ -3303,10 +3303,20 @@ class Siege:
                        for st in self.stormers_on())
         if not (near_top or stepping):
             return False
+        if not self.below(side):
+            return False        # nobody for the stew to fall on
         crowd = sum(1 for rc in self.redcoats if rc["side"] == side
                     and rc["hit"] is None and rc["at_wall"] is not None)
         return self.gun["taken"] or self.breached(side) \
             or crowd >= self.CROWD
+
+    def below(self, side):
+        """Anyone on that side's ladder or at that wall's foot: those the
+        stew would scald."""
+        return any(rc["side"] == side and rc["hit"] is None
+                   and (rc.get("climb") is not None
+                        or rc["at_wall"] is not None)
+                   for rc in self.redcoats)
 
     def _pot_carrier(self, x):
         """The man nearest x along the wall walk who can leave what he is
@@ -3404,7 +3414,7 @@ class Siege:
             if m["h"] >= 1.0:
                 m["leg"] = "to"
         elif leg == "to":
-            if (kind == "pour" and not self.desperate(side)) \
+            if (kind == "pour" and not self.below(side)) \
                     or (kind == "fetch" and self.calm_since is None):
                 self._finish_carry(i)       # it is over, or it has begun
                 return
@@ -3419,6 +3429,9 @@ class Siege:
                 p["at"] = "carried"
                 m["leg"] = "bear"
         elif leg == "bear":
+            if kind == "pour" and not self.below(side):
+                # nobody left below: carry it back rather than waste it
+                kind = m["kind"] = p["task"]["kind"] = "fetch"
             goal = self.LADDER_X[side] if kind == "pour" else self.POT_X
             step = dt * pace / self.CARRY_S
             left = goal - m["x"]
@@ -12378,8 +12391,6 @@ def _stage_pour():
         siege.drill_start = [None, None]
         siege.ladder.update(side=0, state="standing", ext=1.0)
         siege.wall[0] = 0.4
-        for u in (0.3, 0.62):
-            pass
         low = _at_the_foot(siege, "foot", 0, 0)
         low.update(climb=siege.phase - 0.3 * Siege.CLIMB_UP_S, hp=99)
         for slot in (0, 1):
@@ -13367,6 +13378,8 @@ def siege_tests(view, cr):
     siege.wall[1] = 0.0
     assert not siege.desperate(1)
     st = _on_the_walk(siege, 1, 0.9)
+    assert not siege.desperate(1), "nobody below to scald"
+    _at_the_foot(siege, "foot", 1, 0)
     assert siege.desperate(1), "stepping onto the walk, the wall breached"
     st["since"] -= Siege.STEP_S
     assert not siege.desperate(1), "no longer stepping"
