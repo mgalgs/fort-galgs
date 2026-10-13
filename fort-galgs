@@ -141,6 +141,8 @@ FISH_RGB = (0.74, 0.78, 0.82)
 DEN_RGB = (0.33, 0.26, 0.18)
 DEN_MOUTH_RGB = (0.07, 0.05, 0.04)
 BEAR_HIDE_RGB = (0.55, 0.39, 0.24)
+STEW_RGB = (0.66, 0.42, 0.18)
+STEW_HI_RGB = (0.88, 0.66, 0.34)
 
 # The seasons, each across the whole picture: spring, summer, autumn, winter.
 SPRING_GRASS_RGB = (0.20, 0.37, 0.17)
@@ -2049,7 +2051,8 @@ class Siege:
     CATCH_MARGIN = 0.5  # spare seconds he wants over the nearest redcoat
     MEND_FED = 0.3      # at his meal, with a wall to mend, he gets up at this
     HEAVY = ("lower", "descend", "mend", "ascend", "haul", "run", "hide",
-             "home", "raise", "gun", "driven", "retake", "roof", "brawl")
+             "home", "raise", "gun", "driven", "retake", "roof", "brawl",
+             "carry")
 
     # Caught outside. Three hiding rocks stand in the woods outside each
     # side wall, 1 to 3 each farther from the fort, at ground distance g
@@ -2182,6 +2185,21 @@ class Siege:
     DOWN_S = 1.4
     UP_S = 1.4
 
+    # Poured over the redcoats when things are desperate (see desperate):
+    # a man carries it from its fire to the wall top at CARRY_S for the
+    # whole walk, tips it over, and the stew scalds whoever is on that
+    # side's ladder or at the wall's foot. The pot then lies empty and
+    # cold at the wall top until a calm, when it is carried back.
+    DESPERATE_U = 0.5   # on the ladder this far up is near the top
+    STEP_S = 3.0        # a man stepping onto the walk is so for this long
+    CROWD = 4           # this many at the wall's foot are a crowd
+    POUR_MIN = 0.3      # the pot must hold at least this much to be poured
+    CARRY_S = 5.0
+    LIFT_S = 0.7
+    SET_S = 0.7
+    TIP_S = 2.2
+    TIP_AT = 1.0
+
     def __init__(self, seed=1, steady=False):
         self.rng = random.Random(seed)    # its small chances; see vary()
         self.steady = steady              # no variation in the march
@@ -2213,7 +2231,7 @@ class Siege:
         self.calm_since = None            # phase nothing was in sight
         self.boats_in_sight = False       # the view's: redcoats afloat
         self.pot = {"x": self.POT_X, "stew": 1.0, "heat": 1.0,
-                    "at": "fire", "task": None}
+                    "at": "fire", "task": None, "side": 0}
         self.pot_all = False              # all three at it together
         self.men = [self._new_man("post"), self._new_man("post"),
                     self._new_man("patrol")]
@@ -3067,7 +3085,7 @@ class Siege:
         or outward when he is at a wall's ladder)."""
         m = self.men[2]
         if m["mode"] in ("gun", "driven", "retake", "to_roof", "roof",
-                         "brawl", "pot"):
+                         "brawl", "pot", "carry"):
             return m["x"], m["face"]
         if m["mode"] in ("to_wall", "shove_run", "shove", "lower", "haul",
                          "descend", "ascend", "mend"):
@@ -3161,20 +3179,25 @@ class Siege:
         go back."""
         if not self.has_walker:
             for i, m in enumerate(self.men):
-                if m["mode"] == "pot":
+                if m["mode"] in ("pot", "carry"):
                     self._home_post(i)
+            if self.pot["at"] == "carried":
+                self.pot.update(at="fire", x=self.POT_X, task=None)
+            self.pot["task"] = None
             return
         p = self.pot
         sight = self.calm_since is None
         if p["at"] == "fire" and self.calm():
             p["stew"] = min(1.0, p["stew"] + dt / self.REFILL_S)
             p["heat"] = min(1.0, p["heat"] + dt / self.BOIL_S)
+        self._pot_dispatch()
         for i, m in enumerate(self.men):
-            if m["mode"] != "pot":
-                continue
-            if i != 2:
-                self.tally["off_s"] += dt
-            self._pot_man(i, m, dt, sight)
+            if m["mode"] == "carry":
+                self._pot_carry(i, m, dt)
+            elif m["mode"] == "pot":
+                if i != 2:
+                    self.tally["off_s"] += dt
+                self._pot_man(i, m, dt, sight)
         together = all(self.at_pot(i) for i in (0, 1, 2))
         if together:
             self.tally["pot_together_s"] += dt
@@ -3259,6 +3282,170 @@ class Siege:
             m["h"] = max(0.0, m["h"] - dt * pace / self.UP_S)
             if m["h"] <= 0.0:
                 self._home_post(i)
+
+    # -- the pot, poured -----------------------------------------------------
+
+    def desperate(self, side):
+        """THINGS ARE REALLY DESPERATE on one side: a redcoat on the ladder
+        near the top, or stepping onto the walk, and, besides, the gun
+        taken, the wall breached, or CROWD of them at the wall's foot."""
+        near_top = self.ladder["side"] == side and any(
+            rc["side"] == side and self.climb_u(rc) >= self.DESPERATE_U
+            for rc in self.climbers())
+        stepping = any(st["side"] == side and st["mode"] == "walk"
+                       and self.phase - st["since"] < self.STEP_S
+                       for st in self.stormers_on())
+        if not (near_top or stepping):
+            return False
+        crowd = sum(1 for rc in self.redcoats if rc["side"] == side
+                    and rc["hit"] is None and rc["at_wall"] is not None)
+        return self.gun["taken"] or self.breached(side) \
+            or crowd >= self.CROWD
+
+    def _pot_carrier(self, x):
+        """The man nearest x along the wall walk who can leave what he is
+        doing to carry the pot: the walker, or a tower sentry."""
+        best, far = None, math.inf
+        walker = self.men[2]
+        if walker["mode"] in ("patrol", "eat", "pot", "gun", "to_wall",
+                              "shove_run", "to_roof", "roof") \
+                and not self.out(2):
+            best, far = 2, abs(self.walker_x()[0] - x)
+        for i in (0, 1):
+            m = self.men[i]
+            if m["mode"] in ("post", "eat", "pot") and not self.ousted(i):
+                at = m["x"] if m["mode"] == "pot" else self._end_x(i)
+                if abs(at - x) < far:
+                    best, far = i, abs(at - x)
+        return best
+
+    def _pot_dispatch(self):
+        """Who is to carry the pot, and where: to a side in desperate
+        straits, if it is hot and holds stew; back to its fire, in the
+        calm, once it has been emptied."""
+        p = self.pot
+        if p["task"] is not None:
+            return
+        if p["at"] == "fire":
+            if p["heat"] < 1.0 or p["stew"] < self.POUR_MIN:
+                return
+            sides = [s for s in (0, 1) if self.desperate(s)]
+            if not sides:
+                return
+            side = max(sides, key=lambda s: sum(
+                rc["side"] == s and rc["hit"] is None
+                and (rc.get("climb") is not None
+                     or rc["at_wall"] is not None) for rc in self.redcoats))
+            kind = "pour"
+        elif p["at"] == "spent" and self.calm():
+            side, kind = p["side"], "fetch"
+        else:
+            return
+        i = self._pot_carrier(p["x"])
+        if i is not None:
+            self._start_carry(i, kind, side)
+
+    def _start_carry(self, i, kind, side):
+        m, p = self.men[i], self.pot
+        p["task"] = {"kind": kind, "i": i, "side": side}
+        if i == 2:
+            x, face = self.walker_x()
+            m.update(mode="carry", leg="to", x=x, face=face, t0=self.phase,
+                     up=None, kind=kind, side=side)
+        else:
+            on = m["mode"] == "pot"
+            m.update(mode="carry", leg="to" if on else "down",
+                     x=m["x"] if on else self._end_x(i),
+                     h=m["h"] if on else 0.0, t0=self.phase, up=None,
+                     kind=kind, side=side, caught=m.get("caught", False),
+                     face=m.get("face", 1 if i == 0 else -1))
+            self.drill_start[i] = None
+
+    def _finish_carry(self, i):
+        """He has put the pot down, or turned from it: back to the pot's
+        seat if it is calm, to his round or his tower if not."""
+        m, p = self.men[i], self.pot
+        p["task"] = None
+        if i == 2:
+            if self.calm():
+                self._to_pot(2, "rest")
+            else:
+                self._home_post(2)
+        else:
+            m.update(mode="pot", leg="to" if self.calm() else "back",
+                     why="rest", feed=None, t0=self.phase)
+
+    def _scald(self, side):
+        """The stew goes down the outside of the wall: everyone on that
+        side's ladder and at the wall's foot is scalded dead. A redcoat
+        already on the walk is not caught by it."""
+        for rc in self.redcoats:
+            if rc["side"] == side and rc["hit"] is None and (
+                    rc.get("climb") is not None
+                    or rc["at_wall"] is not None):
+                rc.update(hit=self.phase, hp=0, scalded=True)
+                self.tally["scalded"] += 1
+
+    def _pot_carry(self, i, m, dt):
+        """Man i with the pot: to it, up with it, along the walk, and
+        either tipping it over the wall or setting it back on its fire."""
+        p, pace, leg = self.pot, self.pace(i), m["leg"]
+        side, kind = m["side"], m["kind"]
+        if i != 2:
+            self.tally["off_s"] += dt
+        if leg == "down":
+            m["h"] = min(1.0, m["h"] + dt * pace / self.DOWN_S)
+            if m["h"] >= 1.0:
+                m["leg"] = "to"
+        elif leg == "to":
+            if (kind == "pour" and not self.desperate(side)) \
+                    or (kind == "fetch" and self.calm_since is None):
+                self._finish_carry(i)       # it is over, or it has begun
+                return
+            step = dt * pace / self.RUN_X_S
+            left = p["x"] - m["x"]
+            m["x"] += max(-step, min(step, left))
+            m["face"] = 1 if left > 0 else -1 if left < 0 else m["face"]
+            if abs(p["x"] - m["x"]) < 1e-9:
+                m.update(leg="lift", t0=self.phase)
+        elif leg == "lift":
+            if self.phase - m["t0"] >= self.LIFT_S / pace:
+                p["at"] = "carried"
+                m["leg"] = "bear"
+        elif leg == "bear":
+            goal = self.LADDER_X[side] if kind == "pour" else self.POT_X
+            step = dt * pace / self.CARRY_S
+            left = goal - m["x"]
+            m["x"] += max(-step, min(step, left))
+            m["face"] = 1 if left > 0 else -1 if left < 0 else m["face"]
+            p["x"] = m["x"]
+            if abs(goal - m["x"]) < 1e-9:
+                m.update(leg="tip" if kind == "pour" else "set",
+                         t0=self.phase, tipped=False)
+                if kind == "pour":
+                    m["face"] = -1 if side == 0 else 1
+        elif leg == "tip":
+            t = (self.phase - m["t0"]) * pace
+            if t >= self.TIP_AT and not m["tipped"]:
+                m["tipped"] = True
+                self.tally["pours"] += 1
+                p.update(stew=0.0, heat=0.0)
+                self._scald(side)
+            if t >= self.TIP_S:
+                p.update(at="spent", side=side, x=m["x"])
+                self._finish_carry(i)
+        elif leg == "set":
+            if self.phase - m["t0"] >= self.SET_S / pace:
+                p.update(at="fire", x=self.POT_X)
+                self._finish_carry(i)
+
+    def pour_t(self):
+        """Seconds into the tip of the pot, or -1; and the side it is over."""
+        for m in self.men:
+            if m["mode"] == "carry" and m["leg"] == "tip":
+                return (self.phase - m["t0"]) * self.pace(
+                    self.men.index(m)), m["side"]
+        return -1.0, None
 
     # -- the gun ----------------------------------------------------------
 
@@ -3394,7 +3581,7 @@ class Siege:
         self.tally["guns"] += 1
         m = self.men[2]
         if m["mode"] in ("gun", "patrol", "eat", "shove_run", "to_wall",
-                         "shove", "to_roof", "roof", "retake"):
+                         "shove", "to_roof", "roof", "retake", "pot"):
             x, face = self.walker_x()
             m.update(mode="driven", x=x, face=face, up=None,
                      goal=float(st["side"] == 0), t0=self.phase)
@@ -6607,7 +6794,11 @@ class CpuView(Gtk.DrawingArea):
                 self._redcoat(cr, x, feet, size, facing, step, fall, pound,
                               rc["n"] * 1.3, crouch=max(cover, kneel),
                               aim=aim, shot=shot, elev=elev)
-            if not alive:
+            if not alive and rc.get("scalded"):
+                # No blood: the steam of it.
+                self._steam_cloud(cr, x, feet, size,
+                                  self.siege.phase - rc["hit"], rc["n"] * 0.3)
+            elif not alive:
                 # The man bleeds, whether rider, gunner or foot.
                 bx = x - facing * size * 0.55 if kind == "cannon" else x
                 chest = 0.75 if kind == "horse" else 0.6
@@ -6714,6 +6905,8 @@ class CpuView(Gtk.DrawingArea):
             self._redcoat(cr, x, y, self.redcoat_s, inward,
                           math.sin(self.phase * 5.0 + rc["n"]) * 0.4
                           if alive else 0.0, fall)
+            if rc.get("scalded"):
+                self._steam_cloud(cr, x, y, self.redcoat_s, e, rc["n"] * 0.3)
 
     def _draw_shover(self, cr, i, x, feet, size, facing):
         """Man i with the butt of his rifle against the ladder's top,
@@ -6835,6 +7028,12 @@ class CpuView(Gtk.DrawingArea):
                 continue
             if mode == "shove":
                 self._draw_shover(cr, i, tx, floor, s, outward)
+                continue
+            if mode == "carry":
+                x0_, x1_ = walk
+                self._draw_carrier(cr, i, x0_ + (x1_ - x0_)
+                                   * self.siege.men[i]["x"], floor, walk_y,
+                                   s * 0.92, towers)
                 continue
             if mode == "pot":
                 x0_, x1_ = walk
@@ -6981,6 +7180,8 @@ class CpuView(Gtk.DrawingArea):
         elif wm not in ("patrol", "eat"):
             if wm == "pot":
                 self._draw_pot_man(cr, 2, patrol, floor, walk_y, ws, towers)
+            elif wm == "carry":
+                self._draw_carrier(cr, 2, patrol, floor, walk_y, ws, towers)
             elif wm == "gun":
                 self._draw_gunner(cr, patrol, walk_y, ws, facing_now)
             elif wm in ("driven", "retake", "to_roof", "roof", "brawl"):
@@ -7152,6 +7353,117 @@ class CpuView(Gtk.DrawingArea):
                        py - r * 1.2 - u * s * 0.8,
                        s * (0.07 + 0.1 * u), 0, 2 * math.pi)
                 cr.fill()
+
+    def _draw_carrier(self, cr, i, x, floor, walk_y, ws, towers):
+        """Man i with the pot: to it, lifting it, bearing it along the walk
+        in his arms, tipping it over the wall, or setting it on its fire."""
+        siege = self.siege
+        m = siege.men[i]
+        leg, face, pot = m["leg"], m["face"], siege.pot
+        y = walk_y
+        if i != 2:
+            y = floor + (walk_y - floor) * m["h"]
+            if leg == "down":
+                x = towers[i]
+        t = (siege.phase - m["t0"]) * siege.pace(i)
+        walking = leg in ("to", "bear")
+        step = math.sin(self.phase * (6.0 if leg == "bear" else 9.0)) \
+            * (0.3 if leg == "bear" else 0.5) if walking \
+            else math.sin(m["h"] * 40) * 0.5 if leg == "down" else 0.0
+        kneel = 0.0
+        tilt = 0.0
+        lift = 0.0
+        if leg == "lift":
+            kneel = 0.6 * self._ramp(t, 0.0, 0.3) \
+                - 0.6 * self._ramp(t, Siege.LIFT_S - 0.3, Siege.LIFT_S)
+        elif leg == "set":
+            kneel = 0.6 * self._ramp(t, 0.0, 0.3) \
+                - 0.6 * self._ramp(t, Siege.SET_S - 0.3, Siege.SET_S)
+        elif leg == "tip":
+            kneel = 0.25
+            u = self._ramp(t, 0.0, Siege.TIP_AT) \
+                - self._ramp(t, Siege.TIP_S - 0.5, Siege.TIP_S)
+            tilt = face * 1.9 * u
+            lift = u
+        if leg == "down":
+            face = 1 if i == 0 else -1
+        self._mountain_man(cr, x, y, ws, face, step=step, kneel=kneel)
+        held = pot["at"] == "carried" and leg in ("bear", "tip")
+        if held or leg in ("lift", "set"):
+            sz = ws * 0.62
+            px = x + face * ws * (0.34 + 0.16 * lift)
+            py = y - ws * (0.3 + 0.35 * lift - 0.18 * kneel)
+            if leg in ("lift", "set"):
+                # Hanging at the fire as it is lifted or set down.
+                k = self._ramp(t, 0.0, Siege.LIFT_S) if leg == "lift" \
+                    else 1.0 - self._ramp(t, 0.0, Siege.SET_S)
+                py = y - ws * 0.35 - ws * 0.05 * k
+            self._stew_pot(cr, px, py, sz, pot["heat"], pot["stew"],
+                           tilt=tilt, fire=False)
+            if leg == "tip" and t >= Siege.TIP_AT * 0.6:
+                self._draw_stew_sheet(cr, m["side"], (px + face * sz * 0.25,
+                                                      py - sz * 0.55), t)
+
+    def _draw_stew_sheet(self, cr, side, lip, t):
+        """The stew pouring from the pot's lip down the outside of the wall
+        to the grass, steaming, and thinning away."""
+        geo = self.fort_geo
+        if geo is None:
+            return
+        out = -1 if side == 0 else 1
+        wall = geo["wall"]
+        outer = geo["X"] if side == 0 else geo["X"] + geo["W"]
+        (bx, by), _ = self._ladder_ends(side)
+        e = t - Siege.TIP_AT * 0.6
+        reach = self._ramp(e, 0.0, 0.7)
+        fade = 1.0 - self._ramp(e, 1.8, 2.8)
+        if reach <= 0 or fade <= 0:
+            return
+        top = lip[1]
+        bottom = top + (by - top) * reach
+        sx0, sx1 = lip[0], outer + out * wall * 1.0
+        cr.save()
+        # A broad sheet of stew, brown with paler streaks down it, falling
+        # from the lip in an arc and then straight down the wall.
+        for w, rgb, a in ((1.4, STEW_RGB, 0.8), (0.8, STEW_HI_RGB, 0.75),
+                          (0.3, KIT_RGB, 0.8)):
+            half = wall * w * 0.5
+            mid = top + (bottom - top) * 0.12
+            cr.move_to(sx0 - half * 0.3, top)
+            cr.curve_to(sx0 + (sx1 - sx0) * 0.7, top, sx1 - half * 0.5, mid,
+                        sx1 - half, mid + (bottom - mid) * 0.2)
+            cr.line_to(sx1 - half, bottom)
+            cr.line_to(sx1 + half, bottom)
+            cr.line_to(sx1 + half, mid + (bottom - mid) * 0.2)
+            cr.curve_to(sx1 + half * 0.5, mid, sx0 + (sx1 - sx0) * 0.7,
+                        top + half * 0.8, sx0 + half * 0.3, top)
+            cr.close_path()
+            cr.set_source_rgba(*rgb, a * fade)
+            cr.fill()
+        # Steam off all of it, and where it lands.
+        cr.set_source_rgba(*SMOKE_RGB, 0.5 * fade)
+        for k in range(10):
+            u = (self.phase * 0.7 + k * 0.1) % 1.0
+            yy = top + (bottom - top) * ((k * 0.37) % 1.0)
+            xx = sx1 + out * wall * (0.2 + 0.7 * u) + math.sin(
+                self.phase * 3 + k) * wall * 0.1
+            cr.set_source_rgba(*SMOKE_RGB, 0.5 * fade * (1 - u))
+            cr.arc(xx, yy - u * wall * 1.2, wall * (0.18 + 0.3 * u), 0,
+                   2 * math.pi)
+            cr.fill()
+        cr.restore()
+
+    def _steam_cloud(self, cr, x, feet, size, e, seed):
+        """A scalded man's last of the steam, e seconds after."""
+        if e >= 2.6:
+            return
+        for k in range(5):
+            u = ((e * 0.5 + k * 0.2 + seed) % 1.0)
+            cr.set_source_rgba(*SMOKE_RGB, 0.55 * (1 - e / 2.6) * (1 - u))
+            cr.arc(x + math.sin(e * 3 + k * 1.9 + seed) * size * 0.25,
+                   feet - size * (0.2 + 0.9 * u),
+                   size * (0.12 + 0.18 * u), 0, 2 * math.pi)
+            cr.fill()
 
     def _draw_pot(self, cr, walk, walk_y, ws):
         """The pot over its fire where it hangs, or off the fire in a
@@ -12053,6 +12365,66 @@ def _stage_bears_on_the_trail():
     return stage
 
 
+def _stage_pour():
+    """The walker tipping the pot over the wall, redcoats scalded at its
+    foot and others still on the ladder below."""
+    def stage(siege):
+        siege.drill_start = [None, None]
+        siege.ladder.update(side=0, state="standing", ext=1.0)
+        siege.wall[0] = 0.4
+        for u in (0.3, 0.62):
+            pass
+        low = _at_the_foot(siege, "foot", 0, 0)
+        low.update(climb=siege.phase - 0.3 * Siege.CLIMB_UP_S, hp=99)
+        for slot in (0, 1):
+            rc = _at_the_foot(siege, "foot", 0, slot)
+            rc.update(hit=siege.phase - 0.25, hp=0, scalded=True)
+        high = _foe(siege, "foot", 0.75, 0)
+        high.update(climb=siege.phase - 0.62 * Siege.CLIMB_UP_S, hp=99,
+                    at_wall=siege.phase, slot=2)
+        siege.men[2].update(mode="carry", leg="tip", x=Siege.LADDER_X[0],
+                            face=-1, t0=siege.phase - 1.2, up=None,
+                            kind="pour", side=0, tipped=True)
+        siege.pot.update(at="carried", x=Siege.LADDER_X[0], task={
+            "kind": "pour", "i": 2, "side": 0}, stew=0.0, heat=0.0)
+    return stage
+
+
+def _stage_pot_spent():
+    """The pot lying empty at the wall top, its fire low, in the calm."""
+    def stage(siege):
+        siege.pot.update(at="spent", side=1, x=Siege.LADDER_X[1], stew=0.0,
+                         heat=0.0)
+    return stage
+
+
+def _stage_pot_carried():
+    """The walker bearing the pot along the walk to a wall."""
+    def stage(siege):
+        siege.men[2].update(mode="carry", leg="bear", x=0.4, face=-1,
+                            t0=siege.phase, up=None, kind="pour", side=0)
+        siege.pot.update(at="carried", x=0.4, task={
+            "kind": "pour", "i": 2, "side": 0})
+    return stage
+
+
+def _stage_sentries_to_pot():
+    """The calm: one sentry coming down off his tower, the other on his
+    way back up."""
+    def stage(siege):
+        siege.drill_start = [None, None]
+        siege.men[0].update(mode="pot", leg="down", x=0.0, h=0.5,
+                            why="rest", t0=siege.phase, up=None, feed=None,
+                            caught=False, face=1)
+        siege.men[1].update(mode="pot", leg="back", x=0.8, h=1.0,
+                            why="rest", t0=siege.phase, up=None, feed=None,
+                            caught=False, face=1)
+        siege.men[2].update(mode="pot", leg="sit", x=siege.seat_x(2),
+                            face=1, why="rest", t0=siege.phase - 5, up=None,
+                            feed="stew")
+    return stage
+
+
 def _stage_mother_by_walker():
     def stage(siege):
         mother = _bears_up(siege, 0, 0)[0]
@@ -12115,6 +12487,10 @@ SIEGE_PICTURES = (
     ("bears-waiting-at-the-woods-edge", _stage_bears_waiting()),
     ("bears-mauling-at-the-foot", _stage_bears_at_the_foot()),
     ("bears-mauling-on-the-trail", _stage_bears_on_the_trail()),
+    ("pot-poured-over-the-wall", _stage_pour()),
+    ("pot-carried-along-the-walk", _stage_pot_carried()),
+    ("pot-left-empty-at-the-wall", _stage_pot_spent()),
+    ("sentries-down-to-the-pot", _stage_sentries_to_pot()),
     ("mother-bear-by-the-walker", _stage_mother_by_walker(), (0.58, 0.52, 2.0)),
     ("yard-redcoats-battering", _stage_yard()),
     ("yard-redcoats-dropping", _stage_yard(dropping=True)),
@@ -12959,6 +13335,111 @@ def siege_tests(view, cr):
     assert siege.men[2]["mode"] in ("patrol", "gun", "eat"), siege.men[2]
     assert siege.tally["off_caught"] >= 1 or foe["hit"] is not None
     assert _until(siege, lambda: all(m["mode"] != "pot" for m in siege.men), 12)
+
+    # THINGS ARE REALLY DESPERATE: redcoats on the ladder near the top, or
+    # stepping onto the walk, and the gun taken, the wall breached, or a
+    # crowd at the wall's foot. One place defines it.
+    siege = _quiet_siege()
+    siege.ladder.update(side=0, state="standing", ext=1.0)
+    assert not siege.desperate(0)
+    top = _at_the_foot(siege, "foot", 0, 0)
+    top.update(climb=siege.phase - 0.7 * Siege.CLIMB_UP_S, hp=99)
+    assert not siege.desperate(0), "on its own, near the top is not enough"
+    siege.gun["taken"] = True
+    assert siege.desperate(0) and not siege.desperate(1), "the gun taken"
+    siege.gun["taken"] = False
+    siege.wall[0] = 0.0
+    assert siege.desperate(0), "the wall breached"
+    siege.wall[0] = 1.0
+    for k in range(1, Siege.CROWD):
+        _at_the_foot(siege, "foot", 0, k)
+    assert siege.desperate(0), "a crowd at the foot"
+    top["climb"] = siege.phase - 0.2 * Siege.CLIMB_UP_S
+    assert not siege.desperate(0), "not near the top"
+    siege.redcoats = []
+    siege.wall[1] = 0.0
+    assert not siege.desperate(1)
+    st = _on_the_walk(siege, 1, 0.9)
+    assert siege.desperate(1), "stepping onto the walk, the wall breached"
+    st["since"] -= Siege.STEP_S
+    assert not siege.desperate(1), "no longer stepping"
+
+    # The pot is poured: the nearest man leaves what he is at, takes it off
+    # its fire, carries it to that wall top and tips it over. Everyone on
+    # that side's ladder and at the wall's foot is scalded, with steam and
+    # no blood; a redcoat already on the walk is not; the other side is
+    # untouched. Then the pot lies empty, and cold.
+    siege = _quiet_siege(2)
+    siege.ladder.update(side=0, state="standing", ext=1.0)
+    foot = [_at_the_foot(siege, "foot", 0, k) for k in range(Siege.CROWD)]
+    elsewhere = _at_the_foot(siege, "foot", 1, 0)
+    on_ladder = foot[0]
+    on_ladder.update(climb=siege.phase - 0.15 * Siege.CLIMB_UP_S)
+    walking = _on_the_walk(siege, 0, 0.3)
+    for rc in foot + [elsewhere, walking]:
+        rc["hp"] = 99
+    siege.wall[0] = 1.0
+    assert siege.pot_ready() and siege.pot["stew"] == 1.0
+    assert _until(siege, lambda: siege.men[2]["mode"] == "carry"
+                  or siege.pot["task"], 12)
+    assert not siege.pot_ready() or siege.pot["task"], "off its fire"
+    assert _until(siege, lambda: siege.tally["pours"] == 1, 30)
+    scalded = [rc for rc in foot if rc.get("scalded")]
+    assert any(rc.get("climb") is not None for rc in scalded) \
+        and len(scalded) >= 2, "on the ladder and at the foot"
+    assert on_ladder in siege.stormers, "the first was already up: not caught"
+    assert elsewhere["hit"] is None and not walking.get("scalded")
+    assert all(rc["hp"] == 0 for rc in scalded) \
+        and siege.tally["scalded"] == len(scalded)
+    assert siege.pot["stew"] == 0.0 and siege.pot["heat"] == 0.0
+    assert _until(siege, lambda: siege.pot["at"] == "spent", 5)
+    assert siege.pot["x"] == Siege.LADDER_X[0] and not siege.pot_ready()
+    # The price is supper: nobody eats stew, but only from the pack, until
+    # a calm, when the pot is carried back, refilled and brought to the boil.
+    siege.redcoats = []
+    for m in siege.men:
+        m["hunger"] = 0.8
+    siege.stormers = []
+    siege.run(Siege.QUIET_S + 30)
+    assert siege.pot["at"] == "spent" and not any(
+        siege.pot_eating(i) for i in range(3)), "no calm: nobody fetches it"
+    siege.boats_in_sight = False
+    assert _until(siege, lambda: siege.pot["at"] == "fire", 40), siege.pot
+    assert siege.pot["x"] == Siege.POT_X and siege.pot["task"] is None
+    assert not siege.pot_ready() and siege.pot["stew"] < 0.5
+    assert _until(siege, lambda: siege.pot_ready(), 120)
+
+    # A cold or an empty pot is not poured; with no stew, nothing happens.
+    for heat, stew in ((0.5, 1.0), (1.0, 0.1)):
+        siege = _quiet_siege(2)
+        siege.pot.update(heat=heat, stew=stew)
+        siege.ladder.update(side=0, state="standing", ext=1.0)
+        siege.gun["taken"] = True
+        top = _at_the_foot(siege, "foot", 0, 0)
+        top.update(climb=siege.phase - 0.7 * Siege.CLIMB_UP_S, hp=99)
+        siege.run(12)
+        assert not siege.tally["pours"] and siege.pot["at"] == "fire"
+    # With the walker out in the woods, a tower sentry brings it: down off
+    # his tower first.
+    siege = _quiet_siege(2)
+    siege.ladder.update(side=1, state="standing", ext=1.0)
+    walker = _walker_out(siege, "hide", 1)
+    walker.update(g=2.0, rock=2, shot_t=None, pinned=[], next_shot=1e9,
+                  t0=siege.phase + 99)
+    siege.gun["taken"] = True
+    top = _at_the_foot(siege, "foot", 1, 0)
+    top.update(climb=siege.phase - 0.6 * Siege.CLIMB_UP_S, hp=99)
+    foot_man = _at_the_foot(siege, "foot", 1, 1)
+    foot_man["hp"] = 99
+    siege.run(0.1)
+    assert siege.pot["task"] and siege.pot["task"]["i"] in (0, 1)
+    carrier = siege.men[siege.pot["task"]["i"]]
+    assert carrier["mode"] == "carry"
+    assert _until(siege, lambda: siege.tally["pours"] == 1, 30)
+    assert _until(siege, lambda: carrier["mode"] == "pot"
+                  and carrier["leg"] in ("back", "up")
+                  or carrier["mode"] == "post", 8)
+    assert siege.tally["scalded"] >= 1 and foot_man.get("scalded")
 
     # A man at his meal, drawn: in the calm, all three round the pot, the
     # sentries on their way down off the towers and up again.
