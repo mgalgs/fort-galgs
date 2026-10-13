@@ -2675,7 +2675,7 @@ class Siege:
             rc["hit"] = self.phase
             self.tally["shot"] += 1
 
-    def _advance_drivers(self):
+    def _advance_drivers(self, dt):
         """A redcoat near his rock may leave the trail to drive him off:
         he kneels and fires at the rock, and keeps on while the man is
         there, until he has fallen back or the redcoat is shot."""
@@ -2693,7 +2693,7 @@ class Siege:
                         and rc["kind"] == "foot" and rc["at_wall"] is None \
                         and rc.get("hid") is None and not rc.get("drive") \
                         and abs(self.ground_g(rc) - k) <= self.DRIVE_RANGE \
-                        and self.rng.random() < self.DRIVE_CHANCE / 30.0:
+                        and self.rng.random() < self.DRIVE_CHANCE * dt:
                     rc["drive"] = {"t0": self.phase + self.rng.random(),
                                    "born": self.phase, "rock": k,
                                    "fired": False}
@@ -2750,7 +2750,7 @@ class Siege:
                 self._advance_ground(i, dt)
             if self.out(i):
                 self.tally["out_s"] += dt
-        self._advance_drivers()
+        self._advance_drivers(dt)
         self._advance_shoves(dt, walker_busy)
         if not self.has_walker:
             # No room on the wall for him: the sentry on a damaged side
@@ -11317,7 +11317,7 @@ def siege_report(minutes, seed=1, out=None, pressure="normal"):
 # each thing happens at least so often: (what, test on a run's tally).
 SIEGE_CLAIMS = (
     ("a wall damaged, then mended, more than once",
-     lambda t: t["repairs"] >= 2 and sum(t["mended"]) > 0),
+     lambda t: t["repairs_done"] >= 2),
     ("a wall breached", lambda t: t["breaches"] >= 1),
     ("walker caught outside", lambda t: t["caught"] >= 1),
     ("... and driven back past the first rock",
