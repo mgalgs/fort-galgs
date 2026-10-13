@@ -1960,8 +1960,14 @@ class Siege:
     on the wall for him to walk), and, as arguments, whether he is busy
     shooting at a boat. In return it takes men stepping ashore from a boat
     (land) and lets the view run the boats in the middle of a frame (the
-    afloat hook of advance). Randomness is the seeded rng, so far unused:
-    today's siege runs on fixed cycles.
+    afloat hook of advance). Randomness is the seeded rng: a man's stride,
+    the blast of the gun, a bear's blow, a bayonet's wound.
+
+    A siege can go on past the wall. A redcoat who gets up on the wall walk
+    (by the ladder, or through a breach) stands against the fort's gun; if
+    he gets to it with the gun not ready, he takes it, and hacks at a tower
+    roof, and through it drops into the yard to batter the cores, which is
+    a picture and no more. It is the bears that stop him: see rouse_bears.
     """
 
     MARCH_FAR = 6.0     # a new redcoat is this many times farther than...
@@ -2091,7 +2097,8 @@ class Siege:
     # advance on the gun, and a man who reaches it, with the gun not ready
     # to fire, takes it.
     TOP_MAX = 3         # most stormers on one side's wall walk at once
-    THROUGH_S = 2.0     # a redcoat at a gap goes through after this long
+    THROUGH_S = 2.0     # a redcoat at a gap goes through after this long...
+    GAP_S = 4.0         # ...and no sooner than this after the last man did
     STORM_S = 20.0      # a stormer crosses the whole wall walk in this
     FIRE_RANGE = 0.3    # along the walk, how far in front of it the gun reaches
     AIM_S = 0.8         # from the walker sighting along the walk to the shot
@@ -2101,6 +2108,7 @@ class Siege:
     STATION_DX = 0.035  # he stands this far behind the gun
     STAND_S = 2.0       # he keeps to his gun this long with nobody left
     TAKE_X = 0.04       # a stormer this near the gun lays hands on it
+    SEIZE_S = 4.5       # a man at the gun takes this long to wrest it away
     RETAKE_S = 3.0      # to take back a gun, once the walk is his again
 
     # The tower roof. With the gun taken, the stormers go to the blockhouse
@@ -2128,8 +2136,8 @@ class Siege:
     # four layers: the ground, the wall's face, the walk, the yard; and
     # means to attack, to withdraw wounded, or to leave when it is clear.
     BEAR_FAR_G = (3.2, 5.0)
-    BEAR_RUN_G_S = 1.2  # rock distances a second, flat out
-    BEAR_CLIMB_S = 3.0
+    BEAR_RUN_G_S = 2.2  # rock distances a second, flat out
+    BEAR_CLIMB_S = 1.8
     BEAR_WALK_S = 6.0   # to cross the whole wall walk
     BEAR_YARD_S = 5.0   # and the width of the yard
     BEAR_REACH = 0.06   # along the walk; in the yard, in u, twice this
@@ -2139,7 +2147,7 @@ class Siege:
     BAYONET_RATE = 0.25 # a redcoat in reach wounds a bear this often a second
     WOUNDS = (3, 5)     # a follower withdraws with this many, the mother
     WALKER_KILL = 0.2   # per second a man of the fort at a stormer in reach
-    BEAR_REST_S = 8.0   # before the woods will send them again
+    BEAR_REST_S = 0.5   # before the woods will send them again
     BY_WALKER_S = 3.0   # the mother stops by the walker this long...
     BY_WALKER_DX = 0.2  # ...this far along the walk from him
     DRILL_LEN = 4.6     # from kneeling to the last of the smoke
@@ -2174,6 +2182,7 @@ class Siege:
         self.wall = [1.0, 1.0]            # each side wall's strength, 0..1
         self.roof = [1.0, 1.0]            # each tower roof's, likewise
         self.quiet_since = None           # phase the last redcoat left range
+        self.trail_quiet_since = None     # the same, of those on the trails
         self.men = [self._new_man("post"), self._new_man("post"),
                     self._new_man("patrol")]
         self.patrol_u = 0.0               # the walker's patrol, 0..2
@@ -2184,6 +2193,7 @@ class Siege:
                        "raised": 0.0}
         self.rock_chip = [[None] * 4 for _ in (0, 1)]  # phase each was hit
         self.stormers = []                # redcoats on the wall walk, or past
+        self.gap_at = [-1e9, -1e9]        # phase a man last went through each gap
         self.tiles = [(u, v) for v in (0.3, 0.75) for u in (0.2, 0.5, 0.8)]
         self.dents = {}                   # tile -> how battered, 0..1
         self.valley_bears = 2             # as many as the view's world holds
@@ -2208,7 +2218,8 @@ class Siege:
                       "roof_holes": 0, "yard": 0, "batter_s": 0.0,
                       "bear_trips": 0, "bear_out": 0, "bear_wall": 0,
                       "bear_lag_s": 0.0, "bear_kills": 0,
-                      "bear_withdrawn": 0, "walker_kills": 0}
+                      "bear_withdrawn": 0, "walker_kills": 0,
+                      "bear_inflight": 0}
 
     def vary(self, spread):
         """A factor near 1, up to spread either side of it: the siege's
@@ -2359,8 +2370,11 @@ class Siege:
             self._step_onto(rc)
 
     def _room_on_top(self, side):
+        """There is room for one more to step up onto side's wall walk: not
+        crowded, and no bear on the wall for him to meet there."""
         return sum(1 for st in self.stormers if st["side"] == side
-                   and st["hit"] is None) < self.TOP_MAX
+                   and st["hit"] is None) < self.TOP_MAX \
+            and not self.bears_on("walk", "yard")
 
     def _step_onto(self, rc):
         """A redcoat steps up onto the wall walk at his side's end of it:
@@ -2501,11 +2515,21 @@ class Siege:
 
     # -- lulls, hunger and meals --------------------------------------------
 
-    def in_range(self):
-        """Some redcoat is close to a wall: within the sentries' range."""
+    def trail_in_range(self):
+        """Some redcoat on a trail is close to a wall."""
         return any(rc["hit"] is None and self.trail_p(rc["d"]) >= self.CLOSE_P
-                   for rc in self.redcoats) or bool(self.stormers_on()) \
-            or bool(self.bears)
+                   for rc in self.redcoats)
+
+    def in_range(self):
+        """Some redcoat is close to a wall: within the sentries' range, or
+        up on it."""
+        return self.trail_in_range() or bool(self.stormers_on())
+
+    def trail_quiet(self):
+        """No redcoat has been close to a wall for QUIET_S seconds, as far
+        as the trails go; the bears watch for this before they go."""
+        return self.trail_quiet_since is not None and self.phase \
+            - self.trail_quiet_since >= self.QUIET_S
 
     def lull(self, seconds=None):
         """THE LULL: no redcoat close to either wall for QUIET_S seconds.
@@ -2872,6 +2896,10 @@ class Siege:
             self.quiet_since = None
         elif self.quiet_since is None:
             self.quiet_since = self.phase
+        if self.trail_in_range():
+            self.trail_quiet_since = None
+        elif self.trail_quiet_since is None:
+            self.trail_quiet_since = self.phase
         for m in self.men:
             if m["mode"] != "eat":
                 m["hunger"] = min(1.0, m["hunger"] + dt / (
@@ -3089,6 +3117,10 @@ class Siege:
                             if abs(o["x"] - self.gun_at) <= self.FIRE_RANGE
                             and (o["x"] - self.gun_at) * face >= 0],
                            self.pace(2))
+            return
+        if st.get("at_gun") is None:
+            st["at_gun"] = self.phase
+        if self.phase - st["at_gun"] < self.SEIZE_S:
             return
         self.gun.update(taken=True, aim=None)
         self.tally["guns"] += 1
@@ -3321,8 +3353,8 @@ class Siege:
 
     def _bear_step(self, b, dt):
         layer = b["layer"]
-        if b["intent"] in ("greet", "leave") and layer in ("walk", "yard") \
-                and self.stormers_on() and not b["maul"]:
+        if b["intent"] in ("greet", "leave") and not b["maul"] \
+                and self.stormers_on():
             b.update(intent="attack", by=None)     # more of them: back to it
         if self._wounded_enough(b):
             b["intent"] = "withdraw"
@@ -3333,10 +3365,14 @@ class Siege:
             if b["intent"] == "attack":
                 b["g"] -= self.BEAR_RUN_G_S * dt
                 if b["g"] <= 0.0:
-                    live = [st for st in self.stormers_on()]
-                    sides = [sum(st["side"] == k for st in live)
-                             for k in (0, 1)]
-                    if live and sides[1 - b["side"]] > sides[b["side"]]:
+                    # To the wall that needs it most: the most redcoats up
+                    # there for each bear already on it.
+                    need = [sum(st["side"] == k for st in
+                                self.stormers_on()) / (1 + sum(
+                                    o["side"] == k and o["layer"] != "ground"
+                                    for o in self.bears if o is not b))
+                            for k in (0, 1)]
+                    if need[1 - b["side"]] > need[b["side"]]:
                         b["side"] = 1 - b["side"]
                     b.update(layer="wall", g=0.0, u=0.0)
             else:
@@ -3425,7 +3461,15 @@ class Siege:
                     b.update(layer="yard", u=0.02 if side == 0 else 0.98,
                              v=0.0)
                 return
-            b["intent"] = "greet" if b["mother"] else "leave"
+            if self.trail_quiet():
+                b["intent"] = "greet" if b["mother"] else "leave"
+            else:
+                # Redcoats still at the wall: it is no time to go. It keeps
+                # watch at the end of the walk they would come up by.
+                end = self._end_x(side)
+                b["x"] += max(-step, min(step, end - x))
+                b["face"] = -1 if side == 0 else 1
+                return
         if b["intent"] == "greet":
             wx = self.walker_x()[0]
             stand = min(1.0, max(0.0, wx + (-1 if side == 0 else 1)
@@ -3478,7 +3522,8 @@ class Siege:
                     b["v"] += gv / dist * min(step, dist)
                     b["face"] = 1 if gu > 0 else -1
                 return
-            b["intent"] = "greet" if b["mother"] else "leave"
+            if self.trail_quiet():
+                b["intent"] = "greet" if b["mother"] else "leave"
         # Back to the wall's end, and up to the walk.
         eu = 0.02 if b["side"] == 0 else 0.98
         gu, gv = eu - b["u"], 0.0 - b["v"]
@@ -3521,8 +3566,11 @@ class Siege:
         if rc["at_wall"] is None:
             return
         waited = self.phase - rc["at_wall"]
+        side = rc["side"]
         if waited >= self.THROUGH_S and rc["kind"] != "cannon" \
-                and self._room_on_top(rc["side"]):
+                and self.phase - self.gap_at[side] >= self.GAP_S \
+                and self._room_on_top(side):
+            self.gap_at[side] = self.phase
             self._step_onto(rc)
         elif waited >= self.BREACH_WAIT_S:
             rc["gone"] = True
@@ -11759,7 +11807,7 @@ def siege_tests(view, cr):
     assert not siege.bears_on("walk")
     assert _until(siege, lambda: siege.bears_on("walk"), 10)
     assert siege.tally["bear_wall"] == 1
-    assert 4 < siege.tally["bear_lag_s"] < 20, siege.tally["bear_lag_s"]
+    assert 2 < siege.tally["bear_lag_s"] < 12, siege.tally["bear_lag_s"]
     gone = []
     stopped = None
     for _ in range(180 * 30):
@@ -11783,6 +11831,30 @@ def siege_tests(view, cr):
     assert siege.men[2]["mode"] in ("retake", "driven", "patrol") \
         and siege.tally["guns"] == 0, "no gun was lost to them"
     assert _until(siege, lambda: not siege.gun["taken"], 30), "and he retakes it"
+    # While redcoats are still at the wall's foot they do not go: they keep
+    # watch at the end of the walk, and go when it has been quiet.
+    siege = _quiet_siege()
+    siege.bear_rest = 0.0
+    siege.has_walker = False
+    siege.valley_bears = 0
+    siege.men[2]["mode"] = "patrol"
+    a = _on_the_walk(siege, 0, 0.0)
+    watcher = _at_the_foot(siege, "cannon", 0, 0)
+    watcher["hp"] = 99
+    siege.wall = [1.0, 1.0]
+    mother = None
+    assert _until(siege, lambda: siege.bears and siege.bears[0]["layer"]
+                  == "walk", 15)
+    mother = siege.bears[0]
+    assert _until(siege, lambda: a["hit"] is not None, 20)
+    siege.run(Siege.QUIET_S + 6)
+    assert mother["layer"] == "walk" and mother["intent"] == "attack", \
+        "redcoats still at the foot: she keeps watch"
+    watcher["hit"] = siege.phase
+    assert _until(siege, lambda: mother["intent"] != "attack", 12), \
+        "and goes once it is quiet"
+    assert _until(siege, lambda: mother.get("gone"), 40)
+
     # A bear that takes enough bayonet wounds withdraws, wounded; the
     # mother does not leave with a redcoat in the yard.
     siege = _quiet_siege()
@@ -12684,6 +12756,18 @@ SIEGE_COLUMNS = (
     ("raises", 7, lambda t: t["raises"]),
     ("fell", 5, lambda t: t["fell"]),
     ("eating min", 11, lambda t: f"{t['eating_s'] / 60:.1f}"),
+    ("on top", 7, lambda t: t["top"]),
+    ("gun kills", 10, lambda t: t["gun_kills"]),
+    ("guns lost", 10, lambda t: t["guns"]),
+    ("roof %", 9, lambda t: _pair(t["roof_hurt"])),
+    ("roof mended %", 14, lambda t: _pair(t["roof_mended"])),
+    ("in yard", 8, lambda t: t["yard"]),
+    ("batter s", 9, lambda t: round(t["batter_s"])),
+    ("bears", 6, lambda t: t["bear_out"]),
+    ("bear kills", 11, lambda t: t["bear_kills"]),
+    ("withdrawn", 10, lambda t: t["bear_withdrawn"]),
+    ("1st bear s", 11, lambda t: f"{t['bear_lag_s'] / t['bear_wall']:.1f}"
+     if t["bear_wall"] else "-"),
 )
 
 
@@ -12732,6 +12816,12 @@ SIEGE_CLAIMS = (
      lambda t: t["caught"] >= 1 and t["retreats"] >= 1),
     ("redcoats climb the ladder", lambda t: t["climbs"] >= 1),
     ("a man eating", lambda t: t["eating_s"] > 0),
+    ("redcoats onto the wall top", lambda t: t["top"] >= 1),
+    ("every rousing brought a bear to the wall",
+     lambda t: t["bear_wall"] >= t["bear_trips"] - t["bear_inflight"]),
+    ("a gun overpowered", lambda t: t["guns"] >= 1),
+    ("a tower roof holed", lambda t: t["roof_holes"] >= 1),
+    ("redcoats battered a core", lambda t: t["batter_s"] > 0),
 )
 
 
@@ -12745,6 +12835,7 @@ def siege_seeds(minutes, seeds, pressure="normal", out=None):
         siege = Siege(seed)
         siege.flood = pressure == "flood"
         siege.run(60.0 * minutes)
+        siege.tally["bear_inflight"] = int(not siege.bear_firsts)
         tallies.append(siege.tally)
     print(f"{seeds} seeds x {minutes} minutes, {pressure}", file=out)
     for what, test in SIEGE_CLAIMS:
@@ -12756,7 +12847,8 @@ def siege_seeds(minutes, seeds, pressure="normal", out=None):
           f"rock in {driven} of them ({100 * driven // max(1, caught)}%)",
           file=out)
     for key in ("breaches", "caught", "driven", "climbs", "pushes",
-                "raises", "fell"):
+                "raises", "fell", "top", "guns", "roof_holes", "yard",
+                "bear_trips", "bear_kills", "bear_withdrawn"):
         print(f"  {key:>9}: " + " ".join(f"{t[key]:>3}" for t in tallies),
               file=out)
     return tallies
