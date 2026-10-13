@@ -3577,24 +3577,30 @@ class Siege:
             return
         pace, gx = self.pace(2), self.gun_at
         threats = self.stormers_on(mode="walk")
-        if not threats:
+        if threats:
+            m["clear"] = None
+            near = min(threats, key=lambda st: abs(st["x"] - gx))
+            face = 1 if near["x"] >= gx else -1
+        else:
             g["aim"] = None
             if m["clear"] is None:
                 m["clear"] = self.phase
             elif self.phase - m["clear"] >= self.STAND_S:
                 self._home_post(2)
-            return
-        m["clear"] = None
-        near = min(threats, key=lambda st: abs(st["x"] - gx))
-        face = 1 if near["x"] >= gx else -1
-        if m["station"] is None \
-                or (m["station"] - gx) * face > 0:   # he is in front of it
-            m["station"] = min(1.0, max(0.0, gx - face * self.STATION_DX))
+                return
+            face = g["facing"]
+        # His place is behind the gun as it is to point: when it is to turn
+        # to the other side he runs round behind it, and when a tower's call
+        # for it turned it without him he does not stand before its muzzle.
+        m["station"] = min(1.0, max(0.0, gx - face * self.STATION_DX))
         step = dt * pace / self.RUN_X_S
         left = m["station"] - m["x"]
         m["x"] += max(-step, min(step, left))
-        m["face"] = (1 if left > 0 else -1) if abs(left) > 1e-9 else g["facing"]
-        if abs(left) > 1e-9:
+        if abs(m["station"] - m["x"]) > 1e-9:
+            m["face"] = 1 if left > 0 else -1
+            return
+        m["face"] = face
+        if not threats:
             return
         if face != g["facing"]:
             g.update(facing=face, turned=self.phase, aim=None)
@@ -12307,6 +12313,23 @@ def _stage_storm(xs=(0.04, 0.14, 0.25), side=0, fired=None):
     return stage
 
 
+def _stage_storm_both(face):
+    """Redcoats coming along the walk from both sides, the gun turned on
+    the nearer of them, toward face, and the walker behind it."""
+    def stage(siege):
+        near, far = (0, 1) if face < 0 else (1, 0)
+        for x in (0.2, 0.3):
+            _on_the_walk(siege, near, x if near == 0 else 1.0 - x)
+        _on_the_walk(siege, far, 0.97 if far == 1 else 0.03)
+        gx = siege.gun_at
+        siege.men[2].update(mode="gun", x=gx - face * Siege.STATION_DX,
+                            face=face, t0=siege.phase, clear=None,
+                            station=gx - face * Siege.STATION_DX)
+        siege.gun.update(facing=face, turned=siege.phase - 1.0,
+                         aim=siege.phase - 0.5)
+    return stage
+
+
 def _stage_taken(side=0):
     """The gun taken, the walker fallen back to the far tower, redcoats
     along the walk and one on the tower's roof, the sentry given way."""
@@ -12538,6 +12561,8 @@ SIEGE_PICTURES = (
     ("sentry-shoving", _stage_ladder("standing", shove=0)),
     ("walk-redcoats-facing-gun", _stage_storm()),
     ("walk-gun-firing", _stage_storm(fired=0.15)),
+    ("walk-gun-turned-west-both-sides", _stage_storm_both(-1)),
+    ("walk-gun-turned-east-both-sides", _stage_storm_both(1)),
     ("walk-gun-taken", _stage_taken()),
     ("roof-hacked", _stage_roof(0.55)),
     ("roof-holed", _stage_roof(0.0)),
@@ -12988,6 +13013,31 @@ def siege_tests(view, cr):
     assert _until(siege, lambda: siege.gun["fired"] is not None, 40)
     assert siege.gun["facing"] == 1 and siege.gun["turned"] is None
     assert d["hit"] is not None, "taken from the east"
+    # With stormers coming up on both sides, he goes round behind the gun
+    # each time it turns: at his place, never before its muzzle.
+    siege = _quiet_siege()
+    _on_the_walk(siege, 0, 0.1)["hp"] = 99
+    _on_the_walk(siege, 1, 0.95)["hp"] = 99
+    m, gun, faced = siege.men[2], siege.gun, set()
+    for _ in range(int(20 * 30)):
+        siege.run(1 / 30)
+        if m["mode"] == "gun" and m["station"] is not None \
+                and abs(m["x"] - m["station"]) < 1e-9:
+            faced.add(gun["facing"])
+            assert (m["x"] - siege.gun_at) * gun["facing"] < 0, (m, gun)
+            assert m["face"] == gun["facing"]
+    assert faced == {-1, 1}, "turned to the one side and the other"
+    # Turned without him, by a tower's call, he goes behind it again,
+    # running, not in one jump.
+    siege.stormers = []
+    m.update(mode="gun", x=siege.gun_at - gun["facing"] * Siege.STATION_DX,
+             station=None, clear=siege.phase, face=gun["facing"])
+    gun["facing"] = -gun["facing"]
+    was = m["x"]
+    siege.run(1 / 30)
+    assert 0 < abs(m["x"] - was) < Siege.STATION_DX
+    assert _until(siege, lambda: abs(m["x"] - m["station"]) < 1e-9, 2)
+    assert (m["x"] - siege.gun_at) * gun["facing"] < 0
 
     # Men who reach the gun while it cannot be fired take it, and the
     # walker is driven back along the walk to the far tower, never killed.
