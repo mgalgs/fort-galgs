@@ -7370,43 +7370,122 @@ class CpuView(Gtk.DrawingArea):
             self._blast(cr, land, rt - Siege.FIRE_AT - Siege.FLIGHT_S)
 
     def _stew_pot(self, cr, x, y, s, heat, stew, tilt=0.0, fire=True):
-        """A black iron pot of stew on a tripod over a small fire, drawn
-        with its feet at (x, y), s tall in all; steam rises off it as it
-        comes to the boil. tilt turns the pot over on its side, to pour."""
-        t = self.phase
+        """A black iron pot of stew hanging from a tripod over a small
+        fire, the fire's foot at (x, y), the tripod s tall; steam rises off
+        the pot as it comes to the boil. With fire False, just the pot,
+        its foot at (x, y), s the size it would hang at; tilt turns it
+        over on its side, to pour."""
         if fire:
-            # Three legs and a few logs, and the flames between them.
-            cr.set_source_rgb(*SEAM_RGB)
-            cr.set_line_width(max(1.0, s * 0.045))
-            cr.set_line_cap(cairo.LINE_CAP_ROUND)
-            for dx in (-0.34, 0.0, 0.34):
-                cr.move_to(x + dx * s * 0.55, y)
-                cr.line_to(x, y - s * 0.62)
-                cr.stroke()
-            for dx, a in ((-0.2, 0.3), (0.2, -0.3)):
-                cr.save()
-                cr.translate(x + dx * s, y - s * 0.04)
-                cr.rotate(a)
-                self._rounded(cr, -s * 0.2, -s * 0.045, s * 0.4, s * 0.09,
-                              s * 0.04)
-                cr.set_source_rgb(*WOOD_RGB)
-                cr.fill()
-                cr.restore()
-            for k, (dx, h) in enumerate(((-0.1, 0.3), (0.06, 0.4),
-                                         (0.18, 0.22))):
-                flick = 0.75 + 0.25 * math.sin(t * 9.0 + k * 2.1)
-                fh = s * h * flick
-                cr.move_to(x + dx * s - s * 0.07, y - s * 0.04)
-                cr.curve_to(x + dx * s - s * 0.07, y - fh * 0.6,
-                            x + dx * s, y - fh * 0.5, x + dx * s, y - fh)
-                cr.curve_to(x + dx * s + s * 0.02, y - fh * 0.5,
-                            x + dx * s + s * 0.07, y - fh * 0.6,
-                            x + dx * s + s * 0.07, y - s * 0.04)
-                cr.close_path()
-                cr.set_source_rgb(*FLASH_RGB if k == 1 else FORT_RGB)
-                cr.fill()
-        # The pot hangs a little above the flames.
-        px, py = x, y - s * (0.6 if fire else 0.0)
+            self._stew_fire(cr, x, y, s)
+            self._tripod(cr, x, y, s)
+            hx, hy, ps, py = self._hang(x, y, s)
+            self._iron_pot(cr, hx, py, ps, heat, stew, tilt)
+            self._pot_hook(cr, hx, hy, s)
+        else:
+            self._iron_pot(cr, x, y, s, heat, stew, tilt)
+
+    POT_HANG = 0.8      # the pot's size against its tripod's
+
+    def _hang(self, x, y, s):
+        """Where a pot hangs from the tripod of size s over a fire at
+        (x, y): the hook's bend (x, y), the pot's size and its foot's y,
+        low over the flames."""
+        hy = y - s * 0.7
+        ps = s * self.POT_HANG
+        return x, hy, ps, hy + self._bail_drop(ps)
+
+    @staticmethod
+    def _bail_drop(s):
+        """From the top of the bail of a pot of size s down to its foot."""
+        return s * 0.27 * 2.0
+
+    def _stew_fire(self, cr, x, y, s):
+        """A few logs and the flames on them, under where the pot hangs."""
+        t = self.phase
+        for dx, a in ((-0.2, 0.3), (0.2, -0.3)):
+            cr.save()
+            cr.translate(x + dx * s, y - s * 0.04)
+            cr.rotate(a)
+            self._rounded(cr, -s * 0.2, -s * 0.045, s * 0.4, s * 0.09,
+                          s * 0.04)
+            cr.set_source_rgb(*WOOD_RGB)
+            cr.fill()
+            cr.restore()
+        for k, (dx, h) in enumerate(((-0.1, 0.3), (0.06, 0.4),
+                                     (0.18, 0.22))):
+            flick = 0.75 + 0.25 * math.sin(t * 9.0 + k * 2.1)
+            fh = s * h * flick
+            cr.move_to(x + dx * s - s * 0.07, y - s * 0.04)
+            cr.curve_to(x + dx * s - s * 0.07, y - fh * 0.6,
+                        x + dx * s, y - fh * 0.5, x + dx * s, y - fh)
+            cr.curve_to(x + dx * s + s * 0.02, y - fh * 0.5,
+                        x + dx * s + s * 0.07, y - fh * 0.6,
+                        x + dx * s + s * 0.07, y - s * 0.04)
+            cr.close_path()
+            cr.set_source_rgb(*FLASH_RGB if k == 1 else FORT_RGB)
+            cr.fill()
+
+    def _tripod(self, cr, x, y, s):
+        """Three poles over the fire at (x, y), lashed where they cross at
+        the top, s tall, and a short chain hanging from the lashing down
+        to the hook."""
+        apex = (x, y - s * 1.02)
+        cr.save()
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        # The back pole first, a little darker; then the two in front.
+        for fx, fy, rgb, w in ((-0.16, -0.1, STRIPE_RGB, 0.04),
+                               (-0.42, 0.0, SEAM_RGB, 0.045),
+                               (0.4, 0.0, SEAM_RGB, 0.045)):
+            foot = (x + fx * s, y + fy * s)
+            dx, dy = apex[0] - foot[0], apex[1] - foot[1]
+            cr.set_source_rgb(*rgb)
+            cr.set_line_width(max(1.0, s * w))
+            cr.move_to(*foot)
+            cr.line_to(apex[0] + dx * 0.1, apex[1] + dy * 0.1)
+            cr.stroke()
+        # The lashing.
+        cr.set_source_rgb(*BUCK_DARK_RGB)
+        cr.set_line_width(max(0.8, s * 0.02))
+        for k in range(3):
+            yy = apex[1] - s * 0.015 + k * s * 0.02
+            cr.move_to(apex[0] - s * 0.035, yy)
+            cr.line_to(apex[0] + s * 0.035, yy + s * 0.01)
+            cr.stroke()
+        # The chain, link by link, edge on and face on by turns.
+        hx, hy, _, _ = self._hang(x, y, s)
+        top, bottom = apex[1] + s * 0.02, hy - s * 0.1
+        n = max(2, int((bottom - top) / (s * 0.05)))
+        link = (bottom - top) / n
+        cr.set_source_rgb(*IRON_RGB)
+        cr.set_line_width(max(0.7, s * 0.014))
+        for k in range(n):
+            cr.save()
+            cr.translate(hx, top + link * (k + 0.5))
+            cr.scale(s * (0.012 if k % 2 else 0.022), link * 0.62)
+            cr.arc(0, 0, 1.0, 0, 2 * math.pi)
+            cr.restore()
+            cr.stroke()
+        cr.restore()
+
+    def _pot_hook(self, cr, x, y, s):
+        """The iron hook at the chain's end, its bend at (x, y), where the
+        pot's bail rests; drawn over the bail, or empty."""
+        c = s * 0.035
+        cr.save()
+        cr.set_source_rgb(*IRON_RGB)
+        cr.set_line_width(max(0.9, s * 0.022))
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.move_to(x - c, y - s * 0.1)
+        cr.line_to(x - c, y - c)
+        cr.arc_negative(x, y - c, c, math.pi, 0)
+        cr.line_to(x + c, y - c * 2.2)
+        cr.stroke()
+        cr.restore()
+
+    def _iron_pot(self, cr, px, py, s, heat, stew, tilt=0.0):
+        """The pot itself, its foot at (px, py), with its bail up over it
+        and steam off the stew as it nears the boil."""
+        t = self.phase
         r = s * 0.27
         cr.save()
         cr.translate(px, py)
@@ -7492,10 +7571,14 @@ class CpuView(Gtk.DrawingArea):
             px = x + face * ws * (0.34 + 0.16 * lift)
             py = y - ws * (0.3 + 0.35 * lift - 0.18 * kneel)
             if leg in ("lift", "set"):
-                # Hanging at the fire as it is lifted or set down.
+                # Off the hook into his arms, or back onto it: he stands
+                # at the fire, so the hook hangs over where he stands.
                 k = self._ramp(t, 0.0, Siege.LIFT_S) if leg == "lift" \
                     else 1.0 - self._ramp(t, 0.0, Siege.SET_S)
-                py = y - ws * 0.35 - ws * 0.05 * k
+                k = k * k * (3 - 2 * k)
+                hx, _, hs, hy = self._hang(x, walk_y, ws * 1.0)
+                px, py, sz = hx + (px - hx) * k, hy + (py - hy) * k, \
+                    hs + (sz - hs) * k
             self._stew_pot(cr, px, py, sz, pot["heat"], pot["stew"],
                            tilt=tilt, fire=False)
             if leg == "tip" and t >= Siege.TIP_AT * 0.6:
@@ -7569,14 +7652,23 @@ class CpuView(Gtk.DrawingArea):
         pot = self.siege.pot
         x0, x1 = walk
         x = x0 + (x1 - x0) * pot["x"]
-        if pot["at"] == "fire":
+        lifting = any(m["mode"] == "carry" and m["leg"] == "lift"
+                      for m in self.siege.men)
+        if pot["at"] == "fire" and not lifting:
             self._stew_pot(cr, x, walk_y, ws * 1.0, pot["heat"],
                            pot["stew"])
             return
-        # Off the fire: its place keeps the embers, and the pot is wherever
-        # it is being carried or was left.
+        # Off the hook: the one lifting it has it in hand. Off the fire,
+        # its place keeps the embers and the tripod its empty hook, and
+        # the pot is wherever it is being carried or was left.
         fx = x0 + (x1 - x0) * self.siege.POT_X
-        self._stew_embers(cr, fx, walk_y, ws * 1.0)
+        if pot["at"] == "fire":
+            self._stew_fire(cr, fx, walk_y, ws * 1.0)
+        else:
+            self._stew_embers(cr, fx, walk_y, ws * 1.0)
+        self._tripod(cr, fx, walk_y, ws * 1.0)
+        hx, hy, _, _ = self._hang(fx, walk_y, ws * 1.0)
+        self._pot_hook(cr, hx, hy, ws * 1.0)
         if pot["at"] == "spent":
             self._stew_pot(cr, x, walk_y, ws * 1.0, 0.0, 0.0, tilt=1.5,
                            fire=False)
@@ -12522,6 +12614,19 @@ def _stage_pot_carried():
     return stage
 
 
+def _stage_pot_hands(leg, x, face, kind="fetch", at="carried"):
+    """The walker with the pot in hand: lifting it off its hook, holding
+    it at a wall, bearing it home, or hanging it back on its hook."""
+    def stage(siege):
+        siege.men[2].update(mode="carry", leg=leg, x=x, face=face,
+                            t0=siege.phase, up=None, kind=kind,
+                            side=0 if x < 0.5 else 1, tipped=False)
+        siege.pot.update(at=at, x=Siege.POT_X if at == "fire" else x,
+                         task={"kind": kind, "i": 2,
+                               "side": 0 if x < 0.5 else 1})
+    return stage
+
+
 def _stage_sentries_to_pot():
     """The calm: one sentry coming down off his tower, the other on his
     way back up."""
@@ -12603,9 +12708,18 @@ SIEGE_PICTURES = (
     ("bears-waiting-at-the-woods-edge", _stage_bears_waiting()),
     ("bears-mauling-at-the-foot", _stage_bears_at_the_foot()),
     ("bears-mauling-on-the-trail", _stage_bears_on_the_trail()),
-    ("pot-poured-over-the-wall", _stage_pour()),
+    ("pot-hanging-over-the-fire", _stage_walls(1.0), (0.58, 0.5, 2.0)),
+    ("pot-lifted-off-its-hook", _stage_pot_hands("lift", Siege.POT_X, -1,
+                                                 kind="pour", at="fire"),
+     (0.58, 0.5, 2.0)),
     ("pot-carried-along-the-walk", _stage_pot_carried()),
+    ("pot-held-at-the-wall", _stage_pot_hands("bear", Siege.LADDER_X[0], -1,
+                                              kind="pour")),
+    ("pot-poured-over-the-wall", _stage_pour()),
     ("pot-left-empty-at-the-wall", _stage_pot_spent()),
+    ("pot-carried-back", _stage_pot_hands("bear", 0.45, 1)),
+    ("pot-hung-back-on-its-hook", _stage_pot_hands("set", Siege.POT_X, 1),
+     (0.58, 0.5, 2.0)),
     ("sentries-down-to-the-pot", _stage_sentries_to_pot()),
     ("mother-bear-by-the-walker", _stage_mother_by_walker(), (0.58, 0.52, 2.0)),
     ("yard-redcoats-battering", _stage_yard()),
