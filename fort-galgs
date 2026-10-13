@@ -10243,6 +10243,8 @@ class CpuView(Gtk.DrawingArea):
                                 for x, y, w, h in self.yard_tiles] \
                 or self.siege.tiles
             self._draw_yard_stormers(cr, towers, floor, t)
+            for side in (0, 1):
+                self._draw_wall_meter(cr, side)
 
         # Last, so a pacing sentry passes in front of the tower roofs.
         if self.on:
@@ -10271,6 +10273,97 @@ class CpuView(Gtk.DrawingArea):
         return title, (len(w.beavers), len(w.trappers),
                        sum(tr["pelts"] for tr in w.trappers),
                        w.stats()["bears"]), ", ".join(words)
+
+    def _wall_meter(self, side):
+        """Where side's wall meter stands, (x, top, w, h): upright against
+        the inside of the wall, below its tower, or on the wall itself if
+        the yard's tiles come up to it; None while the fort is down."""
+        if not self.on or self.yard_geo is None or self.fort_geo is None:
+            return None
+        yx, fy, yw, fh = self.yard_geo
+        wall, t = self.fort_geo["wall"], self.fort_geo["t"]
+        w = max(6.0, t * 0.09)
+        if self.yard_tiles:
+            room = min(min(x - yx, yx + yw - (x + tw))
+                       for x, _, tw, _ in self.yard_tiles)
+        else:
+            room = yw / 2
+        if room >= w + wall * 0.5:
+            inset = wall * 0.2
+            x = yx + inset if side == 0 else yx + yw - inset - w
+        else:
+            x = yx - wall * 0.5 - w / 2 if side == 0 \
+                else yx + yw + wall * 0.5 - w / 2
+        top = fy + t * 0.2
+        return x, top, w, max(w * 3, fy + fh - t * 0.12 - top)
+
+    def _draw_wall_meter(self, cr, side):
+        """How much is left of side's wall, on a small upright gauge beside
+        it: a wooden trough bound in iron, filled from the foot up as far
+        as the wall stands, empty when it is breached. Its length alone
+        tells it; quarter notches down one edge and an iron notch at the
+        foot, the breach end, give it a scale, and the fill shades from
+        green to red as it drops."""
+        box = self._wall_meter(side)
+        if box is None:
+            return
+        x, top, w, h = box
+        k = max(0.0, min(1.0, self.siege.wall[side]))
+        f = w * 0.45                    # the frame's breadth
+        cr.save()
+        # The wooden frame, and the trough in it, black inside.
+        self._rounded(cr, x - f, top - f, w + 2 * f, h + 2 * f, f)
+        cr.set_source_rgb(*WOOD_HI_RGB)
+        cr.fill_preserve()
+        cr.set_source_rgb(*SEAM_RGB)
+        cr.set_line_width(max(1.0, w * 0.12))
+        cr.stroke()
+        cr.rectangle(x, top, w, h)
+        cr.set_source_rgb(*HAT_RGB)
+        cr.fill()
+        # The fill, from the foot up.
+        if k > 0:
+            if k >= 0.5:
+                u = (k - 0.5) * 2
+                rgb = tuple(a + (b - a) * u for a, b in
+                            zip(FORT_RGB, LEAF_HI_RGB))
+            else:
+                u = k * 2
+                rgb = tuple(a + (b - a) * u for a, b in
+                            zip(BLOOD_RGB, FORT_RGB))
+            cr.rectangle(x, top + h * (1 - k), w, h * k)
+            cr.set_source_rgb(*rgb)
+            cr.fill()
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.25)
+            cr.rectangle(x, top + h * (1 - k), w * 0.3, h * k)
+            cr.fill()
+        # Quarter notches cut in the frame on the side away from the wall,
+        # the middle one longer.
+        edge = x + w if side == 0 else x
+        out = 1 if side == 0 else -1
+        cr.set_source_rgb(*SEAM_RGB)
+        cr.set_line_width(max(1.0, w * 0.16))
+        for q in (0.25, 0.5, 0.75):
+            yy = top + h * (1 - q)
+            cr.move_to(edge, yy)
+            cr.line_to(edge + out * f * (1.6 if q == 0.5 else 0.9), yy)
+            cr.stroke()
+        # Iron bands at the head and the foot, and at the foot, the breach
+        # end, an iron wedge pointing in to where the fill runs out.
+        for yy in (top - f * 0.7, top + h + f * 0.2):
+            cr.rectangle(x - f * 1.15, yy, w + f * 2.3, f * 0.5)
+            cr.set_source_rgb(*IRON_RGB)
+            cr.fill()
+        cr.move_to(edge + out * f * 2.4, top + h - f * 1.3)
+        cr.line_to(edge - out * w * 0.2, top + h)
+        cr.line_to(edge + out * f * 2.4, top + h + f * 1.3)
+        cr.close_path()
+        cr.set_source_rgb(*BALL_RGB)
+        cr.fill_preserve()
+        cr.set_source_rgb(*IRON_RGB)
+        cr.set_line_width(max(1.0, w * 0.12))
+        cr.stroke()
+        cr.restore()
 
     def _draw_almanac(self, cr, height):
         """A small caption in the bottom-left corner, below the pastures
@@ -14505,7 +14598,46 @@ def self_test():
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], True)
     siege_tests(view, cr)
     assert len(siege_pictures(view)) == len(SIEGE_PICTURES)
+
+    # Each side wall has its meter, upright just inside it, clear of the
+    # yard's tiles, filled from the foot as far as the wall stands: full,
+    # hurt, and empty when breached. None while the fort is down.
+    view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], True)
+    w, h = 900, 560
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+    mcr = cairo.Context(surface)
+    view._draw(view, mcr, w, h)
+    yx, fy, yw, fh = view.yard_geo
+    for side in (0, 1):
+        x, top, mw, mh = view._wall_meter(side)
+        wall_x = yx if side == 0 else yx + yw
+        assert abs(x + mw / 2 - wall_x) < view.fort_geo["t"] * 0.4, side
+        assert 0 <= x and x + mw <= w and fy <= top and top + mh <= fy + fh
+        assert mh > mw * 8, "long enough to read"
+        for tx, ty, tw, th in view.yard_tiles:
+            assert x + mw <= tx or tx + tw <= x, (side, tx)
+
+    def lit(side, k):
+        """How far up side's meter it is filled, read off the picture."""
+        x, top, mw, mh = view._wall_meter(side)
+        view.siege.wall[side] = k
+        view._draw(view, mcr, w, h)
+        surface.flush()
+        data, stride = surface.get_data(), surface.get_stride()
+        cx = int(x + mw * 0.7)
+        rows = 0
+        for y in range(int(top) + 1, int(top + mh)):
+            b, g, r = data[y * stride + cx * 4:y * stride + cx * 4 + 3]
+            rows += max(r, g, b) > 60
+        return rows / mh
+
+    for side in (0, 1):
+        assert lit(side, 1.0) > 0.95, side
+        assert abs(lit(side, 0.5) - 0.5) < 0.05, side
+        assert abs(lit(side, 0.25) - 0.25) < 0.05, side
+        assert lit(side, 0.0) < 0.02, "breached, empty"
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
+    assert view._wall_meter(0) is None and view._wall_meter(1) is None
     assert view.siege.wall == [1.0, 1.0], "standing down mends everything"
 
     win.apply_state(SAMPLE_STATE)
