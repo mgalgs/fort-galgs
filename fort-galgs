@@ -3073,7 +3073,8 @@ class Siege:
         m["clear"] = None
         near = min(threats, key=lambda st: abs(st["x"] - gx))
         face = 1 if near["x"] >= gx else -1
-        if m["station"] is None:
+        if m["station"] is None \
+                or (m["station"] - gx) * face > 0:   # he is in front of it
             m["station"] = min(1.0, max(0.0, gx - face * self.STATION_DX))
         step = dt * pace / self.RUN_X_S
         left = m["station"] - m["x"]
@@ -3086,7 +3087,8 @@ class Siege:
             g["ready"] = max(g["ready"], self.phase + self.TURN_S / pace)
         ahead = [st for st in threats
                  if 0 < (st["x"] - gx) * g["facing"] <= self.FIRE_RANGE]
-        if ahead and self.phase >= g["ready"]:
+        if ahead and self.phase >= g["ready"] \
+                and not self._bear_in_blast(g["facing"]):
             if g["aim"] is None:
                 g["aim"] = self.phase
             elif self.phase - g["aim"] >= self.AIM_S / pace:
@@ -3113,6 +3115,8 @@ class Siege:
         along the walk to the far tower."""
         face = 1 if st["x"] >= self.gun_at else -1
         if self._crewed(face):
+            if self._bear_in_blast(face):
+                return              # never fire on a bear
             self._fire_gun([o for o in self.stormers_on(mode="walk")
                             if abs(o["x"] - self.gun_at) <= self.FIRE_RANGE
                             and (o["x"] - self.gun_at) * face >= 0],
@@ -3274,9 +3278,16 @@ class Siege:
                 self._home_post(2)
 
     def walk_clear(self):
-        """No stormer is alive on the walk or its roofs, nor in the yard,
-        and no bear is up there either."""
-        return not self.stormers_on() and not self.bears_on("walk", "yard")
+        """No stormer is alive on the walk or its roofs, nor in the yard.
+        Bears keeping watch do not count: the walker takes the gun back
+        with them beside him."""
+        return not self.stormers_on()
+
+    def _bear_in_blast(self, face):
+        """A bear on the walk is in front of the gun, within its reach."""
+        gx = self.gun_at
+        return any(0 <= (b["x"] - gx) * face <= self.FIRE_RANGE
+                   for b in self.bears_on("walk"))
 
     def _fire_gun(self, ahead, pace):
         """The gun goes off along the wall walk: whoever is in front of it
@@ -11819,8 +11830,8 @@ def siege_tests(view, cr):
             stopped = siege.phase
             assert all(b.get("gone") or b["layer"] == "ground"
                        for b in others), "she stops once the others are down"
-        if siege.bears_on("walk", "yard"):
-            assert siege.gun["taken"], "not retaken with bears on the walk"
+        if siege.stormers_on():
+            assert siege.gun["taken"], "not retaken with redcoats up there"
         if not siege.bears:
             break
     assert not siege.bears and all(f["hit"] is not None for f in foes)
@@ -11828,8 +11839,7 @@ def siege_tests(view, cr):
     assert siege.tally["bear_kills"] >= 1
     assert gone[-1] is mother and len(gone) == 3, "her last"
     assert stopped is not None and siege.phase - stopped >= Siege.BY_WALKER_S
-    assert siege.men[2]["mode"] in ("retake", "driven", "patrol") \
-        and siege.tally["guns"] == 0, "no gun was lost to them"
+    assert siege.tally["guns"] == 0, "no gun was lost to them"
     assert _until(siege, lambda: not siege.gun["taken"], 30), "and he retakes it"
     # While redcoats are still at the wall's foot they do not go: they keep
     # watch at the end of the walk, and go when it has been quiet.
