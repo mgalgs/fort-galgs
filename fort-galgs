@@ -1978,6 +1978,7 @@ class Siege:
     PACE = {"foot": 1.0, "horse": 2.6, "cannon": 0.45}
     HP = {"foot": 1, "horse": 1, "cannon": 5}
     WAVE_EVERY = (75.0, 105.0, 90.0)
+    FLOOD_EVERY = 20.0  # an eager user's double click, every so often
     COVER_P = 0.64      # where on the trail a boulder offers cover
     HIDE_S = 9.5        # how long a man crouches behind it, at least...
     LULL_S = 5.0        # ...and until he has not been shot at for this long
@@ -2001,8 +2002,8 @@ class Siege:
     # What the redcoats at the foot of a side wall do to it, as a fraction
     # of its whole strength: a man on foot or a horseman per second as he
     # pounds, a cannon per ball (it fires every BOOM_EVERY seconds).
-    HURT_PER_S = {"foot": 0.0035, "horse": 0.006}
-    HURT_PER_BALL = 0.045
+    HURT_PER_S = {"foot": 0.0015, "horse": 0.0025}
+    HURT_PER_BALL = 0.016
     BOOM_EVERY = 4.0
 
     # Lulls, hunger and meals. A lull is QUIET_S seconds with no redcoat
@@ -2011,9 +2012,10 @@ class Siege:
     # walker, 2); it slows his drill and his work by up to HUNGER_SLOW.
     CLOSE_P = 0.5
     QUIET_S = 3.0
+    MEAL_AFTER_S = 5.0  # the quiet must have held this long for a meal
     HUNGER_SLOW = 0.5
     HUNGER_S = 2400.0   # seconds on the wall to go from fed to starving...
-    HEAVY_S = 300.0     # ...and doing heavy work
+    HEAVY_S = 220.0     # ...and doing heavy work
     MEAL_S = 80.0       # seconds to eat his fill from starving
     EAT_AT = 0.2        # hungry enough to sit down to a meal at this
     FED = 0.03          # and he gets up again of his own accord at this
@@ -2027,15 +2029,18 @@ class Siege:
     # starving; with no walker, the sentry on that side does. A ladder
     # goes over the outside of the wall: lowered, climbed, used, climbed
     # again and hauled up, each of which takes real time at fed pace.
-    MEND_BELOW = 0.85
-    MEND_PER_S = 0.012  # of a wall's whole strength
-    LOWER_S = 2.5
-    HAUL_S = 2.5
-    CLIMB_S = 2.6
-    WALK_S = 8.0        # the walker takes this long to cross the wall walk
+    MEND_BELOW = 0.75
+    MEND_PER_S = 0.014  # of a wall's whole strength
+    LOWER_S = 1.8
+    HAUL_S = 1.8
+    CLIMB_S = 2.2
+    WALK_S = 5.0        # the walker takes this long to cross the wall walk
     LADDER_X = (0.03, 0.97)  # along the wall walk, the ladder at each wall
+    WATCH_P = 0.3       # how far up the trail he can see redcoats come
+    SAFE_S = 1.0        # he goes up when he has no more than this to spare
+    START_S = 12.0      # he goes down only with this long before a redcoat
     CATCH_MARGIN = 0.5  # spare seconds he wants over the nearest redcoat
-    MEND_FED = 0.3      # a man at his meal who has a wall to mend gets up at this
+    MEND_FED = 0.3      # at his meal, with a wall to mend, he gets up at this
     HEAVY = ("lower", "descend", "mend", "ascend", "haul", "run", "hide",
              "home", "raise")
 
@@ -2044,8 +2049,8 @@ class Siege:
     # from the foot of the wall (0). Redcoats on their trail are as far
     # from the foot as G_SPAN times the trail still ahead of them.
     G_SPAN = 3.0
-    RUN_S = 1.5         # seconds to run one rock's distance, fed
-    HOME_S = 2.2        # and to walk it
+    RUN_S = 1.2         # seconds to run one rock's distance, fed
+    HOME_S = 1.4        # and to walk it
     RAISE_ALONE_S = 10.0
     HIDE_MIN_S = 6.0    # he stays behind a rock at least this long
     POT_EVERY = (None, 6.0, 20.0, None)  # seconds between his shots, by rock
@@ -2054,10 +2059,11 @@ class Siege:
     DRIVE_RANGE = 1.0   # and a musket
     DRIVE_CHANCE = 0.25 # per second, that a redcoat in range goes after him
     DRIVERS_MAX = 2
-    CLOSE_G = 0.4       # a redcoat this near his rock drives him back
-    PIN_SHOTS = 3       # as do this many shots on his rock...
+    CLOSE_G = 0.25      # a redcoat this near his rock drives him back
+    RUSH_P = 0.8        # per second, a redcoat close on his rock drives him off
+    PIN_SHOTS = 4       # as do this many shots on his rock...
     PIN_WINDOW = 15.0   # ...in this many seconds
-    VOLLEY_RATE = 1.5   # a redcoat's drill runs this much faster than a sentry's
+    VOLLEY_RATE = 1.5   # a redcoat's drill is this much quicker than a sentry's
 
     # The redcoats' use of the ladder, and the men's pushing it off. A
     # man at the foot of a wall with a ladder standing against it climbs
@@ -2081,8 +2087,9 @@ class Siege:
     BUGLE_LEN = 2.0     # from raising the bugle to lowering it
     BUGLE_HEARD = 1.2   # the tower sentry starts his drill this far in
 
-    def __init__(self, seed=1):
-        self.rng = random.Random(seed)    # not drawn on yet
+    def __init__(self, seed=1, steady=False):
+        self.rng = random.Random(seed)    # its small chances; see vary()
+        self.steady = steady              # no variation in the march
         self.phase = 0.0                  # its own clock, moved by tick()
         self.boulders = [True, True]      # one beside each trail, if laid
         self.has_walker = True            # room on the wall for him to walk
@@ -2094,8 +2101,11 @@ class Siege:
         self.spawn_in = 1.0
         self.called = [[], []]            # kinds waiting at each barracks
         self.pending_call = None          # (side, phase, wait) of a lone click
-        self.wave_in = 45.0
+        self.wave_in = 45.0 * self.vary(0.3)
         self.waves = 0
+        self.flood = False                # an eager user at the barracks
+        self.flood_in = 20.0
+        self.floods = 0
         self.relief = None                # a tower's call for the gun
         self.gun_at = 0.5                 # along the wall walk, 0..1
         self.bugle_at = None              # phase the walker last sounded
@@ -2116,8 +2126,15 @@ class Siege:
                       "hurt": [0.0, 0.0], "mended": [0.0, 0.0],
                       "breaches": 0, "meals": 0, "eating_s": 0.0,
                       "repairs": 0, "repairs_done": 0, "caught": 0,
-                      "out_s": 0.0, "retreats": 0, "rc_shots": 0,
+                      "out_s": 0.0, "retreats": 0, "driven": 0, "rc_shots": 0,
                       "climbs": 0, "pushes": 0, "raises": 0, "fell": 0}
+
+    def vary(self, spread):
+        """A factor near 1, up to spread either side of it: the siege's
+        small chances, from its seeded random."""
+        if self.steady:
+            return 1.0
+        return 1.0 + spread * (2.0 * self.rng.random() - 1.0)
 
     def _new_man(self, mode):
         """One of the fort's three men: his hunger, what he is at (mode),
@@ -2265,7 +2282,7 @@ class Siege:
 
     def _foot_men(self, side):
         return [rc for rc in self.redcoats if rc["side"] == side
-                and rc["hit"] is None and rc["kind"] == "foot"
+                and rc["hit"] is None and rc["kind"] in ("foot", "horse")
                 and self.at_wall(rc)]
 
     def _advance_ladder(self, dt):
@@ -2357,11 +2374,13 @@ class Siege:
         return any(rc["hit"] is None and self.trail_p(rc["d"]) >= self.CLOSE_P
                    for rc in self.redcoats)
 
-    def lull(self):
+    def lull(self, seconds=None):
         """THE LULL: no redcoat close to either wall for QUIET_S seconds.
-        Whatever a man does only in the quiet asks this."""
-        return self.quiet_since is not None \
-            and self.phase - self.quiet_since >= self.QUIET_S
+        Whatever a man does only in the quiet asks this; a meal asks that
+        the quiet should have lasted a little longer."""
+        return self.quiet_since is not None and self.phase \
+            - self.quiet_since >= (self.QUIET_S if seconds is None
+                                   else seconds)
 
     def pace(self, i):
         """How fast man i works, 1 fed and HUNGER_SLOW less starving."""
@@ -2423,16 +2442,19 @@ class Siege:
                 continue
             if rc["at_wall"] is not None:
                 return 0.0
-            if rc.get("hid") is None:
+            if rc.get("hid") is None and self.trail_p(rc["d"]) >= self.WATCH_P:
                 best = min(best, (rc["d"] - self.MARCH_NEAR)
-                           / (speed * self.PACE[rc["kind"]]))
+                           / (speed * self.PACE[rc["kind"]]
+                              * rc.get("stride", 1.0)))
         return best
 
     def _start_mending(self, i, side):
         """Man i, in a lull, sets out to mend the wall on side."""
         m = self.men[i]
         m.update(side=side, t0=self.phase, h=1.0, g=0.0)
-        self.ladder.update(side=side, state="standing", ext=0.0)
+        self.ladder.update(side=side)
+        if i != 2:
+            self.ladder.update(state="standing", ext=0.0)
         m["x"] = self.walker_x()[0] if i == 2 else None
         m["mode"] = "to_wall" if i == 2 else "lower"
         self.tally["repairs"] += 1
@@ -2455,35 +2477,35 @@ class Siege:
         m = self.men[i]
         side, lad, pace = m["side"], self.ladder, self.pace(i)
         mode = m["mode"]
-        close = self.in_range()
+        wary = self._time_to_foot(side) < self.START_S / 2
         if mode == "to_wall":
             goal = self.LADDER_X[side]
             step = dt * pace / self.WALK_S
             m["x"] += max(-step, min(step, goal - m["x"]))
-            if close:
+            if wary:
                 self._home_post(i)
             elif abs(goal - m["x"]) < 1e-9:
                 m["mode"] = "lower"
+                lad.update(state="standing", ext=0.0)
         elif mode == "lower":
             lad["ext"] = min(1.0, lad["ext"] + dt * pace / self.LOWER_S)
-            if close:
+            if wary:
                 m["mode"] = "haul"
             elif lad["ext"] >= 1.0:
                 m["mode"] = "descend"
         elif mode == "descend":
             m["h"] = max(0.0, m["h"] - dt * pace / self.CLIMB_S)
-            if close:
-                self._ladder_alarm(i)
-            elif m["h"] <= 0.0:
+            self._ladder_alarm(i)
+            if m["mode"] == "descend" and m["h"] <= 0.0:
                 m["mode"] = "mend"
         elif mode == "mend":
             if self.wall[side] >= 1.0:
                 self.tally["repairs_done"] += 1
-                self._ladder_alarm(i)
-            elif close:
-                self._ladder_alarm(i)
+                m["mode"] = "ascend"
             else:
-                self.mend(side, dt * pace * self.MEND_PER_S)
+                self._ladder_alarm(i)
+                if m["mode"] == "mend":
+                    self.mend(side, dt * pace * self.MEND_PER_S)
         elif mode == "ascend":
             m["h"] = min(1.0, m["h"] + dt * pace / self.CLIMB_S)
             if m["h"] >= 1.0:
@@ -2504,24 +2526,30 @@ class Siege:
         under him, from where he is, at his pace."""
         m, lad = self.men[i], self.ladder
         t = 0.0
-        if m["mode"] in ("home", "run"):
+        if m["mode"] in ("home", "run", "hide"):
             t += m["g"] * self.HOME_S
         if lad["state"] in ("fallen", "falling") and m["mode"] != "ascend":
             t += self.RAISE_ALONE_S * (1.0 - lad["raised"])
         h = m["h"] if m["mode"] in ("descend", "ascend", "mend") else 0.0
         return (t + (1.0 - h) * self.CLIMB_S) / self.pace(i)
 
+    def _slack(self, i):
+        """Seconds to spare: how long before the nearest redcoat he can
+        see is at the foot of the wall, less what it would take man i to
+        be up on the wall again."""
+        return self._time_to_foot(self.men[i]["side"]) - self._time_needed(i)
+
     def _ladder_alarm(self, i):
-        """Man i, on the ladder or below it, is done or has seen redcoats:
-        he goes back up if he can reach the ladder and climb it before the
-        nearest redcoat reaches the foot of the wall, and if not he breaks
-        for the woods, leaving the ladder where it stands."""
+        """Man i, on the ladder or below it, watches the trail. While he
+        has time to spare he goes on; when he has only just enough he
+        goes back up; and when he has not enough, he breaks for the woods,
+        leaving the ladder where it stands."""
         m = self.men[i]
-        if self.wall[m["side"]] >= 1.0 or self._time_needed(i) \
-                + self.CATCH_MARGIN < self._time_to_foot(m["side"]):
-            if m["mode"] in ("home", "raise"):
-                m["mode"] = "home"   # carries on to the ladder
-            else:
+        slack = self._slack(i)
+        if slack > self.SAFE_S:
+            return
+        if slack >= 0:
+            if m["mode"] in ("descend", "mend"):
                 m["mode"] = "ascend"
             return
         self._break_for_woods(i)
@@ -2529,21 +2557,18 @@ class Siege:
     def _break_for_woods(self, i):
         m = self.men[i]
         self.tally["caught"] += 1
+        m["driven"] = False
         self.ladder["raised"] = 0.0
         m.update(mode="run", rock=min(3, max(1, math.ceil(m["g"] - 1e-9))),
                  t0=self.phase, h=0.0, up=None, pinned=[], shot_t=None)
-
-    def _rock_g(self, k):
-        return float(k)
 
     def _advance_ground(self, i, dt):
         """Man i out in the grass: running for the woods, behind a rock
         taking pot shots, walking home, or raising the ladder alone."""
         m, lad, pace = self.men[i], self.ladder, self.pace(i)
         side, mode = m["side"], m["mode"]
-        close = self.in_range()
         if mode == "run":
-            goal = self._rock_g(m["rock"])
+            goal = float(m["rock"])
             m["g"] = min(goal, m["g"] + dt * pace / self.RUN_S)
             if m["g"] >= goal:
                 m.update(mode="hide", t0=self.phase, shot_t=None,
@@ -2551,7 +2576,7 @@ class Siege:
         elif mode == "hide":
             self._hide(i, dt)
         elif mode == "home":
-            if close and m["g"] > 0.0:
+            if m["g"] > 0.0:
                 self._ladder_alarm(i)
             if m["mode"] != "home":
                 return
@@ -2561,10 +2586,9 @@ class Siege:
                     else "ascend"
                 m["h"] = 0.0
         elif mode == "raise":
-            if close:
-                self._ladder_alarm(i)
-                if m["mode"] != "raise":
-                    return
+            self._ladder_alarm(i)
+            if m["mode"] != "raise":
+                return
             if lad["state"] == "falling":
                 return
             lad["raised"] = min(1.0, lad["raised"]
@@ -2588,10 +2612,17 @@ class Siege:
                        if self.phase - t < self.PIN_WINDOW]
         foes = [rc for rc in self.redcoats if rc["side"] == side
                 and rc["hit"] is None]
-        crowded = any(abs(self.ground_g(rc) - k) <= self.CLOSE_G
-                      for rc in foes if rc["kind"] != "cannon")
-        if k < 3 and (len(m["pinned"]) >= self.PIN_SHOTS or crowded):
+        # A man on foot close on his rock is a threat that stays; a
+        # horseman, going by, half of one.
+        crowd = sum(1.0 if rc["kind"] == "foot" else 0.5 for rc in foes
+                    if rc["kind"] != "cannon" and rc.get("hid") is None
+                    and abs(self.ground_g(rc) - k) <= self.CLOSE_G)
+        if k < 3 and (len(m["pinned"]) >= self.PIN_SHOTS or (
+                crowd and self.rng.random() < self.RUSH_P * crowd * dt)):
             self.tally["retreats"] += 1
+            if not m.get("driven"):
+                m["driven"] = True    # once for each time he is caught
+                self.tally["driven"] += 1
             m.update(mode="run", rock=k + 1, t0=self.phase, pinned=[],
                      shot_t=None)
             self._call_off(side)
@@ -2610,7 +2641,8 @@ class Siege:
             m.update(shot_t=0.0, fired=False)
             return
         if self.lull() and self.phase - m["t0"] >= self.HIDE_MIN_S \
-                and not m["pinned"]:
+                and not m["pinned"] \
+                and self._slack(i) > self.SAFE_S + self.CATCH_MARGIN:
             m["mode"] = "home"
             self._call_off(side)
 
@@ -2725,6 +2757,7 @@ class Siege:
             # goes down instead, if he has nothing at his rifle.
             side = self._wall_to_mend()
             if side is not None and self.lull() \
+                    and self._time_to_foot(side) > self.START_S \
                     and self.men[side]["mode"] == "post" \
                     and not self.busy(side) \
                     and self.men[side]["hunger"] < self.STARVING \
@@ -2747,9 +2780,11 @@ class Siege:
                               x=self.walker_x()[0], t0=self.phase)
             elif self.lull() and side is not None \
                     and walker["hunger"] < self.STARVING \
-                    and self.ladder["state"] == "up":
+                    and self.ladder["state"] == "up" \
+                    and self._time_to_foot(side) > self.START_S:
                 self._start_mending(2, side)
-            elif self.lull() and walker["hunger"] >= self.EAT_AT:
+            elif self.lull(self.MEAL_AFTER_S) \
+                    and walker["hunger"] >= self.EAT_AT:
                 self._sit_down(2)
         elif walker["mode"] == "eat":
             if self._meal(2, dt, not self.in_range() and not (
@@ -2896,6 +2931,7 @@ class Siege:
         and a place to hop from, steps ashore from a boat there."""
         self.redcoats.append({"side": side, "d": d or self.MARCH_FAR,
                               "hit": None, "n": self.spawned,
+                              "stride": self.vary(0.1),
                               "born": self.phase, "kind": kind,
                               "hp": self.HP[kind], "struck": None,
                               "at_wall": None, "slot": 0, "boat": boat})
@@ -2948,7 +2984,8 @@ class Siege:
                     rc["hid"], rc["rose"] = None, self.phase
                 was = self.trail_p(rc["d"])
                 rc["d"] = max(self.MARCH_NEAR,
-                              rc["d"] - speed * self.PACE[rc["kind"]] * dt)
+                              rc["d"] - speed * self.PACE[rc["kind"]]
+                              * rc.get("stride", 1.0) * dt)
                 # A man on foot who reaches the boulder with a rifle on him
                 # drops behind it, once.
                 if rock and rc["kind"] == "foot" and "rock" not in rc \
@@ -2983,10 +3020,16 @@ class Siege:
                 self.phase - self.pending_call[1] > self.pending_call[2]:
             self.call(self.pending_call[0], self.FILE)
             self.pending_call = None
+        if self.flood:
+            self.flood_in -= dt
+            if self.flood_in <= 0:
+                self.call(self.floods % 2, self.WAVE)
+                self.flood_in = self.FLOOD_EVERY
+                self.floods += 1
         self.wave_in -= dt
         if self.wave_in <= 0:
             self.call(self.waves % 2, self.WAVE)
-            self.wave_in = self.WAVE_EVERY[self.waves % 3]
+            self.wave_in = self.WAVE_EVERY[self.waves % 3] * self.vary(0.3)
             self.waves += 1
 
         def door_clear(side):
@@ -3007,7 +3050,7 @@ class Siege:
                            for rc in self.redcoats)
             if marching < 2 and door_clear(side):
                 self.send(side, "foot")
-                self.spawn_in = (6.0, 4.5, 7.5, 5.0)[n % 4]
+                self.spawn_in = (6.0, 4.5, 7.5, 5.0)[n % 4] * self.vary(0.25)
             else:
                 self.spawn_in = 1.0
 
@@ -3035,7 +3078,7 @@ class Siege:
                         self.drill_start[i], (man["up"] or self.phase)
                         + self.RISE_S)
                 continue
-            if not self.busy(i) and self.lull() \
+            if not self.busy(i) and self.lull(self.MEAL_AFTER_S) \
                     and man["hunger"] >= self.EAT_AT:
                 self._sit_down(i)
                 continue
@@ -4520,7 +4563,7 @@ class CpuView(Gtk.DrawingArea):
         if aim > 0:
             cr.restore()
         if 0 <= shot < 2.2:
-            mx, my = 60.0, -72.0 + drop * 0
+            mx, my = 60.0, -72.0
             for j in range(3):
                 u = min(1.0, max(0.0, shot - 0.06 * j) / 2.2)
                 cr.set_source_rgba(*SMOKE_RGB, 0.55 * (1 - u))
@@ -5177,7 +5220,7 @@ class CpuView(Gtk.DrawingArea):
         # Each boulder is drawn just after anyone crouched behind it, and
         # before anyone nearer the fort.
         items = [(-rc["d"], 0, rc) for rc in self.siege.redcoats
-                 if rc.get("climb") is None]
+                 if rc.get("climb") is None or rc["kind"] == "horse"]
         items += [(-rock["d"], 1, rock) for rock in self.rocks if rock]
         # Whoever is outside is as far down the picture as his feet, with
         # his rock just after him; the hiding rocks go in by the same rule.
@@ -5211,6 +5254,16 @@ class CpuView(Gtk.DrawingArea):
             pound = self.siege.phase - rc["at_wall"] \
                 if alive and self.siege.at_wall(rc) else -1.0
             kind = rc["kind"]
+            if kind == "horse" and rc.get("climb") is not None:
+                # The rider has left his saddle for the ladder; the horse
+                # bolts riderless off the side of the picture.
+                e = self.siege.phase - rc["climb"]
+                if e < Siege.FLEE_S:
+                    self._cavalry(cr, x - toward * size * 2.4 * e ** 1.4,
+                                  feet, size, -toward,
+                                  self.phase * 16 + rc["n"], 0.0,
+                                  rider=False)
+                continue
             if kind == "horse" and not alive:
                 # The rider drops from the saddle and dies where he lands;
                 # his horse bolts riderless off the side of the picture.
@@ -7904,8 +7957,9 @@ class CpuView(Gtk.DrawingArea):
             self._find_fords()
             self._lay_rocks()
             wall = 0.3 * t
-            self.fort_geo = {"X": yx - wall, "Y": fy - wall, "W": yw + 2 * wall,
-                             "H": fh + 2 * wall, "wall": wall, "t": t,
+            self.fort_geo = {"X": yx - wall, "Y": fy - wall,
+                             "W": yw + 2 * wall, "H": fh + 2 * wall,
+                             "wall": wall, "t": t,
                              "floor": fy - wall - 0.5 * t}
             self._lay_hiding_rocks(key, width, height, t, die)
             self._draw_boats(cr)
@@ -9982,7 +10036,7 @@ def _walker_out(siege, mode="mend", side=0, i=2):
 def _stage_eating(siege):
     for m in siege.men:
         m["hunger"] = 0.7
-    siege.run(Siege.QUIET_S + 2.5)
+    siege.run(Siege.MEAL_AFTER_S + 2.5)
 
 
 def _stage_walls(strength):
@@ -10098,7 +10152,7 @@ def siege_tests(view, cr):
     siege = _quiet_siege()
     rc = _at_the_foot(siege, "cannon")
     rc["hp"] = 99
-    siege.wall[0] = 0.06
+    siege.wall[0] = Siege.HURT_PER_BALL * 1.5
     siege.run(Siege.BOOM_EVERY + 1)
     assert siege.breached(0) and siege.tally["breaches"] == 1, siege.wall
     before = siege.tally["hurt"][0]
@@ -10116,7 +10170,7 @@ def siege_tests(view, cr):
     siege.men[0]["hunger"], siege.men[2]["hunger"] = 0.6, 0.6
     siege.run(Siege.QUIET_S - 1)
     assert not siege.lull() and not siege.eating(0), "not yet a lull"
-    siege.run(2.5)
+    siege.run(Siege.MEAL_AFTER_S - Siege.QUIET_S + 2.5)
     assert siege.lull() and siege.eating(0) and siege.eating(2)
     assert not siege.eating(1), "a fed man does not sit down"
     assert siege.sit(0) == 1.0 and siege.men[0]["mode"] == "eat"
@@ -10172,8 +10226,8 @@ def siege_tests(view, cr):
     assert siege.relief is None, "the gun cannot be worked"
     siege.redcoats = []
     siege.wall[0] = 1.0
-    rc = _at_the_foot(siege, "foot", side=0)
-    rc["d"], rc["at_wall"] = Siege.trail_d(0.6), None
+    rc = _at_the_foot(siege, "foot", side=1)
+    rc["d"], rc["at_wall"] = Siege.trail_d(0.45), None
     assert _until(siege, lambda: walker["mode"] == "ascend", 3), \
         "he sees them come"
     assert _until(siege, lambda: walker["mode"] == "haul", 10)
@@ -10194,7 +10248,7 @@ def siege_tests(view, cr):
     siege.wall = [0.5, 1.0]
     walker = siege.men[2]
     walker["hunger"] = 0.9
-    siege.run(Siege.QUIET_S + 2)
+    siege.run(Siege.MEAL_AFTER_S + 2)
     assert siege.eating(2) and siege.tally["repairs"] == 0
     # With no room on the wall for a walker, the sentry on that side mends.
     siege = Siege()
@@ -10204,7 +10258,8 @@ def siege_tests(view, cr):
     assert _until(siege, lambda: siege.men[1]["mode"] == "mend", 40)
     assert siege.out(1) and not siege.out(0) and siege.ladder["side"] == 1
     assert _until(siege, lambda: siege.wall[1] >= 1.0, 60)
-    assert _until(siege, lambda: siege.men[1]["mode"] == "post", 20)
+    assert _until(siege, lambda: siege.men[1]["mode"] in ("post", "eat"), 20)
+    assert siege.ladder["state"] == "up" and not siege.out(1)
 
     # Caught outside: a horseman in range will be at the foot of the wall
     # before he can climb, so he breaks for the woods; the ladder is left
@@ -10233,7 +10288,8 @@ def siege_tests(view, cr):
     siege.men[2]["hunger"] = 1.0   # starving, slowly
     _foe(siege, "foot", 0.52)
     siege.run(0.2)
-    assert walker["mode"] == "run", "a hungry man is caught where a fed one is not"
+    assert walker["mode"] == "run", \
+        "a hungry man is caught where a fed one is not"
 
     # Behind a rock he takes pot shots at redcoats on his side, often from
     # the first, seldom from the second and not at all from the third,
@@ -10273,7 +10329,6 @@ def siege_tests(view, cr):
     assert _until(siege, lambda: walker["rock"] == 2, 40), walker
     assert siege.tally["retreats"] == 1 and not rc.get("drive")
     assert walker["mode"] in ("run", "hide") and siege.men[2]["hunger"] > 0
-    assert siege.wall[0] == 1.0 or True
 
     # He comes home in a lull, climbs the ladder and hauls it up.
     siege = _quiet_siege()
@@ -10397,7 +10452,7 @@ def siege_tests(view, cr):
     view.siege.drill_start = [None, None]
     for man in view.siege.men:
         man["hunger"] = 0.7
-    for _ in range(int(Siege.QUIET_S * 30) + 40):
+    for _ in range(int((Siege.MEAL_AFTER_S + 2) * 30)):
         view.phase += 1 / 30
         view._advance(1 / 30)
         view._draw(view, cr, 1024, 680)
@@ -10648,6 +10703,23 @@ def self_test():
     assert [ln.split()[0] for ln in lines[2:]] == ["1", "2", "3", "total"]
     sent, shot = lines[-1].split()[1:3]
     assert sum(map(int, sent.split("/"))) >= 5 and int(shot) >= 1, lines[-1]
+    for word in ("hurt", "mended", "breaches", "repairs", "caught", "out s",
+                 "retreats", "rc shots", "climbs", "pushes", "raises", "fell",
+                 "eating"):
+        assert word in lines[1], word
+    assert parse_args(["--siege", "3", "--pressure", "flood"])["pressure"] \
+        == "flood"
+    assert parse_args(["--siege", "3", "--seeds", "4"])["seeds"] == 4
+    # The flood adds an eager user's waves, and the summary says in how
+    # many runs each of the owner's wishes came true.
+    calm, flooded = io.StringIO(), io.StringIO()
+    quiet = siege_seeds(5, 2, "normal", out=calm)
+    wet = siege_seeds(5, 2, "flood", out=flooded)
+    assert sum(sum(t["sent"].values()) for t in wet) \
+        > sum(sum(t["sent"].values()) for t in quiet)
+    assert "2 seeds x 5 minutes, flood" in flooded.getvalue()
+    for what, _ in SIEGE_CLAIMS:
+        assert what in calm.getvalue(), what
 
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], True)
     view.boats, view.potshot = [], None
@@ -10672,7 +10744,7 @@ def self_test():
     # Some minutes of siege, with no picture: redcoats come, the sentries
     # shoot each one well before he reaches the fort, and nobody is left
     # standing at its foot.
-    siege = Siege()
+    siege = Siege(steady=True)  # the march on fixed cycles, to the second
     siege.wave_in = 1e9  # foot alone; the rest come below
     hits, closest, hid = set(), 0.0, False
     for frame in range(150 * 30):
@@ -10847,11 +10919,12 @@ def self_test():
     assert rc["hid"] is not None, "he ducks"
     siege.run(Siege.HIDE_S + 0.5)
     assert rc["hid"] is None and Siege.trail_p(rc["d"]) > Siege.COVER_P, rc
-    # Whatever the seed, the same siege: the rules draw on no chance yet.
-    a, b = Siege(seed=1), Siege(seed=2)
-    a.run(90)
-    b.run(90)
+    # The same seed, the same siege; another seed, a different one.
+    a, b, c = Siege(seed=1), Siege(seed=1), Siege(seed=2)
+    for siege in (a, b, c):
+        siege.run(300)
     assert a.tally == b.tally and a.spawned == b.spawned
+    assert a.tally != c.tally
 
     view.siege.redcoats, view.siege.drill_start = [], [None, None]
     view.siege.relief = None
@@ -11134,7 +11207,8 @@ def snapshot(path):
 
 USAGE = ("usage: fort-galgs [--time-scale <x>] | --self-test"
          " | --snapshot <png> | --almanac <years> [--seed N]"
-         " | --siege <minutes> [--seed N]")
+         " | --siege <minutes> [--seed N | --seeds N]"
+         " [--pressure normal|flood]")
 
 
 def almanac(years, seed=1, out=None):
@@ -11192,20 +11266,36 @@ SIEGE_COLUMNS = (
     ("hurt %", 9, lambda t: _pair(t["hurt"])),
     ("mended %", 10, lambda t: _pair(t["mended"])),
     ("breaches", 9, lambda t: t["breaches"]),
+    ("repairs s/f", 12, lambda t: f"{t['repairs']}/{t['repairs_done']}"),
+    ("caught", 7, lambda t: t["caught"]),
+    ("out s", 7, lambda t: round(t["out_s"])),
+    ("retreats", 9, lambda t: t["retreats"]),
+    ("rc shots", 9, lambda t: t["rc_shots"]),
+    ("climbs", 7, lambda t: t["climbs"]),
+    ("pushes", 7, lambda t: t["pushes"]),
+    ("raises", 7, lambda t: t["raises"]),
+    ("fell", 5, lambda t: t["fell"]),
     ("eating min", 11, lambda t: f"{t['eating_s'] / 60:.1f}"),
 )
 
 
-def siege_report(minutes, seed=1, out=None):
+def siege_report(minutes, seed=1, out=None, pressure="normal"):
     """Run a fresh siege headless for so many minutes and print one row a
     minute, then the total: the redcoats sent (foot/horse/cannon), those
-    shot by the sentries, those who reached the wall, those the gun's blast
-    took, the calls for the gun, and the walls' story. No boats: they row
-    on the river as drawn, which a headless run has not got."""
+    shot, those who reached the wall, those the gun's blast took, the
+    calls for the gun, and the walls' story: damage dealt and mended per
+    side (percent of a wall), breaches, repairs started and finished,
+    times the walker was caught outside, seconds spent out, retreats from
+    rock to rock, shots fired by redcoats, ladder climbs, push-offs and
+    raises, men killed falling, and minutes eating. No boats: they row on
+    the river as drawn, which a headless run has not got. pressure
+    "flood" adds an eager user's wave from a barracks every twenty
+    seconds."""
     out = out or sys.stdout
     siege = Siege(seed)
-    print(f"siege, seed {seed}, no boats (they need the drawn river)",
-          file=out)
+    siege.flood = pressure == "flood"
+    print(f"siege, seed {seed}, {pressure}, no boats (they need the drawn "
+          f"river)", file=out)
     print(f"{'minute':>6}" + "".join(f"{name:>{w}}"
                                      for name, w, _ in SIEGE_COLUMNS),
           file=out)
@@ -11223,11 +11313,52 @@ def siege_report(minutes, seed=1, out=None):
     row("total", siege.tally)
 
 
+# What the owner wants of an hour of siege, as the share of runs in which
+# each thing happens at least so often: (what, test on a run's tally).
+SIEGE_CLAIMS = (
+    ("a wall damaged, then mended, more than once",
+     lambda t: t["repairs"] >= 2 and sum(t["mended"]) > 0),
+    ("a wall breached", lambda t: t["breaches"] >= 1),
+    ("walker caught outside", lambda t: t["caught"] >= 1),
+    ("... and driven back past the first rock",
+     lambda t: t["caught"] >= 1 and t["retreats"] >= 1),
+    ("redcoats climb the ladder", lambda t: t["climbs"] >= 1),
+    ("a man eating", lambda t: t["eating_s"] > 0),
+)
+
+
+def siege_seeds(minutes, seeds, pressure="normal", out=None):
+    """Run the siege headless over seeds 1..seeds for so many minutes
+    each and print, for each of the owner's wishes in SIEGE_CLAIMS, in how
+    many of those runs it came true. Returns the tallies."""
+    out = out or sys.stdout
+    tallies = []
+    for seed in range(1, seeds + 1):
+        siege = Siege(seed)
+        siege.flood = pressure == "flood"
+        siege.run(60.0 * minutes)
+        tallies.append(siege.tally)
+    print(f"{seeds} seeds x {minutes} minutes, {pressure}", file=out)
+    for what, test in SIEGE_CLAIMS:
+        n = sum(1 for t in tallies if test(t))
+        print(f"  {n:>2}/{seeds}  {what}", file=out)
+    caught = sum(t["caught"] for t in tallies)
+    driven = sum(t["driven"] for t in tallies)
+    print(f"  caught {caught} times in all, and driven back past the first "
+          f"rock in {driven} of them ({100 * driven // max(1, caught)}%)",
+          file=out)
+    for key in ("breaches", "caught", "driven", "climbs", "pushes",
+                "raises", "fell"):
+        print(f"  {key:>9}: " + " ".join(f"{t[key]:>3}" for t in tallies),
+              file=out)
+    return tallies
+
+
 def parse_args(argv):
     """The command line as a dict; a usage error exits 2."""
     opts = {"self_test": False, "snapshot": None, "help": False,
             "time_scale": 1.0, "almanac": None, "siege": None,
-            "seed": 1}
+            "seed": 1, "seeds": None, "pressure": "normal"}
     args = list(argv)
 
     def fail():
@@ -11252,12 +11383,17 @@ def parse_args(argv):
             opts["time_scale"] = x
         elif a == "--time-scale":
             fail()
-        elif a in ("--almanac", "--siege", "--seed"):
+        elif a == "--pressure" and args \
+                and args[0] in ("normal", "flood"):
+            opts["pressure"] = args.pop(0)
+        elif a == "--pressure":
+            fail()
+        elif a in ("--almanac", "--siege", "--seed", "--seeds"):
             try:
                 n = int(args.pop(0))
             except (IndexError, ValueError):
                 fail()
-            if a in ("--almanac", "--siege") and n < 1:
+            if a in ("--almanac", "--siege", "--seeds") and n < 1:
                 fail()
             opts[a[2:]] = n
     return opts
@@ -11268,8 +11404,11 @@ def main():
     if opts["almanac"]:
         almanac(opts["almanac"], opts["seed"])
         return 0
+    if opts["siege"] and opts["seeds"]:
+        siege_seeds(opts["siege"], opts["seeds"], opts["pressure"])
+        return 0
     if opts["siege"]:
-        siege_report(opts["siege"], opts["seed"])
+        siege_report(opts["siege"], opts["seed"], pressure=opts["pressure"])
         return 0
     if opts["self_test"]:
         self_test()
