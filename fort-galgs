@@ -1982,6 +1982,7 @@ class Siege:
     COVER_P = 0.64      # where on the trail a boulder offers cover
     HIDE_S = 9.5        # how long a man crouches behind it, at least...
     LULL_S = 5.0        # ...and until he has not been shot at for this long
+    BREACH_WAIT_S = 4.0     # how long one waits at a gap before he tires
     AT_WALL = 2         # how many beat on the wall at once
     QUEUE_P = 0.08      # trail between each in the queue behind them
 
@@ -2003,7 +2004,7 @@ class Siege:
     # of its whole strength: a man on foot or a horseman per second as he
     # pounds, a cannon per ball (it fires every BOOM_EVERY seconds).
     HURT_PER_S = {"foot": 0.0015, "horse": 0.0025}
-    HURT_PER_BALL = 0.016
+    HURT_PER_BALL = 0.013
     BOOM_EVERY = 4.0
 
     # Lulls, hunger and meals. A lull is QUIET_S seconds with no redcoat
@@ -2029,7 +2030,7 @@ class Siege:
     # starving; with no walker, the sentry on that side does. A ladder
     # goes over the outside of the wall: lowered, climbed, used, climbed
     # again and hauled up, each of which takes real time at fed pace.
-    MEND_BELOW = 0.75
+    MEND_BELOW = 0.96
     MEND_PER_S = 0.014  # of a wall's whole strength
     LOWER_S = 1.8
     HAUL_S = 1.8
@@ -2885,7 +2886,13 @@ class Siege:
     def wait_at_breach(self, rc):
         """THE BREACH: a redcoat at the foot of a wall with a gap in it.
         For now he waits there and does nothing more; what a breach lets
-        him do is for the next round to say, here."""
+        him do is for the next round to say, here. Meanwhile he does not
+        wait for ever: with nothing to pound and no way in, he tires after
+        BREACH_WAIT_S and goes back up the trail out of the picture, so a
+        steady siege still has its lulls and the walker can come home."""
+        if rc["at_wall"] is not None \
+                and self.phase - rc["at_wall"] >= self.BREACH_WAIT_S:
+            rc["gone"] = True
 
     def _pound(self, dt):
         """Redcoats at the wall's foot beat on it; a cannon fires into the
@@ -3011,10 +3018,10 @@ class Siege:
                     if rc["slot"] < self.AT_WALL and not rc.get("reached"):
                         rc["reached"] = True
                         self.tally["reached"] += 1
-        self.redcoats = [rc for rc in self.redcoats if rc["hit"] is None
-                         or self.phase - rc["hit"] < (
+        self.redcoats = [rc for rc in self.redcoats if not rc.get("gone")
+                         and (rc["hit"] is None or self.phase - rc["hit"] < (
                              self.FLEE_S if rc["kind"] == "horse"
-                             else self.FALL_S)]
+                             else self.FALL_S))]
 
         if self.pending_call is not None and \
                 self.phase - self.pending_call[1] > self.pending_call[2]:
@@ -4466,14 +4473,15 @@ class CpuView(Gtk.DrawingArea):
 
     @staticmethod
     def _redcoat(cr, x, feet, s, facing, step, fall, pound=-1.0, seed=0.0,
-                 crouch=0.0, aim=0.0, shot=-1.0):
+                 crouch=0.0, aim=0.0, shot=-1.0, elev=0.0):
         """A redcoat on the march, musket at the shoulder, in the same
         100-unit model as the mountain man. fall runs 0..1 as he topples
         backward and fades once he is shot; pound is the seconds he has
         been beating on the fort's wall, or negative on the march. crouch
         runs 0..1 as he drops to one knee. aim runs 0..1 as he levels his
         musket in front of him; shot is the seconds since he fired it, or
-        negative, a flash and smoke at its muzzle."""
+        negative, a flash and smoke at its muzzle. elev is how far above level
+        the musket points, negative to point it down."""
         if s < 1.5:
             return
         cr.save()
@@ -4536,7 +4544,7 @@ class CpuView(Gtk.DrawingArea):
         if aim > 0:
             cr.save()
             cr.translate(4, -72)
-            cr.rotate(aim * (math.pi / 2 + 0.13))
+            cr.rotate(aim * (math.pi / 2 + 0.13 - elev))
             cr.translate(-4, 72)
         cr.set_source_rgb(*RIFLE_WOOD_RGB)
         cr.set_line_width(5)
@@ -4563,7 +4571,9 @@ class CpuView(Gtk.DrawingArea):
         if aim > 0:
             cr.restore()
         if 0 <= shot < 2.2:
-            mx, my = 60.0, -72.0
+            # The muzzle, where the musket now points from the shoulder.
+            mx = 4 + 56 * math.cos(elev)
+            my = -72.0 - 56 * math.sin(elev)
             for j in range(3):
                 u = min(1.0, max(0.0, shot - 0.06 * j) / 2.2)
                 cr.set_source_rgba(*SMOKE_RGB, 0.55 * (1 - u))
@@ -5298,15 +5308,20 @@ class CpuView(Gtk.DrawingArea):
                     and not rc.get("drive") else 0.0
                 if cover > 0:
                     facing = toward  # he keeps his eyes on the fort
-                kneel = aim = 0.0
+                kneel = aim = elev = 0.0
                 shot = -1.0
                 if rc.get("drive") and alive and self.hrocks[rc["side"]]:
                     rock = self.hrocks[rc["side"]][rc["drive"]["rock"] - 1]
                     facing = 1 if rock["x"] >= x else -1
                     kneel, aim, shot = self.siege.volley(rc)
+                    # He levels his musket at the rock, not at the horizon.
+                    gy = feet - size * (0.55 if kneel > 0.5 else 0.72)
+                    elev = max(-0.9, min(0.9, math.atan2(
+                        gy - (rock["base"] - rock["h"] * 0.6),
+                        max(1.0, abs(rock["x"] - x)))))
                 self._redcoat(cr, x, feet, size, facing, step, fall, pound,
                               rc["n"] * 1.3, crouch=max(cover, kneel),
-                              aim=aim, shot=shot)
+                              aim=aim, shot=shot, elev=elev)
             if not alive:
                 # The man bleeds, whether rider, gunner or foot.
                 bx = x - facing * size * 0.55 if kind == "cannon" else x
@@ -10156,10 +10171,13 @@ def siege_tests(view, cr):
     siege.run(Siege.BOOM_EVERY + 1)
     assert siege.breached(0) and siege.tally["breaches"] == 1, siege.wall
     before = siege.tally["hurt"][0]
-    siege.run(30)
+    siege.run(Siege.BREACH_WAIT_S - Siege.BOOM_EVERY - 2)
     assert siege.wall[0] == 0.0 and siege.tally["hurt"][0] == before
     assert siege.tally["breaches"] == 1, "a breach is counted once"
     assert siege.at_wall(rc), "he waits at the gap"
+    siege.run(Siege.BREACH_WAIT_S)
+    assert rc not in siege.redcoats, "and tires of waiting, and goes"
+    assert not siege.in_range(), "so the quiet can come"
 
     # A lull, a few quiet seconds, lets a hungry man sit and eat: each of
     # the two sentries where he stands and the walker on the wall walk,
