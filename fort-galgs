@@ -2198,6 +2198,7 @@ class Siege:
     # cold at the wall top until a calm, when it is carried back.
     DESPERATE_U = 0.5   # on the ladder this far up is near the top
     STEP_S = 3.0        # a man stepping onto the walk is so for this long
+    DESPERATE_HOLD_S = 2.0   # desperate this long before the pot is sent for
     CROWD = 4           # this many at the wall's foot are a crowd
     POUR_MIN = 0.3      # the pot must hold at least this much to be poured
     CARRY_S = 5.0
@@ -2238,6 +2239,7 @@ class Siege:
         self.boats_in_sight = False       # the view's: redcoats afloat
         self.pot = {"x": self.POT_X, "stew": 1.0, "heat": 1.0,
                     "at": "fire", "task": None, "side": 0}
+        self.desp_since = [None, None]    # phase each side became desperate
         self.pot_all = False              # all three at it together
         self.men = [self._new_man("post"), self._new_man("post"),
                     self._new_man("patrol")]
@@ -3340,12 +3342,20 @@ class Siege:
         straits, if it is hot and holds stew; back to its fire, in the
         calm, once it has been emptied."""
         p = self.pot
+        for s in (0, 1):
+            if not self.desperate(s):
+                self.desp_since[s] = None
+            elif self.desp_since[s] is None:
+                self.desp_since[s] = self.phase
         if p["task"] is not None:
             return
         if p["at"] == "fire":
             if p["heat"] < 1.0 or p["stew"] < self.POUR_MIN:
                 return
-            sides = [s for s in (0, 1) if self.desperate(s)]
+            # a flicker is not desperate straits: it must have held a while
+            sides = [s for s in (0, 1) if self.desp_since[s] is not None
+                     and self.phase - self.desp_since[s]
+                     >= self.DESPERATE_HOLD_S]
             if not sides:
                 return
             side = max(sides, key=lambda s: sum(
@@ -3445,6 +3455,11 @@ class Siege:
                     m["face"] = -1 if side == 0 else 1
         elif leg == "tip":
             t = (self.phase - m["t0"]) * pace
+            if t >= self.TIP_AT and not m["tipped"] and not self.below(side):
+                # they are gone: carry it home rather than pour it on no one
+                kind = m["kind"] = p["task"]["kind"] = "fetch"
+                m["leg"] = "bear"
+                return
             if t >= self.TIP_AT and not m["tipped"]:
                 m["tipped"] = True
                 self.tally["pours"] += 1
@@ -13451,7 +13466,7 @@ def siege_tests(view, cr):
     top.update(climb=siege.phase - 0.6 * Siege.CLIMB_UP_S, hp=99)
     foot_man = _at_the_foot(siege, "foot", 1, 1)
     foot_man["hp"] = 99
-    siege.run(0.1)
+    siege.run(Siege.DESPERATE_HOLD_S + 0.1)
     assert siege.pot["task"] and siege.pot["task"]["i"] in (0, 1)
     carrier = siege.men[siege.pot["task"]["i"]]
     assert carrier["mode"] == "carry"
