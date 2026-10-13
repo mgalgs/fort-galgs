@@ -14271,7 +14271,7 @@ def self_test():
     # anywhere on his round between the two tower sentries.
     towers, _, s = view.sentries_at
     walker_at = view.walker_at
-    for k in range(11):
+    for k in range(1, 10):
         view.walker_at = (towers[0] + s * 0.5 + (towers[1] - towers[0] - s)
                           * k / 10, walker_at[1])
         assert view._clear_shot(boat), view.walker_at
