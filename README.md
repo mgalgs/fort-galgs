@@ -15,6 +15,18 @@ the beavers and now and then for a trapper — and keeps evolving across runs,
 kept in `$XDG_STATE_HOME/fort-galgs/world.json` (by default under
 `~/.local/state`).
 
+While the fort is up it is under siege, and nothing in the siege is
+scripted: each actor acts on what it sees. Redcoats march down from barracks
+and row down the river to land at the far ford, then climb ladders and
+batter the walls. The sentries, the gun and the man walking the wall hold
+them off. In a lull the walker mends what was knocked down, and the men eat
+from a stew pot that a desperate garrison will pour over a ladder instead.
+When redcoats reach the top, the valley's bears come for them. A meter on
+each side wall shows how much of it still stands. The siege is only a
+picture: it never touches the cores the fort holds. Click a barracks or the
+river to send more. `--siege 60 --seeds 20 [--pressure flood]`
+runs an hour of it headless over 20 seeds and prints what happened.
+
 <p align="center">
   <img src="docs/screenshot.png" width="420"
        alt="Fort Galgs with the fort up: four cores inside a log stockade with sentries on the walls, the rest outside, and a list of apps with switches">
