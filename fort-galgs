@@ -1998,6 +1998,13 @@ class Siege:
     GUN_POST = (0.2, 0.8)   # where on the wall walk he wheels it, per side
     BLAST_P = 0.85      # the blast takes queued redcoats this near the wall
 
+    # What the redcoats at the foot of a side wall do to it, as a fraction
+    # of its whole strength: a man on foot or a horseman per second as he
+    # pounds, a cannon per ball (it fires every BOOM_EVERY seconds).
+    HURT_PER_S = {"foot": 0.0035, "horse": 0.006}
+    HURT_PER_BALL = 0.045
+    BOOM_EVERY = 4.0
+
     DRILL_LEN = 4.6     # from kneeling to the last of the smoke
     SHOT_AT = 2.0       # he fires this far into it
 
@@ -2023,8 +2030,11 @@ class Siege:
         self.gun_at = 0.5                 # along the wall walk, 0..1
         self.bugle_at = None              # phase the walker last sounded
         self.chipped = [None, None]       # phase a shot last struck each rock
+        self.wall = [1.0, 1.0]            # each side wall's strength, 0..1
         self.tally = {"sent": {"foot": 0, "horse": 0, "cannon": 0},
-                      "shot": 0, "reached": 0, "blasted": 0, "calls": 0}
+                      "shot": 0, "reached": 0, "blasted": 0, "calls": 0,
+                      "hurt": [0.0, 0.0], "mended": [0.0, 0.0],
+                      "breaches": 0}
 
     @staticmethod
     def ramp(tau, a, b):
@@ -2172,6 +2182,48 @@ class Siege:
             self.gun_at = self.GUN_POST[r["side"]]
             self.relief = None
 
+    # -- the walls --------------------------------------------------------
+
+    def breached(self, side):
+        """The wall on side has no strength left: there is a gap."""
+        return self.wall[side] <= 0.0
+
+    def hurt(self, side, amount):
+        """The wall on side takes a blow."""
+        before = self.wall[side]
+        self.wall[side] = max(0.0, before - amount)
+        self.tally["hurt"][side] += before - self.wall[side]
+        if before > 0.0 and self.wall[side] <= 0.0:
+            self.tally["breaches"] += 1
+
+    def mend(self, side, amount):
+        """The wall on side is made stronger."""
+        before = self.wall[side]
+        self.wall[side] = min(1.0, before + amount)
+        self.tally["mended"][side] += self.wall[side] - before
+
+    def wait_at_breach(self, rc):
+        """THE BREACH: a redcoat at the foot of a wall with a gap in it.
+        For now he waits there and does nothing more; what a breach lets
+        him do is for the next round to say, here."""
+
+    def _pound(self, dt):
+        """Redcoats at the wall's foot beat on it; a cannon fires into the
+        logs. A breached wall takes nothing more."""
+        for rc in self.redcoats:
+            if rc["hit"] is not None or not self.at_wall(rc):
+                continue
+            side = rc["side"]
+            if self.breached(side):
+                self.wait_at_breach(rc)
+            elif rc["kind"] == "cannon":
+                due = int((self.phase - rc["at_wall"]) / self.BOOM_EVERY) + 1
+                while rc.get("booms", 0) < due:
+                    rc["booms"] = rc.get("booms", 0) + 1
+                    self.hurt(side, self.HURT_PER_BALL)
+            else:
+                self.hurt(side, self.HURT_PER_S[rc["kind"]] * dt)
+
     # -- the redcoats -----------------------------------------------------
 
     def at_wall(self, rc):
@@ -2216,6 +2268,7 @@ class Siege:
         at a boat; afloat, if given, is called between the barracks' calls
         and the new arrivals, to run the boats and let men land from them."""
         self._advance_relief(walker_busy)
+        self._pound(dt)
         speed = (self.MARCH_FAR - self.MARCH_NEAR) / self.MARCH_S
         for side in (0, 1):
             # Two at a time beat on the wall; the rest wait in a queue back
@@ -3049,6 +3102,83 @@ class CpuView(Gtk.DrawingArea):
             lift = stake_w * 0.25 if (i % 2 and pointed) else 0.0
             self._stake(cr, x0 + i * w, bottom, w, top - lift, pointed)
 
+    WALL_PIECES = 10    # logs stacked up each of a side wall's two columns
+
+    @classmethod
+    def _wall_piece_state(cls, strength, j, col):
+        """How the log j up from the foot of a side wall's column col (0
+        the outer one) stands at this strength: 0 whole, 1 splintered
+        and shortened, 2 leaning, 3 fallen. Blows land low and outside
+        first, so the damage creeps up the wall."""
+        hit = ((j * 7 + col * 3 + 1) * 0.618034) % 1.0
+        rank = 0.55 * j / (cls.WALL_PIECES - 1) + 0.35 * hit + 0.1 * col
+        u = (1.0 - strength) * 1.1 - rank * 0.75
+        return 0 if u <= 0 else 1 if u < 0.18 else 2 if u < 0.45 else 3
+
+    def _side_wall(self, cr, side, x, wall, top, bottom):
+        """A side wall, seen end-on as a column of two stacks of logs. As
+        it is hurt, logs splinter and shorten, then lean, then fall,
+        leaving a gap; it reads by shape, not by colour."""
+        strength = self.siege.wall[side]
+        n = self.WALL_PIECES
+        w = wall / 2
+        sh = (bottom - top) / n
+        fallen = 0
+        for col in (1, 0):
+            cx = x + (col if side == 0 else 1 - col) * w
+            for j in range(n):
+                state = self._wall_piece_state(strength, j, col)
+                y1 = bottom - j * sh
+                if state == 3:
+                    fallen += 1
+                    continue
+                cr.save()
+                h = sh * (1.0, 0.8, 0.68)[state]
+                if state == 2:
+                    lean = (0.5 if (j + col) % 2 else -0.4)
+                    cr.translate(cx + w / 2, y1)
+                    cr.rotate(lean)
+                    cr.translate(-(cx + w / 2), -y1)
+                cr.move_to(cx, y1)
+                if state == 0:
+                    cr.line_to(cx, y1 - h)
+                    if j == n - 1:
+                        cr.line_to(cx + w / 2, y1 - h - w * 0.6)
+                    cr.line_to(cx + w, y1 - h)
+                else:
+                    # A ragged break across the top.
+                    cr.line_to(cx, y1 - h)
+                    for k in range(1, 5):
+                        cr.line_to(cx + w * k / 4, y1 - h
+                                   - (w * 0.45 if k % 2 else 0.0)
+                                   + (w * 0.15 if j % 2 else 0.0))
+                cr.line_to(cx + w, y1)
+                cr.close_path()
+                cr.set_source_rgb(*WOOD_RGB)
+                cr.fill_preserve()
+                cr.set_source_rgb(*SEAM_RGB)
+                cr.set_line_width(max(0.8, w * 0.08))
+                cr.stroke()
+                cr.set_source_rgba(*WOOD_HI_RGB, 0.8)
+                cr.rectangle(cx + w * 0.18, y1 - h + w * 0.25, w * 0.16,
+                             max(0.0, h - w * 0.5))
+                cr.fill()
+                cr.restore()
+        # The fallen lie in a heap at the foot, a log each.
+        for k in range(min(fallen, 8)):
+            cr.save()
+            cr.translate(x + wall / 2 + (k % 2 - 0.5) * wall * 0.3,
+                         bottom - (k // 2 + 0.5) * w * 0.55)
+            cr.rotate(0.12 * ((k % 3) - 1))
+            self._rounded(cr, -wall * 0.5, -w * 0.25, wall, w * 0.5,
+                          w * 0.25)
+            cr.set_source_rgb(*WOOD_RGB)
+            cr.fill_preserve()
+            cr.set_source_rgb(*SEAM_RGB)
+            cr.set_line_width(max(0.8, w * 0.08))
+            cr.stroke()
+            cr.restore()
+
     def _blockhouse(self, cr, x, y, w, h):
         """A square log tower; y is its floor, where a sentry stands."""
         logs = 4
@@ -3879,8 +4009,8 @@ class CpuView(Gtk.DrawingArea):
 
         # Side walls are seen from the front, like the rest: a column of
         # stakes each side, standing full height.
-        for sx in (X, X + W - wall):
-            self._wall(cr, sx, sx + wall, Y + H, Y - wall * 0.6, stake, True)
+        for side, sx in enumerate((X, X + W - wall)):
+            self._side_wall(cr, side, sx, wall, Y - wall * 0.6, Y + H)
         # Back wall, sharpened against the sky; front wall, with the gate.
         self._wall(cr, X + wall, X + W - wall, y, Y - wall * 0.9, stake, True)
         gate_w = min(t * 0.9, w * 0.35)
@@ -8664,6 +8794,67 @@ def bear_tests(view, cr, rows, more):
     assert len(seen) >= 8 and 0 < won < len(seen), (len(seen), won)
 
 
+def _quiet_siege(seed=1):
+    """A siege with the barracks quiet and the sentries holding fire, for
+    staging one situation at a time."""
+    siege = Siege(seed)
+    siege.wave_in = siege.spawn_in = 1e9
+    siege.drill_start = [siege.phase + 1e9, siege.phase + 1e9]
+    return siege
+
+
+def _at_the_foot(siege, kind="foot", side=0, slot=0):
+    """Put a redcoat at the foot of side's wall, beating on it."""
+    siege.send(side, kind)
+    rc = siege.redcoats[-1]
+    rc.update(d=Siege.MARCH_NEAR, at_wall=siege.phase, slot=slot)
+    return rc
+
+
+def siege_tests(view, cr):
+    """The walls, the lulls, the walker's mending and the ladder: staged
+    situations, run with Siege alone, and the drawings of each state."""
+    # Pounding hurts the wall, a horseman a little more than a man, a
+    # cannon most, one side only; a breached wall takes nothing more.
+    for kind in ("foot", "horse", "cannon"):
+        siege = _quiet_siege()
+        _at_the_foot(siege, kind, side=1)
+        siege.run(20)
+        assert siege.wall[0] == 1.0 and siege.wall[1] < 1.0, (kind, siege.wall)
+        siege.redcoats[0]["hp"] = 99
+        if kind == "foot":
+            foot = 1.0 - siege.wall[1]
+        elif kind == "horse":
+            assert 1.0 - siege.wall[1] > foot, "a horseman hits harder"
+            horse = 1.0 - siege.wall[1]
+        else:
+            assert 1.0 - siege.wall[1] > horse, "a cannon hits hardest"
+    siege = _quiet_siege()
+    rc = _at_the_foot(siege, "cannon")
+    rc["hp"] = 99
+    siege.wall[0] = 0.06
+    siege.run(Siege.BOOM_EVERY + 1)
+    assert siege.breached(0) and siege.tally["breaches"] == 1, siege.wall
+    before = siege.tally["hurt"][0]
+    siege.run(30)
+    assert siege.wall[0] == 0.0 and siege.tally["hurt"][0] == before
+    assert siege.tally["breaches"] == 1, "a breach is counted once"
+    assert siege.at_wall(rc), "he waits at the gap"
+
+    # A wall reads by shape: more logs down, shorter, leaning, at each
+    # level of damage, not only a different shade.
+    ladder = [sum(CpuView._wall_piece_state(st, j, c) for j in range(10)
+                  for c in (0, 1)) for st in (1.0, 0.8, 0.5, 0.2, 0.0)]
+    assert ladder[0] == 0 and ladder == sorted(ladder), ladder
+    gone = [sum(CpuView._wall_piece_state(st, j, c) == 3 for j in range(10)
+                for c in (0, 1)) for st in (1.0, 0.8, 0.5, 0.2, 0.0)]
+    assert gone[0] == gone[1] == 0 and gone[3] > 0 and gone[4] > gone[3], gone
+    for strength in (1.0, 0.8, 0.5, 0.2, 0.0):
+        view.siege.wall = [strength, 1.0 - strength]
+        view._draw(view, cr, 1024, 680)
+    view.siege.wall = [1.0, 1.0]
+
+
 def self_test():
     """Build every page and draw every state against a real surface.
 
@@ -9289,6 +9480,11 @@ def self_test():
     view._on_click(None, 1, *spot)
     assert not view.boats, "no boats while the fort is down"
 
+    view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], True)
+    siege_tests(view, cr)
+    view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
+    assert view.siege.wall == [1.0, 1.0], "standing down mends everything"
+
     win.apply_state(SAMPLE_STATE)
     assert win.banner.get_revealed() and win.banner_action is None
     stray = [dict(a, inside=False) if a["always"] else a
@@ -9403,33 +9599,59 @@ def almanac(years, seed=1, out=None):
         w.run(0.5)
 
 
+def _tally_minus(t, last):
+    """The siege's tally less an earlier copy of it, whatever its shape."""
+    if isinstance(t, dict):
+        return {k: _tally_minus(t[k], last[k]) for k in t}
+    if isinstance(t, list):
+        return [_tally_minus(a, b) for a, b in zip(t, last)]
+    return t - last
+
+
+def _pair(v):
+    """A per-side tally as 'left/right', walls in whole percents."""
+    return "/".join(str(round(100 * x)) if isinstance(x, float) else str(x)
+                    for x in v)
+
+
+# The siege report's columns: heading, width, and what to show of a tally.
+SIEGE_COLUMNS = (
+    ("sent f/h/c", 12, lambda t: "/".join(
+        str(t["sent"][k]) for k in ("foot", "horse", "cannon"))),
+    ("shot", 5, lambda t: t["shot"]),
+    ("at wall", 8, lambda t: t["reached"]),
+    ("blasted", 8, lambda t: t["blasted"]),
+    ("gun calls", 10, lambda t: t["calls"]),
+    ("hurt %", 9, lambda t: _pair(t["hurt"])),
+    ("mended %", 10, lambda t: _pair(t["mended"])),
+    ("breaches", 9, lambda t: t["breaches"]),
+)
+
+
 def siege_report(minutes, seed=1, out=None):
     """Run a fresh siege headless for so many minutes and print one row a
     minute, then the total: the redcoats sent (foot/horse/cannon), those
     shot by the sentries, those who reached the wall, those the gun's blast
-    took, and the calls for the gun. No boats: they row on the river as
-    drawn, which a headless run has not got."""
+    took, the calls for the gun, and the walls' story. No boats: they row
+    on the river as drawn, which a headless run has not got."""
     out = out or sys.stdout
     siege = Siege(seed)
     print(f"siege, seed {seed}, no boats (they need the drawn river)",
           file=out)
-    print(f"{'minute':>6}{'sent f/h/c':>14}{'shot':>6}{'at wall':>9}"
-          f"{'blasted':>9}{'gun calls':>11}", file=out)
+    print(f"{'minute':>6}" + "".join(f"{name:>{w}}"
+                                     for name, w, _ in SIEGE_COLUMNS),
+          file=out)
 
     def row(label, t):
-        sent = "/".join(str(t["sent"][k]) for k in ("foot", "horse",
-                                                    "cannon"))
-        print(f"{label:>6}{sent:>14}{t['shot']:>6}{t['reached']:>9}"
-              f"{t['blasted']:>9}{t['calls']:>11}", file=out)
+        print(f"{label:>6}" + "".join(f"{str(get(t)):>{w}}"
+                                      for _, w, get in SIEGE_COLUMNS),
+              file=out)
 
     last = copy.deepcopy(siege.tally)
     for n in range(int(minutes)):
         siege.run(60.0)
-        t = siege.tally
-        row(n + 1, {"sent": {k: t["sent"][k] - last["sent"][k]
-                             for k in t["sent"]},
-                    **{k: t[k] - last[k] for k in t if k != "sent"}})
-        last = copy.deepcopy(t)
+        row(n + 1, _tally_minus(siege.tally, last))
+        last = copy.deepcopy(siege.tally)
     row("total", siege.tally)
 
 
