@@ -10987,6 +10987,18 @@ class FortWindow(Adw.ApplicationWindow):
         header = Adw.HeaderBar(css_classes=["flat"])
         header.set_title_widget(Adw.WindowTitle(title="Fort Galgs",
                                                 subtitle=os.uname().nodename))
+        # Fast-forward: the scene at double speed. Never kept; each launch
+        # starts at 1x. Pressed is the cue, the label says it plainly too.
+        self.fast = Gtk.ToggleButton(label="1×",
+                                     tooltip_text="Run the scene at double "
+                                     "speed (Ctrl+2)")
+        self.fast.connect("toggled", self._on_fast)
+        header.pack_start(self.fast)
+        keys = Gtk.ShortcutController(scope=Gtk.ShortcutScope.GLOBAL)
+        keys.add_shortcut(Gtk.Shortcut(
+            trigger=Gtk.ShortcutTrigger.parse_string("<Control>2"),
+            action=Gtk.CallbackAction.new(self._toggle_fast)))
+        self.add_controller(keys)
         toolbar = Adw.ToolbarView()
         toolbar.add_top_bar(header)
         toolbar.set_content(self.stack)
@@ -11006,6 +11018,15 @@ class FortWindow(Adw.ApplicationWindow):
         self.sample_id = self.status_id = self.save_id = self.clock_id = 0
         self._save_world()
         return False
+
+    def _on_fast(self, button):
+        fast = button.get_active()
+        button.set_label("2×" if fast else "1×")
+        self.view.set_speed(2 if fast else 1)
+
+    def _toggle_fast(self, *_):
+        self.fast.set_active(not self.fast.get_active())
+        return True
 
     def _world_clock(self):
         self.view.catch_up(GLib.get_monotonic_time() / 1_000_000.0)
@@ -14327,6 +14348,15 @@ def self_test():
     frames(clock, wait + 2)
     assert view.siege.pending_call is None, "a lone click sends its file"
     view.set_speed(1)
+    # The header bar's toggle and Ctrl+2 set it, starting at 1x.
+    fresh = FortWindow(None)
+    assert not fresh.fast.get_active() and fresh.view.speed == 1
+    fresh._toggle_fast()
+    assert fresh.fast.get_active() and fresh.view.speed == 2
+    assert fresh.fast.get_label() == "2×"
+    fresh._toggle_fast()
+    assert fresh.view.speed == 1 and fresh.fast.get_label() == "1×"
+    fresh._on_close(fresh)
 
     # Whoever reaches the wall beats on it.
     def stand(kind, n=99, d=1.05, at_wall=None, hp=1):
