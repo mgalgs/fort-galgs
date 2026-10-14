@@ -2109,6 +2109,8 @@ class Siege:
     AIM_S = 0.8         # from the walker sighting along the walk to the shot
     RELOAD_S = 6.0      # and he cannot fire again for this long: swab,
                         # powder, ball, ram; after a relief shot as well
+    RELIEF_RELOAD_S = 12.0  # the load after a relief shot: the walker is
+                        # tied up this long (same gun["ready"], one load)
     TURN_S = 1.0        # turning the gun round to the other way takes this
     BLAST_KILL = 0.9    # a man in the blast is taken with this chance
     STATION_DX = 0.035  # he stands this far behind the gun
@@ -3567,12 +3569,26 @@ class Siege:
                     self.desp[i] = min(self.DESP_MAX, self.desp[i] + 1.0)
                     self.tally["unanswered"] += 1
             return
+        # The other side's sentry, with the walker at this side's call,
+        # goes unanswered and calls again.
+        i = 1 - r["side"]
+        if not self.below(i):
+            self.call_at[i] = -1e9
+            if self.lull():
+                self.desp[i] = max(0.0, self.desp[i] - dt / self.DESP_DRAIN_S)
+        elif not (self.busy(i) or self.men[i]["mode"] not in ("post", "eat")
+                  or self.ousted(i)) \
+                and self.phase >= self.call_at[i] and not self.calling(i):
+            self.horn_at[i] = self.phase
+            self.call_at[i] = self.phase + self.CALL_EVERY_S
+            self.desp[i] = min(self.DESP_MAX, self.desp[i] + 1.0)
+            self.tally["unanswered"] += 1
         t = self.phase - r["t0"]
         if not r["fired"] and t >= self.FIRE_AT:
             r["fired"] = True
             pace = self.pace(2)
             self.gun.update(fired=self.phase, aim=None,
-                            ready=self.phase + self.RELOAD_S / pace)
+                            ready=self.phase + self.RELIEF_RELOAD_S / pace)
             self.tally["reloads"] += 1
         if not r["landed"] and t >= self.FIRE_AT + self.FLIGHT_S:
             r["landed"] = True
@@ -14642,8 +14658,13 @@ def self_test():
         siege.tick(1 / 30)
         siege.advance(1 / 30, walker_busy=True)
     assert siege.relief is None, "the gun waits on the walker"
-    siege.run(Siege.DRILL_LEN)  # his sentry's rifle is busy a while yet
-    assert siege.relief, "then the gun"
+    calls = siege.tally["calls"]
+    # his sentry's rifle is busy a while yet and the gun still loading, and
+    # he calls so long with nobody answering that he takes the pot himself
+    assert _until(siege, lambda: siege.tally["calls"] > calls
+                  or siege.tally["desp_pours"] > 0,
+                  Siege.DRILL_LEN + Siege.RELIEF_RELOAD_S + 20), \
+        "then the gun, or his desperation"
 
     # In the picture the fallen leave blood where they fall.
     for i in range(3):
@@ -14835,11 +14856,18 @@ def self_test():
     assert abs(view.siege.patrol_u - halted) < 0.1, "he halts"
     view.potshot_after = 1e9
     assert ashore(boat) == view.BOAT_MEN - 1
+    for i in range(3):
+        view.siege._home_post(i)    # nobody off at the pot or the gun
+    view.siege.desp = [0.0, 0.0]
+    for i in range(3):
+        view.siege.men[i]["hunger"] = 0.0
     view.potshot_after = 0.0
     boat = afloat(1, True)
     assert until(lambda: view.potshot is not None, 30)
     run(Siege.DRILL_LEN / view.siege.pace(2) + 0.1, 3)
-    assert view.potshot is None and boat["men"] == view.BOAT_MEN - 1
+    # (the boat may be landing its men by now; the one he took is overboard)
+    assert view.potshot is None and len(view.overboard) == 1, \
+        (view.potshot, view.overboard)
     run(view.POTSHOT_REST - 0.5, 3)
     assert view.potshot is None, "he patrols between shots"
 
