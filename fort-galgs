@@ -12907,9 +12907,11 @@ def _stage_reload(beat, side=0):
         siege.men[2].update(mode="gun", x=gx - face * Siege.STATION_DX,
                             face=face, t0=siege.phase, clear=None,
                             station=gx - face * Siege.STATION_DX)
+        # (the picture's four frames run 0.4 s on from here)
         age = 1.6 + beat * (Siege.RELOAD_S - 2.8)
-        siege.gun.update(facing=face, aim=None, fired=siege.phase - age,
-                         ready=siege.phase - age + Siege.RELOAD_S)
+        fired = siege.phase - age + 0.4
+        siege.gun.update(facing=face, aim=None, fired=fired,
+                         ready=fired + Siege.RELOAD_S)
     return stage
 
 
