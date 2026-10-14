@@ -2296,7 +2296,9 @@ class Siege:
                       "pot_eating_s": 0.0, "pot_together": 0,
                       "pot_together_s": 0.0, "off_s": 0.0, "off_caught": 0,
                       "pour_trips": 0, "pours": 0, "scalded": 0,
-                      "unanswered": 0, "reloads": 0, "desp_pours": 0}
+                      "unanswered": 0, "reloads": 0, "desp_pours": 0,
+                      "pot_s": {"ready": 0.0, "thin": 0.0, "heating": 0.0,
+                                "spent": 0.0, "carried": 0.0}}
 
     def vary(self, spread):
         """A factor near 1, up to spread either side of it: the siege's
@@ -3191,11 +3193,27 @@ class Siege:
             and not self.busy(i) and not self.calling(i) \
             and self.relief is None and not self.ousted(i)
 
+    def _tally_pot(self, dt):
+        """Where the pot's time goes: ready to pour, on its hook but too
+        thin to pour, on its hook and not yet at the boil, lying spent
+        at a wall, or carried."""
+        p = self.pot
+        if p["at"] != "fire":
+            key = "carried" if p["at"] == "carried" else "spent"
+        elif p["heat"] < 1.0:
+            key = "heating"
+        elif p["stew"] < self.POUR_MIN:
+            key = "thin"
+        else:
+            key = "ready"
+        self.tally["pot_s"][key] += dt
+
     def _advance_pot(self, dt):
         """The pot and the men round it. In the calm it fills and comes to
         the boil; a man at it eats from it, and the sentries come down and
         sit with the walker; when a redcoat comes in sight they get up and
         go back."""
+        self._tally_pot(dt)
         if not self.has_walker:
             for i, m in enumerate(self.men):
                 if m["mode"] in ("pot", "carry"):
@@ -15272,6 +15290,12 @@ def siege_seeds(minutes, seeds, pressure="normal", out=None):
         n = sum(1 for t in tallies if base(t) and test(t))
         print(f"  {n:>2}/{sum(1 for t in tallies if base(t))}  {what}",
               file=out)
+    budget = {k: sum(t["pot_s"][k] for t in tallies)
+              for k in tallies[0]["pot_s"]}
+    whole = sum(budget.values()) or 1.0
+    print("  pot budget: " + ", ".join(f"{k} {100 * v / whole:.0f}%"
+                                       for k, v in budget.items()),
+          file=out)
     caught = sum(t["caught"] for t in tallies)
     driven = sum(t["driven"] for t in tallies)
     print(f"  caught {caught} times in all, and driven back past the first "
