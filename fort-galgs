@@ -2109,8 +2109,6 @@ class Siege:
     AIM_S = 0.8         # from the walker sighting along the walk to the shot
     RELOAD_S = 6.0      # and he cannot fire again for this long: swab,
                         # powder, ball, ram; after a relief shot as well
-    RELIEF_RELOAD_S = 12.0  # the load after a relief shot: the walker is
-                        # tied up this long (same gun["ready"], one load)
     TURN_S = 1.0        # turning the gun round to the other way takes this
     BLAST_KILL = 0.9    # a man in the blast is taken with this chance
     STATION_DX = 0.035  # he stands this far behind the gun
@@ -3588,7 +3586,7 @@ class Siege:
             r["fired"] = True
             pace = self.pace(2)
             self.gun.update(fired=self.phase, aim=None,
-                            ready=self.phase + self.RELIEF_RELOAD_S / pace)
+                            ready=self.phase + self.RELOAD_S / pace)
             self.tally["reloads"] += 1
         if not r["landed"] and t >= self.FIRE_AT + self.FLIGHT_S:
             r["landed"] = True
@@ -14663,7 +14661,7 @@ def self_test():
     # he calls so long with nobody answering that he takes the pot himself
     assert _until(siege, lambda: siege.tally["calls"] > calls
                   or siege.tally["desp_pours"] > 0,
-                  Siege.DRILL_LEN + Siege.RELIEF_RELOAD_S + 20), \
+                  Siege.DRILL_LEN + Siege.RELOAD_S + 20), \
         "then the gun, or his desperation"
 
     # In the picture the fallen leave blood where they fall.
