@@ -1971,7 +1971,7 @@ class Siege:
     roof, and through it drops into the yard to batter the cores, which is
     a picture and no more. It is the bears that stop him: see rouse_bears.
     In the calm the men sit round the stew pot; in desperate straits they
-    pour it over the wall: see desperate.
+    pour it over the wall: see Siege.CALL_EVERY_S and DESP_AT.
     """
 
     MARCH_FAR = 6.0     # a new redcoat is this many times farther than...
@@ -2199,7 +2199,7 @@ class Siege:
     # his tower and carries it from its fire to the wall top at CARRY_S for
     # the whole walk, tips it over, and the stew scalds whoever is on that
     # side's ladder or at the wall's foot. The pot then lies empty and
-    # cold at the wall top until a calm, when it is carried back.
+    # cold at the wall top until a lull, when it is carried back.
     CALL_EVERY_S = 4.0  # a sentry calls again this long after an unanswered one
     DESP_AT = 3.0       # unanswered calls it takes to make him resort to it
     DESP_MAX = 6.0      # and no more than this is stored up
