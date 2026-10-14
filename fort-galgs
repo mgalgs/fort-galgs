@@ -2107,7 +2107,7 @@ class Siege:
     STORM_S = 20.0      # a stormer crosses the whole wall walk in this
     FIRE_RANGE = 0.3    # along the walk, how far in front of it the gun reaches
     AIM_S = 0.8         # from the walker sighting along the walk to the shot
-    RELOAD_S = 6.0      # and he cannot fire again for this long: swab,
+    RELOAD_S = 12.0     # and he cannot fire again for this long: swab,
                         # powder, ball, ram; after a relief shot as well
     TURN_S = 1.0        # turning the gun round to the other way takes this
     BLAST_KILL = 0.9    # a man in the blast is taken with this chance
@@ -13473,7 +13473,8 @@ def siege_tests(view, cr):
     siege.run(Siege.RELOAD_S - 1.0)
     assert c["hit"] is None, "no second shot while he reloads"
     assert _until(siege, lambda: c["hit"] is not None, 20)
-    assert _until(siege, lambda: siege.men[2]["mode"] == "patrol", 10), \
+    assert _until(siege, lambda: siege.men[2]["mode"] == "patrol",
+                  Siege.RELOAD_S + 10), \
         "and back to his round"
     assert not siege.stormers_on()
     # From the east it already faces them, and there is no turning.
@@ -13499,6 +13500,7 @@ def siege_tests(view, cr):
     # Turned without him, by a tower's call, he goes behind it again,
     # running, not in one jump.
     siege.stormers = []
+    gun.update(taken=False, ready=siege.phase)  # (a long load lets them in)
     m.update(mode="gun", x=siege.gun_at - gun["facing"] * Siege.STATION_DX,
              station=None, clear=siege.phase, face=gun["facing"])
     gun["facing"] = -gun["facing"]
