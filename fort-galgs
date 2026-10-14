@@ -2178,10 +2178,11 @@ class Siege:
     # The stew pot, hung over a small fire on the wall walk at POT_X along
     # it (the gun stands at 0.5, and is wheeled to 0.2 or 0.8). It holds
     # stew from 0 to 1 and is hot from 0 (cold) to 1 (at the boil). On its
-    # hook it comes to the boil over BOIL_S, lull or not; in THE CALM, and
-    # only then, it fills over REFILL_S; a man at it eats faster than from his pack, and draws it down
-    # slowly; and the sentries come down off their towers, DOWN_S, to sit
-    # round it with the walker, and go back, UP_S, when a redcoat is in sight.
+    # hook it comes to the boil over BOIL_S, lull or not; in a lull, and
+    # only then, it fills over REFILL_S. In THE CALM a man at it eats
+    # faster than from his pack, and draws it down slowly; and the sentries
+    # come down off their towers, DOWN_S, to sit round it with the walker,
+    # and go back, UP_S, when a redcoat is in sight.
     POT_X = 0.66
     POT_SEAT = (-0.095, 0.095, 0.0)     # the two sentries and the walker
     POT_MEAL_S = 30.0   # seconds to eat his fill from starving, at the pot
@@ -2200,7 +2201,7 @@ class Siege:
     # back and hangs it on its hook; driven off, it lies empty and cold at
     # the wall top until a lull, when it is carried back.
     CALL_EVERY_S = 4.0  # a sentry calls again this long after an unanswered one
-    DESP_AT = 2.0       # unanswered calls it takes to make him resort to it
+    DESP_AT = 1.0       # unanswered calls it takes to make him resort to it
     DESP_MAX = 6.0      # and no more than this is stored up
     DESP_DRAIN_S = 6.0  # in a lull he loses one call's worth in this long
     DESP_RELIEVED = 0.5     # a relief shot on his side leaves this fraction
@@ -3210,8 +3211,8 @@ class Siege:
         self.tally["pot_s"][key] += dt
 
     def _advance_pot(self, dt):
-        """The pot and the men round it. In the calm it fills and comes to
-        the boil; a man at it eats from it, and the sentries come down and
+        """The pot and the men round it. On its hook it comes to the boil,
+        and in a lull it fills; in the calm a man at it eats from it, and the sentries come down and
         sit with the walker; when a redcoat comes in sight they get up and
         go back."""
         self._tally_pot(dt)
@@ -14945,6 +14946,8 @@ def self_test():
     assert until(lambda: view.potshot is not None, 20)
     view._on_click(None, 1, (x0 + x1) / 2, (y0 + y1) / 2)
     assert not view.siege.bugling(), "nor the bugle during his shot"
+    rest = view.siege.pot_rest
+    view.siege.pot_rest = 1e9           # (so the sentry waits on the gun)
     view.siege.redcoats = [{"side": 0, "d": Siege.MARCH_NEAR, "hit": None, "n": 98,
                       "born": view.phase, "kind": "cannon", "hp": 99,
                       "struck": None, "at_wall": view.phase, "slot": 0}]
@@ -14959,6 +14962,7 @@ def self_test():
         assert view.potshot is None or view.siege.relief is None, \
             "not while he works the gun"
     assert view.siege.redcoats[0]["hit"] is not None, "the gun fired"
+    view.siege.pot_rest = rest
 
     # With no room on the wall for him, nobody shoots at the boats.
     boat = afloat(1, False)
