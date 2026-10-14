@@ -2187,7 +2187,7 @@ class Siege:
     POT_MEAL_S = 30.0   # seconds to eat his fill from starving, at the pot
     POT_DRAW_S = 240.0  # seconds of one man eating that empty a full pot
     POT_MIN = 0.02      # least stew he will sit down to
-    REFILL_S = 60.0
+    REFILL_S = 30.0
     BOIL_S = 40.0
     DOWN_S = 1.4
     UP_S = 1.4
@@ -2200,7 +2200,7 @@ class Siege:
     # back and hangs it on its hook; driven off, it lies empty and cold at
     # the wall top until a lull, when it is carried back.
     CALL_EVERY_S = 4.0  # a sentry calls again this long after an unanswered one
-    DESP_AT = 3.0       # unanswered calls it takes to make him resort to it
+    DESP_AT = 2.0       # unanswered calls it takes to make him resort to it
     DESP_MAX = 6.0      # and no more than this is stored up
     DESP_DRAIN_S = 6.0  # in a lull he loses one call's worth in this long
     DESP_RELIEVED = 0.5     # a relief shot on his side leaves this fraction
