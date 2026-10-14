@@ -2177,9 +2177,9 @@ class Siege:
 
     # The stew pot, hung over a small fire on the wall walk at POT_X along
     # it (the gun stands at 0.5, and is wheeled to 0.2 or 0.8). It holds
-    # stew from 0 to 1 and is hot from 0 (cold) to 1 (at the boil). In THE
-    # CALM, and only then, it fills over REFILL_S and comes to the boil over
-    # BOIL_S; a man at it eats faster than from his pack, and draws it down
+    # stew from 0 to 1 and is hot from 0 (cold) to 1 (at the boil). On its
+    # hook it comes to the boil over BOIL_S, lull or not; in THE CALM, and
+    # only then, it fills over REFILL_S; a man at it eats faster than from his pack, and draws it down
     # slowly; and the sentries come down off their towers, DOWN_S, to sit
     # round it with the walker, and go back, UP_S, when a redcoat is in sight.
     POT_X = 0.66
@@ -2196,8 +2196,9 @@ class Siege:
     # calls for the gun go unanswered DESP_AT times is desperate; he leaves
     # his tower and carries it from its fire to the wall top at CARRY_S for
     # the whole walk, tips it over, and the stew scalds whoever is on that
-    # side's ladder or at the wall's foot. The pot then lies empty and
-    # cold at the wall top until a lull, when it is carried back.
+    # side's ladder or at the wall's foot. He carries the empty pot straight
+    # back and hangs it on its hook; driven off, it lies empty and cold at
+    # the wall top until a lull, when it is carried back.
     CALL_EVERY_S = 4.0  # a sentry calls again this long after an unanswered one
     DESP_AT = 3.0       # unanswered calls it takes to make him resort to it
     DESP_MAX = 6.0      # and no more than this is stored up
@@ -3224,11 +3225,12 @@ class Siege:
             return
         p = self.pot
         sight = self.calm_since is None
-        if p["at"] == "fire" and self.lull() \
-                and not any(m["mode"] == "pot" and m["feed"] == "stew"
-                            for m in self.men):
-            p["stew"] = min(1.0, p["stew"] + dt / self.REFILL_S)
+        if p["at"] == "fire":
             p["heat"] = min(1.0, p["heat"] + dt / self.BOIL_S)
+            if self.lull() and not any(m["mode"] == "pot"
+                                       and m["feed"] == "stew"
+                                       for m in self.men):
+                p["stew"] = min(1.0, p["stew"] + dt / self.REFILL_S)
         self._pot_dispatch()
         for i, m in enumerate(self.men):
             if m["mode"] == "carry":
@@ -3237,6 +3239,10 @@ class Siege:
                 if i != 2:
                     self.tally["off_s"] += dt
                 self._pot_man(i, m, dt, sight)
+        if p["at"] == "carried" and not any(
+                m["mode"] == "carry" for m in self.men):
+            # driven off with it: it lies where he left it, for the lull
+            p.update(at="spent", task=None)
         together = all(self.at_pot(i) for i in (0, 1, 2))
         if together:
             self.tally["pot_together_s"] += dt
@@ -3499,8 +3505,10 @@ class Siege:
                 self._scald(side)
                 self.desp[side] = 0.0
             if t >= self.TIP_S:
-                p.update(at="spent", side=side, x=m["x"])
-                self._finish_carry(i)
+                # he carries it straight home and hangs it on its hook
+                p["side"] = side
+                m["kind"] = p["task"]["kind"] = "fetch"
+                m["leg"] = "bear"
         elif leg == "set":
             if self.phase - m["t0"] >= self.SET_S / pace:
                 p.update(at="fire", x=self.POT_X)
@@ -13332,7 +13340,7 @@ def siege_tests(view, cr):
         siege = _quiet_siege()
         siege.drill_start = [None, None]
         siege.wall = [wall, 1.0]
-        siege.pot.update(heat=0.0)      # no stew to scald him with
+        siege.pot_rest = 1e9            # no stew to scald him with
         walker = _walker_out(siege)
         walker.update(mode="hide", g=2.0, rock=2, shot_t=None, pinned=[],
                       next_shot=1e9)
@@ -13913,14 +13921,12 @@ def siege_tests(view, cr):
     near["d"] = Siege.trail_d(0.6)
     siege.gun["ready"] = 1e9            # (the gun cannot take him)
     siege.run(30)
-    assert siege.pot["stew"] == 0.0 and siege.pot["heat"] == 0.0 \
-        and not siege.pot_ready(), "no lull, no stew"
+    assert siege.pot["stew"] == 0.0 and siege.pot["heat"] > 0.5 \
+        and not siege.pot_ready(), "no lull, no stew; but it heats"
     siege.redcoats = []
     siege.boats_in_sight = False
-    assert _until(siege, lambda: siege.pot["stew"] > 0.2, 30)
-    assert not siege.pot_ready(), "full enough to eat from, not yet at the boil"
-    assert _until(siege, lambda: siege.pot_ready(), 120)
-    assert siege.pot["stew"] > 0.5
+    assert _until(siege, lambda: siege.pot["stew"] > 0.1, 120)
+    assert _until(siege, lambda: siege.pot_ready(), 30), "at the boil"
     # When a redcoat comes into sight on either trail, they get up: a
     # sentry takes a beat to rise, walk back and climb, and until he is
     # back he cannot shoot.
@@ -13952,6 +13958,7 @@ def siege_tests(view, cr):
     siege = _quiet_siege(2)
     siege.drill_start = [None, None]
     siege.pot.update(heat=0.0)          # nothing to pour yet
+    siege.BOIL_S = 1e12                # (and it stays cold)
     siege.gun["ready"] = 1e9            # and the gun not loaded
     foe = _at_the_foot(siege, "foot", 0, 0)
     foe["hp"] = 99
@@ -13977,6 +13984,7 @@ def siege_tests(view, cr):
     siege = _quiet_siege(2)
     siege.drill_start = [None, None]
     siege.pot.update(heat=0.0)
+    siege.BOIL_S = 1e12                # (and it stays cold)
     siege.desp[0] = 2.0
     foe = _at_the_foot(siege, "foot", 0, 0)
     foe["hp"] = 99
@@ -13994,6 +14002,7 @@ def siege_tests(view, cr):
     siege = _quiet_siege(2)
     siege.drill_start = [None, None]
     siege.pot.update(heat=0.0)
+    siege.BOIL_S = 1e12                # (and it stays cold)
     foe = _at_the_foot(siege, "foot", 0, 0)
     foe["hp"] = 99
     assert _until(siege, lambda: siege.relief is not None, 12)
@@ -14055,18 +14064,31 @@ def siege_tests(view, cr):
     assert all(rc["hp"] == 0 for rc in scalded) \
         and siege.tally["scalded"] == len(scalded)
     assert siege.pot["stew"] == 0.0 and siege.pot["heat"] == 0.0
-    assert _until(siege, lambda: siege.pot["at"] == "spent", 5)
-    assert siege.pot["x"] == Siege.LADDER_X[0] and not siege.pot_ready()
-    # The price is supper: nobody eats stew until, in a lull, the pot is
-    # carried back, refilled and brought to the boil.
-    siege.redcoats = []
-    siege.stormers = []
+    # He does not leave it lying: he carries the empty pot straight back
+    # and hangs it on its hook, with no lull to wait for, and it comes to
+    # the boil there; the price is supper until it is refilled, in a lull.
+    assert _until(siege, lambda: siege.pot["at"] == "carried"
+                  and siege.pot["task"]["kind"] == "fetch", 5)
+    carrier = siege.men[siege.pot["task"]["i"]]
+    assert carrier["mode"] == "carry" and carrier["kind"] == "fetch"
+    assert siege.pot["stew"] == 0.0
+    assert _until(siege, lambda: siege.pot["at"] == "fire", 30), siege.pot
+    assert siege.pot["x"] == Siege.POT_X and siege.pot["task"] is None
+    assert not siege.pot_ready() and siege.pot["stew"] == 0.0
     for m in siege.men:
         m["hunger"] = 0.8
-    assert _until(siege, lambda: siege.pot["at"] == "fire", 60), siege.pot
-    assert siege.pot["x"] == Siege.POT_X and siege.pot["task"] is None
-    assert not siege.pot_ready() and siege.pot["stew"] < 0.5
+    siege.redcoats = []
+    siege.stormers = []
     assert _until(siege, lambda: siege.pot_ready(), 120)
+
+    # Driven off before he gets it home, it lies where he left it, and in
+    # a lull it is fetched (at once, here).
+    siege.pot.update(at="carried", x=0.3, stew=0.0, heat=0.0,
+                     task={"kind": "fetch", "i": 0, "side": 0})
+    siege.men[0].update(mode="post")
+    siege.run(0.1)
+    assert siege.pot["at"] == "spent" and siege.pot["x"] == 0.3
+    assert _until(siege, lambda: siege.pot["at"] == "fire", 90), siege.pot
 
     # A cold or an empty pot is not poured; with no stew, nothing happens.
     for heat, stew in ((0.5, 1.0), (1.0, 0.1)):
