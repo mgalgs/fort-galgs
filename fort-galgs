@@ -1989,6 +1989,18 @@ class Siege:
     HP = {"foot": 1, "horse": 1, "cannon": 5}
     WAVE_EVERY = (75.0, 105.0, 90.0)
     FLOOD_EVERY = 20.0  # an eager user's double click, every so often
+
+    # The load on the machine outside the fort, 0..1, brings them on: it
+    # is followed over LOAD_TAU, and as it goes 0, LOAD_MID, 1 the
+    # barracks' clocks for foot and for waves (and the view's for boats)
+    # run at these rates, and so many may march on one trail at once.
+    # LOAD_MID is the old even pace, and a headless siege's.
+    LOAD_TAU = 15.0
+    LOAD_MID = 0.5
+    FOOT_RATE = (0.2, 1.0, 2.2)
+    WAVE_RATE = (0.25, 1.0, 3.0)
+    BOAT_RATE = (0.2, 1.0, 3.0)
+    MARCHING = (1, 2, 6)
     COVER_P = 0.64      # where on the trail a boulder offers cover
     HIDE_S = 9.5        # how long a man crouches behind it, at least...
     LULL_S = 5.0        # ...and until he has not been shot at for this long
@@ -2227,6 +2239,7 @@ class Siege:
         self.redcoats = []
         self.spawned = 0
         self.spawn_in = 1.0
+        self.load = self.LOAD_MID         # the load outside, followed
         self.called = [[], []]            # kinds waiting at each barracks
         self.pending_call = None          # (side, phase, wait) of a lone click
         self.wave_in = 45.0 * self.vary(0.3)
@@ -2308,6 +2321,21 @@ class Siege:
         if self.steady:
             return 1.0
         return 1.0 + spread * (2.0 * self.rng.random() - 1.0)
+
+    def follow_load(self, load, dt):
+        """Let the followed load move dt seconds' way toward load."""
+        k = 1.0 - math.exp(-dt / self.LOAD_TAU)
+        self.load += (load - self.load) * k
+
+    def by_load(self, scale):
+        """scale's (idle, mid, busy) at the followed load: geometric
+        between them, so each step of load multiplies alike."""
+        lo, mid, hi = scale
+        u = min(1.0, max(0.0, self.load / self.LOAD_MID))
+        if u < 1.0:
+            return lo * (mid / lo) ** u
+        u = min(1.0, (self.load - self.LOAD_MID) / (1.0 - self.LOAD_MID))
+        return mid * (hi / mid) ** u
 
     def _new_man(self, mode):
         """One of the fort's three men: his hunger, what he is at (mode),
@@ -4577,7 +4605,7 @@ class Siege:
                 self.call(self.floods % 2, self.WAVE)
                 self.flood_in = self.FLOOD_EVERY
                 self.floods += 1
-        self.wave_in -= dt
+        self.wave_in -= dt * self.by_load(self.WAVE_RATE)
         if self.wave_in <= 0:
             self.call(self.waves % 2, self.WAVE)
             self.wave_in = self.WAVE_EVERY[self.waves % 3] * self.vary(0.3)
@@ -4593,13 +4621,14 @@ class Siege:
 
         if afloat is not None:
             afloat()
-        self.spawn_in -= dt
+        self.spawn_in -= dt * self.by_load(self.FOOT_RATE)
         if self.spawn_in <= 0:
             n = self.spawned
             side = (0, 1, 1, 0, 1, 0, 0, 1)[n % 8]
             marching = sum(rc["side"] == side and rc["hit"] is None
                            for rc in self.redcoats)
-            if marching < 2 and door_clear(side):
+            if marching < round(self.by_load(self.MARCHING)) \
+                    and door_clear(side):
                 self.send(side, "foot")
                 self.spawn_in = (6.0, 4.5, 7.5, 5.0)[n % 4] * self.vary(0.25)
             else:
@@ -4698,7 +4727,8 @@ class CpuView(Gtk.DrawingArea):
     While the fort is up, the reserved cores stand inside a log stockade,
     embers rising in their orange tiles; mountain men watch from its
     towers and walk its wall, redcoats march on it down trails from
-    barracks in the far corners or come down the river in boats, take
+    barracks in the far corners or come down the river in boats, the
+    more of them the busier the rest of the machine is, take
     cover behind boulders, and the sentries and the fort's gun see them
     off. Boats row past the first ford to put their men ashore at the
     second, and the one walking the wall takes shots at them as they pass:
@@ -4729,6 +4759,7 @@ class CpuView(Gtk.DrawingArea):
         self.siege = Siege(seed=7)        # the rules; this view draws them
         self.siege.boulders = [False, False]  # none laid until drawn
         self.siege.has_walker = False
+        self.siege.load = 0.0
         self.gun_facing = 1
         self.stains = []                  # (x, y, size, phase) of the fallen
         self.barracks_box = [None, None]  # (x0, y0, x1, y1) as last drawn
@@ -4782,6 +4813,7 @@ class CpuView(Gtk.DrawingArea):
             old, self.siege = self.siege, Siege(seed=7)
             self.siege.boulders = old.boulders
             self.siege.has_walker = old.has_walker
+            self.siege.load = old.load
         self.on = on
         self.queue_draw()
 
@@ -4804,6 +4836,13 @@ class CpuView(Gtk.DrawingArea):
 
     def set_loads(self, loads):
         self.loads = loads
+
+    def outside_load(self):
+        """The mean load on the CPUs outside the fort, or on all of them if
+        the fort holds every one; 0 with no loads yet."""
+        out = [v for c, v in self.loads.items() if c not in self.reserved]
+        out = out or list(self.loads.values())
+        return sum(out) / len(out) if out else 0.0
 
     def set_speed(self, speed):
         """Run the whole scene, siege, boats and valley alike, at speed
@@ -4898,6 +4937,7 @@ class CpuView(Gtk.DrawingArea):
         siege = self.siege
         siege.valley_bears = sum(b["job"] != "dead"
                                  for b in self.world.predators)
+        siege.follow_load(self.outside_load(), dt)
         if self.on:
             siege.tick(dt if elapsed is None else elapsed)
         if not self.on:
@@ -5018,7 +5058,7 @@ class CpuView(Gtk.DrawingArea):
         on downstream. One whose crew is all shot drifts off too."""
         if self.trails is None or self.river is None:
             return
-        self.boat_in -= dt
+        self.boat_in -= dt * self.siege.by_load(Siege.BOAT_RATE)
         if self.boat_in <= 0:
             if self._launch_boat():
                 self.boat_in = self.BOAT_EVERY[self.boats_sent % 2]
@@ -14561,6 +14601,8 @@ def self_test():
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], False)
     view.set_state(SAMPLE_STATE["cores"], SAMPLE_STATE["reserved"], True)
     view.siege.wave_in = view.boat_in = 1e9
+    view.set_loads({c: Siege.LOAD_MID for c in range(20)})  # the old pace
+    view.siege.load = Siege.LOAD_MID
 
     def run(seconds, every=15):
         for frame in range(int(seconds * 30)):
@@ -14778,6 +14820,40 @@ def self_test():
     assert a.tally == b.tally and a.spawned == b.spawned
     assert a.tally != c.tally
 
+    # The busier the machine outside the fort, the more redcoats come; a
+    # spike shorter than the following brings no more than none does, a
+    # load that holds does. A click sends its men at any load.
+    def spawned(raw, start, seconds=180):
+        siege, most = Siege(seed=3), 0
+        siege.load = start
+        for _ in range(int(seconds * 30)):
+            siege.tick(1 / 30)
+            siege.follow_load(raw(siege.phase), 1 / 30)
+            siege.advance(1 / 30)
+            most = max(most, sum(rc["hit"] is None
+                                 for rc in siege.redcoats))
+        return siege.spawned, siege.load, most
+
+    few, mid, many = (spawned(lambda t: x, x)[0] for x in (0.1, 0.5, 0.9))
+    assert 1 <= few and 1.5 * few < mid and 1.5 * mid < many, \
+        (few, mid, many)
+    full = spawned(lambda t: 1.0, 1.0, 600)
+    assert full[2] <= 2 * Siege.MARCHING[2] + 2 * len(Siege.WAVE), full
+    quiet = spawned(lambda t: 0.1, 0.1, 120)
+    spike = spawned(lambda t: 1.0 if 10 <= t < 12 else 0.1, 0.1, 120)
+    held = spawned(lambda t: 1.0 if t >= 10 else 0.1, 0.1, 120)
+    assert spike[0] <= quiet[0] + 1 and abs(spike[1] - 0.1) < 0.01, spike
+    assert held[0] > 2 * quiet[0] and held[1] > 0.95, (held, quiet)
+    idle = Siege()
+    idle.load = 0.0
+    idle.wave_in = idle.spawn_in = 1e9
+    idle.click_barracks(1, 1, 0.4)
+    idle.run(1.0)
+    idle.click_barracks(0, 2, 0.4)
+    idle.run(12)
+    assert idle.tally["sent"] == {"foot": 3, "horse": 3, "cannon": 1}, \
+        idle.tally["sent"]
+
     view.siege.redcoats, view.siege.drill_start = [], [None, None]
     view.siege.relief = None
     view.siege.spawn_in = view.siege.wave_in = 1e9
@@ -14978,6 +15054,15 @@ def self_test():
     # shows there.
     view.siege.redcoats, view.boats = [], []
     view.siege.bugle_at, view.siege.pending_call = None, None
+    # The load that brings them is the rest of the machine's, outside the
+    # fort, unless the fort holds it all.
+    view.set_loads({0: 0.2, 1: 0.4, 3: 1.0})
+    assert abs(view.outside_load() - 0.3) < 1e-9, view.outside_load()
+    view.set_loads({3: 1.0, 4: 0.5})
+    assert abs(view.outside_load() - 0.75) < 1e-9, view.outside_load()
+    view.set_loads({})  # as if none sampled yet: no load, and still a boat
+    assert view.outside_load() == 0.0
+    view.siege.load = 0.0
     view._draw(view, cr, 1024, 680)
     spot = None
     for x in range(8, 1024, 8):
@@ -15102,6 +15187,8 @@ def snapshot(path):
     sampler.sample()
     GLib.usleep(400_000)
     view.shown = sampler.sample()
+    view.set_loads(dict(view.shown))
+    view.siege.load = view.outside_load()  # as if it had held a while
     w, h = 1024, 680  # the window's own shape, at 2x
     surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, w * 2, h)
     cr = cairo.Context(surface)
